@@ -13,6 +13,7 @@ is the intended trade, not a bug to be optimised away.
 import logging
 from datetime import date, datetime, time, timedelta, timezone
 
+from svtplay_arr.matching import episode_matches
 from svtplay_arr.models import QualityInfo, Release, SvtEpisode
 from svtplay_arr.naming import release_guid, release_title
 from svtplay_arr.sonarr import SonarrApiError
@@ -208,13 +209,16 @@ class Resolver:
             # would claim the episode, writing a permanent S00Exx filename
             # for something that is really S15Exx. SVT-side specials cannot
             # reach here anyway: they parse with ordinal=None.
+            # Same predicate as the forward rule, read from the other
+            # end -- `episode_matches` is the shared implementation, so
+            # the reverse rule cannot drift from the forward one. Season 0
+            # is this direction's own addition, for the reason above.
             wanted = [
                 se
                 for se in sonarr_episodes
                 if se.season > 0
                 and se.air_date is not None
-                and se.episode == svt_ep.ordinal
-                and abs((svt_ep.published - se.air_date).days) <= self._tolerance
+                and self._matches(svt_ep, se.air_date, se.episode)
             ]
             if len(wanted) != 1:
                 log.info(
@@ -251,25 +255,18 @@ class Resolver:
         return out
 
     def _matches(self, ep: SvtEpisode, air_date, episode_number: int) -> bool:
-        # Signal 0: it must actually be downloadable. 14 episodes on the
-        # same listing page were flagged upcoming (a non-null
-        # `upcomingOverlay`), including the *next* one; offering any of them
-        # is a guaranteed failed grab, and a failed grab is permanent
-        # because the release GUID is stable across searches.
-        if not ep.available:
-            return False
-        # Signal 1: air date agreement, within tolerance.
-        if ep.published is None:
-            return False
-        if abs((ep.published - air_date).days) > self._tolerance:
-            return False
-        # Signal 2: SVT's own ordinal within its run. NEVER SVT's season
-        # number -- SVT labelled a run "Sasong 14" that Sonarr/TVDB call
-        # season 15, and two episodes shared an air date (S15E01, S15E02
-        # both 2026-08-23), so ordinal is what actually disambiguates.
-        if ep.ordinal is None:
-            return False
-        return ep.ordinal == episode_number
+        """The matching rule, bound to this resolver's configured tolerance.
+
+        The rule itself lives in `svtplay_arr.matching` and is *not*
+        restated here. `discovery.py` counts how often it holds to decide
+        whether a whole series mapping may be written unconfirmed, so the
+        sweep and the resolver have to be asking the identical question --
+        see that module's docstring for why a second copy would be a defect
+        rather than a duplication.
+        """
+        return episode_matches(
+            ep, air_date, episode_number, tolerance_days=self._tolerance
+        )
 
     @staticmethod
     def _estimate_size(ep: SvtEpisode, quality: QualityInfo) -> int:
