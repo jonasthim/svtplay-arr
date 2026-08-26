@@ -8,11 +8,12 @@ Two controls here make live SVT calls, both strictly on demand and never on
 a page render. The per-mapping Check control (`_check_slug`,
 `_check_context`, `check_mapping`) calls `svt.list_episodes(slug)` the same
 way `Resolver` does, and writes nothing. The Find mappings sweep
-(`discover`) calls `svt.search_series(title)` once per unmapped series and
-is the one route that writes without a per-row confirmation -- it may write
-only what `discovery.confident_match` approved, and that gate lives in
-`discovery.py`, not here. This module holds no matching rule of its own,
-here as everywhere else.
+(`discover`) searches SVT for each unmapped series and then reads the
+episode lists of the few candidates it finds -- the same `list_episodes`
+call, and it is the one route that writes without a per-row confirmation.
+It may write only what `discovery.corroborated_match` approved, and that
+gate lives in `discovery.py`, not here. This module holds no matching rule
+of its own, here as everywhere else.
 """
 
 import logging
@@ -56,12 +57,16 @@ _TEMPLATES = Jinja2Templates(
 # re-render and the JSON the JS fetch consumes) read `css_class` off the
 # same dict rather than each deciding independently, so they cannot pick
 # different colours for the same result.
-# What one "Find mappings" click may cost SVT: one search per unmapped
-# series against an unofficial API. Module-level rather than defaults on
-# the call, so the bound is stated in one visible place -- and so a test
-# can shrink it without reaching inside the router closure.
+# What one "Find mappings" click may cost SVT. The sweep now corroborates
+# candidates against their episode lists rather than trusting a title, so a
+# series costs up to a few searches plus an episode-list fetch per checked
+# candidate -- see `discovery`'s own bounds, which these mirror.
+# Module-level rather than defaults on the call, so the bound is stated in
+# one visible place -- and so a test can shrink it without reaching inside
+# the router closure.
 _SWEEP_CONCURRENCY = 4
 _SWEEP_CAP = 200
+_SWEEP_REQUEST_BUDGET = 600
 
 _CHECK_CSS_CLASS = {
     "found": "notice",
@@ -951,11 +956,13 @@ def build_config_router(
     async def discover(request: Request):
         """The Find mappings sweep.
 
-        Walks Sonarr's library, asks SVT about each unmapped series, writes
-        the rows `discovery.confident_match` approved, and surfaces
-        everything else for one click. A plain form POST with no JavaScript
-        anywhere in the path: the sweep works with JS off, like every other
-        control on this page.
+        Walks Sonarr's library, asks SVT about each unmapped series and
+        its alternate titles, corroborates the few most promising
+        candidates against the series' own episodes, writes the rows
+        `discovery.corroborated_match` approved, and surfaces everything
+        else -- with its evidence -- for one click. A plain form POST with
+        no JavaScript anywhere in the path: the sweep works with JS off,
+        like every other control on this page.
 
         The order of operations is the safety argument, and each step
         exists because skipping it would allow a bad write:
@@ -968,8 +975,8 @@ def build_config_router(
            mapped, the sweep would re-search the whole library and could
            append a duplicate row on top of a file it could not read.
         3. The sweep runs and returns a value. It writes nothing itself, so
-           a Sonarr outage part-way through leaves no partial file to clean
-           up -- there is simply nothing to write.
+           a Sonarr or SVT outage part-way through leaves no partial file
+           to clean up -- there is simply nothing to write.
         4. One atomic write for the whole batch, honouring the same
            concurrency check every other write route uses. Refused for any
            reason means refused entirely; the matches are then shown as
@@ -1012,6 +1019,14 @@ def build_config_router(
                 existing_mappings=existing,
                 concurrency=_SWEEP_CONCURRENCY,
                 cap=_SWEEP_CAP,
+                request_budget=_SWEEP_REQUEST_BUDGET,
+                # The tolerance the service actually booted with, so the
+                # sweep corroborates at the same air-date window the
+                # resolver will later match at. A router built without
+                # `booted` (as tests do) passes None and the sweep falls
+                # back to `Settings`' own default rather than to a literal
+                # of its own.
+                tolerance_days=getattr(booted, "air_date_tolerance_days", None),
             )
         except Exception as exc:
             log.warning("mapping sweep failed", exc_info=True)

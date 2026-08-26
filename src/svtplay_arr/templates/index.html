@@ -135,9 +135,9 @@
    who never runs the sweep is looking at. #}
 <p class="help auto-note"><span class="auto-badge">Auto-matched</span>
   marks the {{ auto_rows | length }} row{{ 's' if auto_rows | length != 1 else '' }}
-  that <strong>Find mappings</strong> wrote on its own, because the Sonarr
-  title and the SVT programme name were identical and only one SVT
-  programme matched. Nobody confirmed
+  that <strong>Find mappings</strong> wrote on its own, because that SVT
+  programme's episodes matched this series' episodes &mdash; and no other
+  candidate's did. Nobody confirmed
   {{ 'them' if auto_rows | length != 1 else 'it' }}. Check
   {{ 'each one' if auto_rows | length != 1 else 'it' }} against SVT and
   remove anything wrong: the series title is the permanent filename in
@@ -148,7 +148,7 @@
 {% endif %}
 {# Two ways in, both plain forms/links: sweep the whole Sonarr library at
    once, or add one series by hand. The sweep writes only what
-   discovery.confident_match approved and surfaces the rest -- see
+   discovery.corroborated_match approved and surfaces the rest -- see
    `discover` in config_ui.py. It is a form POST because it writes, and
    needs no JavaScript to work. #}
 <div class="panel-actions">
@@ -159,9 +159,12 @@
   <a href="/config/mappings/new">Add a series</a>
 </div>
 <p class="help">Find mappings searches SVT for every Sonarr series that is
-not mapped yet. It saves only the ones where the Sonarr title and the SVT
-programme name match exactly and only one SVT programme matches; everything
-else is listed for you to decide.</p>
+not mapped yet &mdash; under its own title and Sonarr's alternate titles
+&mdash; and then compares each likely SVT programme's episodes against that
+series' episodes. It saves only the ones where the episodes themselves
+agree: same air date, same episode number, on enough episodes that
+coincidence is not an explanation. Everything else is listed for you to
+decide, with the count that decided it.</p>
   </div>
 </section>
 

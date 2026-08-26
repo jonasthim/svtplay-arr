@@ -1,10 +1,13 @@
 {% extends "base.html" %}
 {% block content %}
-{# The result of one Find mappings sweep. Reports three different things
+{# The result of one Find mappings sweep. Reports several different things
    and never blurs them: what was written without anyone confirming it,
-   what needs a human decision, and what SVT had nothing for. Every
-   control here is a plain form POST -- the sweep and everything it offers
-   work with JavaScript off. #}
+   what needs a human decision, what could not be checked, and what SVT
+   had nothing for. Every candidate carries its evidence -- "2 of 8
+   episodes matched" is what a person actually needs to decide, where
+   "needs a decision" is only a restatement of the heading. Every control
+   here is a plain form POST: the sweep and everything it offers work with
+   JavaScript off. #}
 <h2>Find mappings</h2>
 
 <section class="panel">
@@ -14,6 +17,9 @@
       <li><strong>{{ written | length }}</strong> mapped automatically</li>
       <li><strong>{{ sweep.needs_decision | length }}</strong> need a decision</li>
       <li><strong>{{ sweep.no_match | length }}</strong> with no SVT match</li>
+      {% if sweep.check_failed %}
+      <li><strong>{{ sweep.check_failed | length }}</strong> could not be checked</li>
+      {% endif %}
       {% if sweep.already_claimed %}
       <li><strong>{{ sweep.already_claimed | length }}</strong> already claimed</li>
       {% endif %}
@@ -21,42 +27,57 @@
       <li><strong>{{ sweep.search_failed | length }}</strong> could not be searched</li>
       {% endif %}
       <li><strong>{{ sweep.already_mapped }}</strong> already mapped, not searched</li>
+      {# What the click cost SVT, always, not only when a limit bit. #}
+      <li><strong>{{ sweep.requests_used }}</strong> SVT requests made</li>
     </ul>
     {% if sweep.capped %}
     {# Said out loud rather than silently truncating: the operator has to
        know the library was not swept end to end. Re-running continues,
-       because this run's confident rows are now mapped and skipped. #}
-    <p class="warn">Stopped at the per-run limit of {{ sweep.cap }} SVT
-      searches: {{ sweep.not_searched }} unmapped series were
+       because this run's corroborated rows are now mapped and skipped. #}
+    <p class="warn">Stopped at the per-run limit of {{ sweep.cap }} series:
+      {{ sweep.not_searched }} unmapped series were
       <strong>not searched</strong> this run. Run Find mappings again to
       continue with the rest.</p>
     {% endif %}
+    {% if sweep.budget_exhausted %}
+    {# The failure mode that matters most here is a partial sweep reported
+       as a complete one: the operator concludes there is nothing more to
+       find, when the run simply stopped asking. #}
+    <p class="warn">Stopped at the per-run budget of
+      {{ sweep.request_budget }} SVT requests, so
+      <strong>this sweep is incomplete</strong>:
+      {{ sweep.out_of_budget | length }} series were not checked at all.
+      Corroborating a candidate means reading its episode list, which costs
+      a request each. Run Find mappings again to continue &mdash; what was
+      mapped above is skipped next time.</p>
+    {% endif %}
     {% if sweep.skipped_records %}
     <p class="help">{{ sweep.skipped_records }} Sonarr record(s) had no
-      usable title or TVDB id and were skipped.</p>
+      usable title, TVDB id or Sonarr id and were skipped.</p>
     {% endif %}
   </div>
 </section>
 
 {% if written %}
 <h2>Mapped automatically</h2>
-<p class="help">Written because the Sonarr title and the SVT programme name
-matched exactly and exactly one SVT programme matched. Anything less
-confident than that is below, unwritten. These rows are marked
-<code>source: auto</code> in mappings.yaml so they can be told apart from
-mappings you confirmed yourself &mdash; check them, and remove any that
-look wrong: the series title becomes the permanent filename in your
-library.</p>
+<p class="help">Written because this series' own episodes corroborate that
+SVT programme &mdash; same air date, same episode number &mdash; and no
+other candidate's episodes did. The title was only the search query; the
+episodes decided. These rows are marked <code>source: auto</code> in
+mappings.yaml so they can be told apart from mappings you confirmed
+yourself &mdash; check them, and remove any that look wrong: the series
+title becomes the permanent filename in your library.</p>
 <section class="panel">
   <div class="panel-inner">
     <table class="mappings">
-      <thead><tr><th>Series</th><th>TVDB</th><th>SVT</th></tr></thead>
+      <thead><tr><th>Series</th><th>TVDB</th><th>SVT</th><th>Evidence</th></tr></thead>
       <tbody>
       {% for m in written %}
       <tr class="mapping-row">
         <td data-label="Series">{{ m.series_title }}</td>
         <td data-label="TVDB">{{ m.tvdb_id }}</td>
         <td data-label="SVT">{{ m.svt_series_id }} / {{ m.svt_slug }}</td>
+        <td data-label="Evidence">{{ m.evidence.describe() }}</td>
       </tr>
       {% endfor %}
       </tbody>
@@ -78,6 +99,7 @@ again.</p>
     <div class="sweep-item">
       <p class="sweep-title">{{ m.series_title }}
         <span class="help">tvdbId {{ m.tvdb_id }}</span></p>
+      <p class="help">{{ m.evidence.describe() }}</p>
       <form method="post" action="/config/mappings" class="accept-form">
         <input type="hidden" name="expected_mtime" value="{{ mappings_mtime }}">
         <input type="hidden" name="q" value="{{ m.series_title }}">
@@ -93,10 +115,11 @@ again.</p>
 
 {% if sweep.needs_decision %}
 <h2>Needs a decision</h2>
-<p class="help">SVT returned programmes for these, but not exactly one whose
-name matches the Sonarr title &mdash; so nothing was written. Pick one and
-it is saved immediately; the series title always comes from Sonarr, never
-from SVT.</p>
+<p class="help">SVT returned programmes for these and their episodes were
+compared against Sonarr's, but no single one agreed well enough on its own
+&mdash; so nothing was written. Each candidate says how many of its
+episodes matched. Pick one and it is saved immediately; the series title
+always comes from Sonarr, never from SVT.</p>
 <section class="panel">
   <div class="panel-inner">
   {% for p in sweep.needs_decision %}
@@ -106,14 +129,46 @@ from SVT.</p>
       <p class="help">{{ p.reason }}</p>
       {% for c in p.candidates %}
       {# One click per candidate: the same create route, carrying the same
-         "svt_id|slug" value a radio pick on the search page would. #}
+         "svt_id|slug" value a radio pick on the search page would. The
+         evidence sits beside the button, because that is what the click
+         is a judgement about. #}
       <form method="post" action="/config/mappings" class="accept-form">
         <input type="hidden" name="expected_mtime" value="{{ mappings_mtime }}">
         <input type="hidden" name="q" value="{{ p.series_title }}">
         <input type="hidden" name="svt" value="{{ c.svt_id }}|{{ c.slug }}">
         <input type="hidden" name="sonarr" value="{{ p.tvdb_id }}">
         <button type="submit">Use {{ c.name }}</button>
-        <span class="help">{{ c.svt_id }} / {{ c.slug }}</span>
+        <span class="help">{{ c.svt_id }} / {{ c.slug }} &mdash; {{ c.note() }}</span>
+      </form>
+      {% endfor %}
+    </div>
+  {% endfor %}
+  </div>
+</section>
+{% endif %}
+
+{% if sweep.check_failed %}
+<h2>Could not be checked</h2>
+<p class="help">Candidates were found for these, but the episode evidence
+could not be gathered &mdash; so nothing was written. That says nothing
+about whether a match exists: an unchecked candidate is not a refuted one.
+Run Find mappings again once SVT and Sonarr are both reachable, or pick a
+candidate yourself.</p>
+<section class="panel">
+  <div class="panel-inner">
+  {% for p in sweep.check_failed %}
+    <div class="sweep-item">
+      <p class="sweep-title">{{ p.series_title }}
+        <span class="help">tvdbId {{ p.tvdb_id }}</span></p>
+      <p class="warn">{{ p.reason }}</p>
+      {% for c in p.candidates %}
+      <form method="post" action="/config/mappings" class="accept-form">
+        <input type="hidden" name="expected_mtime" value="{{ mappings_mtime }}">
+        <input type="hidden" name="q" value="{{ p.series_title }}">
+        <input type="hidden" name="svt" value="{{ c.svt_id }}|{{ c.slug }}">
+        <input type="hidden" name="sonarr" value="{{ p.tvdb_id }}">
+        <button type="submit">Use {{ c.name }}</button>
+        <span class="help">{{ c.svt_id }} / {{ c.slug }} &mdash; {{ c.note() }}</span>
       </form>
       {% endfor %}
     </div>
@@ -124,12 +179,12 @@ from SVT.</p>
 
 {% if sweep.already_claimed %}
 <h2>Already claimed by another series</h2>
-<p class="help">These matched an SVT programme that another series is already
-mapped to. Two mappings pointing at one SVT programme answer a search for
-either with episodes of the same show &mdash; and with Sonarr's renaming off
-that is permanent &mdash; so nothing was written. Usually one of the two
-Sonarr series is the one you actually want mapped: remove the other mapping
-first, or accept this deliberately below.</p>
+<p class="help">The episodes corroborated an SVT programme that another
+series is already mapped to. Two mappings pointing at one SVT programme
+answer a search for either with episodes of the same show &mdash; and with
+Sonarr's renaming off that is permanent &mdash; so nothing was written.
+Usually one of the two Sonarr series is the one you actually want mapped:
+remove the other mapping first, or accept this deliberately below.</p>
 <section class="panel">
   <div class="panel-inner">
   {% for p in sweep.already_claimed %}
@@ -144,7 +199,7 @@ first, or accept this deliberately below.</p>
         <input type="hidden" name="svt" value="{{ c.svt_id }}|{{ c.slug }}">
         <input type="hidden" name="sonarr" value="{{ p.tvdb_id }}">
         <button type="submit">Map it here anyway</button>
-        <span class="help">{{ c.svt_id }} / {{ c.slug }}</span>
+        <span class="help">{{ c.svt_id }} / {{ c.slug }} &mdash; {{ c.note() }}</span>
       </form>
       {% endfor %}
     </div>
@@ -155,8 +210,8 @@ first, or accept this deliberately below.</p>
 
 {% if sweep.no_match %}
 <h2>No SVT match</h2>
-<p class="help">SVT returned nothing usable for these titles. They may not
-be on SVT Play at all, or SVT may spell them differently from TVDB &mdash;
+<p class="help">SVT returned nothing usable for these titles, nor for any
+alternate title Sonarr carries. They may not be on SVT Play at all &mdash;
 try a shorter query in the manual search.</p>
 <section class="panel">
   <div class="panel-inner">
@@ -186,6 +241,24 @@ reachable.</p>
       <p class="sweep-title">{{ p.series_title }}
         <span class="help">tvdbId {{ p.tvdb_id }}</span></p>
       <p class="warn">{{ p.reason }}</p>
+    </div>
+  {% endfor %}
+  </div>
+</section>
+{% endif %}
+
+{% if sweep.out_of_budget %}
+<h2>Not checked this run</h2>
+<p class="help">The run's SVT request budget ran out before these were
+reached, so nothing is known about them either way. This is the honest
+half of the summary above: the sweep stopped, it did not finish and find
+nothing.</p>
+<section class="panel">
+  <div class="panel-inner">
+  {% for p in sweep.out_of_budget %}
+    <div class="sweep-item">
+      <p class="sweep-title">{{ p.series_title }}
+        <span class="help">tvdbId {{ p.tvdb_id }}</span></p>
     </div>
   {% endfor %}
   </div>

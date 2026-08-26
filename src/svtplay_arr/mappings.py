@@ -9,10 +9,11 @@ an empty feed is what makes Sonarr reject the indexer outright.
 This module holds no opinion about *which* SVT programme a series is. A
 wrong series mapping is the class of error `resolver.py` refuses to make on
 its own, one level larger, so the decision lives behind
-`discovery.confident_match`: either a human confirmed the row on the config
-page, or that gate found two independent signals agreeing. Rows of the
-second kind carry `source: auto` (see `models.SOURCE_AUTO`) so the two are
-never indistinguishable afterwards.
+`discovery.corroborated_match`: either a human confirmed the row on the
+config page, or that gate found the series' own episodes corroborating
+exactly one SVT programme and no other. Rows of the second kind carry
+`source: auto` (see `models.SOURCE_AUTO`) so the two are never
+indistinguishable afterwards.
 """
 
 import logging
@@ -286,7 +287,7 @@ def add_mappings(
         # series already points at. Two mappings on one programme answer a
         # search for either with episodes of the same show, and with
         # renameEpisodes=False that is permanent -- too large a
-        # consequence to rest on a title comparison alone.
+        # consequence to rest on anything short of a human looking.
         #
         # Scoped to auto rows on purpose. The resolver tolerates two
         # mappings sharing a slug (it dedupes by GUID), and a human who

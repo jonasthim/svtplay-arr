@@ -1,6 +1,7 @@
 import html as html_mod
 import os
 import re
+from datetime import date, timedelta
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -12,15 +13,22 @@ from fastapi.testclient import TestClient
 from svtplay_arr.api.config_ui import build_config_router
 from svtplay_arr.config import SETTING_FIELDS, Settings
 from svtplay_arr.mappings import MappingTable, add_mapping
-from svtplay_arr.models import SvtEpisode, SvtSearchHit
+from svtplay_arr.models import SonarrEpisode, SvtEpisode, SvtSearchHit
 from svtplay_arr.svt.client import SvtApiError, derive_slug
 
 TITLE = "Gift vid första ögonkastet"
 
 
 class FakeSvt:
-    def __init__(self, hits=None, episodes=None, list_episodes_error=None):
+    def __init__(self, hits=None, episodes=None, list_episodes_error=None,
+                 episodes_by_slug=None):
         self.hits = hits or []
+        # slug -> [SvtEpisode], for the sweep, which reads a *different*
+        # episode list per candidate. Takes precedence over `episodes`
+        # (the single list the per-mapping Check control reads) when a
+        # slug is present in it, so tests written before the sweep
+        # corroborated anything keep the shape they had.
+        self.episodes_by_slug = episodes_by_slug or {}
         # What list_episodes returns/raises for the mapping Check control.
         # Defaulting episodes to [] rather than None means a test that
         # never touches this (i.e. every test written before the Check
@@ -40,15 +48,26 @@ class FakeSvt:
         self.list_episodes_calls.append(slug)
         if self.list_episodes_error is not None:
             raise self.list_episodes_error
+        if self.episodes_by_slug:
+            return self.episodes_by_slug.get(slug, [])
         return self.episodes
 
 
 class FakeSonarr:
-    def __init__(self, series=None):
+    def __init__(self, series=None, episodes=None):
         self.series = series if series is not None else []
+        # series_id -> [SonarrEpisode]. The sweep corroborates a candidate
+        # against these, so a series with none is a series with no
+        # evidence -- which is refused, never written.
+        self._episodes = episodes or {}
+        self.episode_calls: list[int] = []
 
     async def all_series(self):
         return self.series
+
+    async def episodes(self, series_id):
+        self.episode_calls.append(series_id)
+        return self._episodes.get(series_id, [])
 
 
 def _paths(tmp_path: Path):
@@ -3548,6 +3567,34 @@ class SweepSvt(FakeSvt):
         return self.results.get(query, [])
 
 
+# The gate decides on episodes now, not on titles, so a sweep test that
+# expects a row to be written has to supply the evidence for it: a weekly
+# run that both sides agree about, episode for episode.
+SWEEP_FIRST = date(2026, 8, 3)
+
+
+def _svt_run(count=8, start=SWEEP_FIRST):
+    return [
+        SvtEpisode(
+            svt_id=f"v{i + 1}", title=f"Avsnitt {i + 1}",
+            url=f"/video/v{i + 1}/show/{i + 1}", ordinal=i + 1,
+            published=start + timedelta(days=7 * i), available=True,
+            duration_s=None,
+        )
+        for i in range(count)
+    ]
+
+
+def _sonarr_run(series_id, count=8, start=SWEEP_FIRST):
+    return [
+        SonarrEpisode(
+            series_id=series_id, season=1, episode=i + 1,
+            air_date=start + timedelta(days=7 * i), title="",
+        )
+        for i in range(count)
+    ]
+
+
 class BrokenSonarr:
     def __init__(self):
         self.calls = 0
@@ -3578,12 +3625,15 @@ def test_the_index_offers_find_mappings_as_a_plain_form(tmp_path: Path):
     assert "Find mappings" in body
 
 
-def test_a_confident_match_is_written(tmp_path: Path):
-    svt = SweepSvt({OTHER: [SvtSearchHit("vvm123", OTHER, "TvSeries")]})
+def test_a_corroborated_match_is_written(tmp_path: Path):
+    svt = SweepSvt(
+        {OTHER: [SvtSearchHit("vvm123", OTHER, "TvSeries")]},
+        episodes_by_slug={derive_slug(OTHER): _svt_run()},
+    )
     sonarr = FakeSonarr([
         {"id": 7, "tvdbId": 288649, "title": TITLE},      # already mapped
         {"id": 9, "tvdbId": 999, "title": OTHER},
-    ])
+    ], episodes={9: _sonarr_run(9)})
     client, maps = _sweep_client(tmp_path, svt, sonarr)
 
     r = _discover(client, maps)
@@ -3598,8 +3648,12 @@ def test_a_confident_match_is_written(tmp_path: Path):
 
 
 def test_a_written_row_is_marked_as_auto(tmp_path: Path):
-    svt = SweepSvt({OTHER: [SvtSearchHit("vvm123", OTHER, "TvSeries")]})
-    sonarr = FakeSonarr([{"id": 9, "tvdbId": 999, "title": OTHER}])
+    svt = SweepSvt(
+        {OTHER: [SvtSearchHit("vvm123", OTHER, "TvSeries")]},
+        episodes_by_slug={derive_slug(OTHER): _svt_run()},
+    )
+    sonarr = FakeSonarr([{"id": 9, "tvdbId": 999, "title": OTHER}],
+                        episodes={9: _sonarr_run(9)})
     client, maps = _sweep_client(tmp_path, svt, sonarr)
 
     _discover(client, maps)
@@ -3679,8 +3733,12 @@ def test_a_sonarr_outage_writes_nothing_and_does_not_500(tmp_path: Path):
 def test_a_form_supplied_series_title_cannot_reach_the_file(tmp_path: Path):
     # The same guarantee the manual path has, on the automatic one: the
     # title is the permanent filename and comes only from Sonarr's record.
-    svt = SweepSvt({OTHER: [SvtSearchHit("vvm123", OTHER, "TvSeries")]})
-    sonarr = FakeSonarr([{"id": 9, "tvdbId": 999, "title": OTHER}])
+    svt = SweepSvt(
+        {OTHER: [SvtSearchHit("vvm123", OTHER, "TvSeries")]},
+        episodes_by_slug={derive_slug(OTHER): _svt_run()},
+    )
+    sonarr = FakeSonarr([{"id": 9, "tvdbId": 999, "title": OTHER}],
+                        episodes={9: _sonarr_run(9)})
     client, maps = _sweep_client(tmp_path, svt, sonarr)
 
     _discover(client, maps, series_title="WRONG TITLE FROM FORM",
@@ -3695,8 +3753,12 @@ def test_a_form_supplied_series_title_cannot_reach_the_file(tmp_path: Path):
 def test_an_svt_name_is_never_used_as_the_series_title(tmp_path: Path):
     # SVT's spelling differs only in case, so the gate matches -- and the
     # file must still carry Sonarr's spelling byte for byte.
-    svt = SweepSvt({OTHER: [SvtSearchHit("vvm123", OTHER.upper(), "TvSeries")]})
-    sonarr = FakeSonarr([{"id": 9, "tvdbId": 999, "title": OTHER}])
+    svt = SweepSvt(
+        {OTHER: [SvtSearchHit("vvm123", OTHER.upper(), "TvSeries")]},
+        episodes_by_slug={derive_slug(OTHER): _svt_run()},
+    )
+    sonarr = FakeSonarr([{"id": 9, "tvdbId": 999, "title": OTHER}],
+                        episodes={9: _sonarr_run(9)})
     client, maps = _sweep_client(tmp_path, svt, sonarr)
 
     _discover(client, maps)
@@ -3740,8 +3802,12 @@ def test_a_corrupt_expected_mtime_is_refused_before_any_search(tmp_path: Path):
 
 
 def test_a_concurrent_modification_refuses_the_whole_batch(tmp_path: Path):
-    svt = SweepSvt({OTHER: [SvtSearchHit("vvm123", OTHER, "TvSeries")]})
-    sonarr = FakeSonarr([{"id": 9, "tvdbId": 999, "title": OTHER}])
+    svt = SweepSvt(
+        {OTHER: [SvtSearchHit("vvm123", OTHER, "TvSeries")]},
+        episodes_by_slug={derive_slug(OTHER): _svt_run()},
+    )
+    sonarr = FakeSonarr([{"id": 9, "tvdbId": 999, "title": OTHER}],
+                        episodes={9: _sonarr_run(9)})
     client, maps = _sweep_client(tmp_path, svt, sonarr)
     before = maps.read_text(encoding="utf-8")
 
@@ -3759,14 +3825,150 @@ def test_a_concurrent_modification_refuses_the_whole_batch(tmp_path: Path):
     assert OTHER in r.text          # still shown, still one click away
 
 
-def test_the_sweep_never_asks_svt_for_an_episode_list(tmp_path: Path):
-    svt = SweepSvt({OTHER: [SvtSearchHit("vvm123", OTHER, "TvSeries")]})
-    sonarr = FakeSonarr([{"id": 9, "tvdbId": 999, "title": OTHER}])
+def test_the_sweep_reads_episode_lists_because_that_is_what_decides(
+    tmp_path: Path
+):
+    # The inverse of what this test used to assert. The sweep once refused
+    # to fetch an episode list at all, and the gate underneath was a string
+    # comparison because of it. Reading the episodes *is* the gate now, so
+    # the guarantee that matters is a different one: it must read exactly
+    # the candidates it is deciding between, and nothing else.
+    svt = SweepSvt(
+        {OTHER: [SvtSearchHit("vvm123", OTHER, "TvSeries")]},
+        episodes_by_slug={derive_slug(OTHER): _svt_run()},
+    )
+    sonarr = FakeSonarr([
+        {"id": 7, "tvdbId": 288649, "title": TITLE},      # already mapped
+        {"id": 9, "tvdbId": 999, "title": OTHER},
+    ], episodes={9: _sonarr_run(9)})
     client, maps = _sweep_client(tmp_path, svt, sonarr)
 
     _discover(client, maps)
 
-    assert svt.list_episodes_calls == []
+    assert svt.list_episodes_calls == [derive_slug(OTHER)]
+    # Not the already-mapped series: it costs no request at all, the same
+    # as before.
+    assert sonarr.episode_calls == [9]
+
+
+def test_the_sweep_never_touches_the_download_path(tmp_path: Path):
+    # Reading episode lists is the matching read. Resolving a stream is the
+    # *download* path, and no route on this page may reach it.
+    class QualityIsForbidden(SweepSvt):
+        async def resolve_quality(self, svt_id):
+            raise AssertionError("the sweep must not resolve a stream")
+
+    svt = QualityIsForbidden(
+        {OTHER: [SvtSearchHit("vvm123", OTHER, "TvSeries")]},
+        episodes_by_slug={derive_slug(OTHER): _svt_run()},
+    )
+    sonarr = FakeSonarr([{"id": 9, "tvdbId": 999, "title": OTHER}],
+                        episodes={9: _sonarr_run(9)})
+    client, maps = _sweep_client(tmp_path, svt, sonarr)
+
+    assert _discover(client, maps).status_code == 200
+    assert MappingTable.load(maps).for_tvdb(999) is not None
+
+
+def test_a_same_named_programme_whose_episodes_disagree_is_not_written(
+    tmp_path: Path
+):
+    # The Critical the old gate would have written: the names are
+    # identical, and the episodes are months apart.
+    svt = SweepSvt(
+        {OTHER: [SvtSearchHit("vvm123", OTHER, "TvSeries")]},
+        episodes_by_slug={
+            derive_slug(OTHER): _svt_run(start=SWEEP_FIRST + timedelta(days=300))
+        },
+    )
+    sonarr = FakeSonarr([{"id": 9, "tvdbId": 999, "title": OTHER}],
+                        episodes={9: _sonarr_run(9)})
+    client, maps = _sweep_client(tmp_path, svt, sonarr)
+
+    r = _discover(client, maps)
+
+    assert MappingTable.load(maps).for_tvdb(999) is None
+    # And the page says *why*, in the numbers that decided it.
+    assert "0 of 8 episodes matched" in r.text
+
+
+def test_a_differently_named_programme_whose_episodes_agree_is_written(
+    tmp_path: Path
+):
+    # The mapping the old gate refused forever: TVDB's English title
+    # against SVT's Swedish one. The title is only the query now.
+    svt = SweepSvt(
+        {"Married at First Sight Sweden": [
+            SvtSearchHit("gvfo", TITLE, "TvSeries")
+        ]},
+        episodes_by_slug={derive_slug(TITLE): _svt_run()},
+    )
+    sonarr = FakeSonarr(
+        [{"id": 9, "tvdbId": 999, "title": "Married at First Sight Sweden"}],
+        episodes={9: _sonarr_run(9)},
+    )
+    client, maps = _sweep_client(tmp_path, svt, sonarr)
+
+    _discover(client, maps)
+
+    created = MappingTable.load(maps).for_tvdb(999)
+    assert created is not None
+    assert created.svt_series_id == "gvfo"
+    # Sonarr's spelling is still the permanent filename, not SVT's.
+    assert created.series_title == "Married at First Sight Sweden"
+
+
+def test_the_written_row_shows_the_evidence_that_wrote_it(tmp_path: Path):
+    # A row nobody confirmed has to carry its reason on the page that
+    # created it, or auditing it means reading mappings.yaml over SSH --
+    # the workflow this page exists to remove.
+    svt = SweepSvt(
+        {OTHER: [SvtSearchHit("vvm123", OTHER, "TvSeries")]},
+        episodes_by_slug={derive_slug(OTHER): _svt_run()},
+    )
+    sonarr = FakeSonarr([{"id": 9, "tvdbId": 999, "title": OTHER}],
+                        episodes={9: _sonarr_run(9)})
+    client, maps = _sweep_client(tmp_path, svt, sonarr)
+
+    assert "8 of 8 episodes matched" in _discover(client, maps).text
+
+
+def test_the_sweep_corroborates_at_the_tolerance_the_service_booted_with(
+    tmp_path: Path
+):
+    # The page must not corroborate at a different air-date window from the
+    # one the resolver will later match at. A router built with the booted
+    # Settings passes that value through; one built without falls back to
+    # the same default the service would run at.
+    from svtplay_arr.config import Settings
+
+    hits = {OTHER: [SvtSearchHit("vvm123", OTHER, "TvSeries")]}
+    # Published two days late: outside the default tolerance of 1.
+    slugged = {derive_slug(OTHER): _svt_run(start=SWEEP_FIRST + timedelta(days=2))}
+
+    def _run(base, tolerance):
+        base.mkdir(parents=True, exist_ok=True)
+        cfg, maps = _paths(base)
+        booted = Settings(
+            sonarr_url="http://sonarr.test:8989", sonarr_api_key="k",
+            incomplete_dir=base / "i", completed_dir=base / "c",
+            air_date_tolerance_days=tolerance,
+        )
+        app = FastAPI()
+        app.include_router(build_config_router(
+            cfg, maps,
+            SweepSvt(hits, episodes_by_slug=slugged),
+            FakeSonarr([{"id": 9, "tvdbId": 999, "title": OTHER}],
+                       episodes={9: _sonarr_run(9)}),
+            booted=booted,
+        ))
+        client = TestClient(app)
+        client.post("/config/mappings/discover",
+                    data={"expected_mtime": str(maps.stat().st_mtime)})
+        return MappingTable.load(maps).for_tvdb(999)
+
+    assert _run(tmp_path / "tight", 1) is None
+    assert _run(tmp_path / "loose", 3) is not None
 
 
 def test_the_sweep_page_never_renders_the_api_key(tmp_path: Path):
@@ -3871,11 +4073,15 @@ def test_every_confident_row_is_written_in_a_single_write(
     import svtplay_arr.mappings as mappings_mod
 
     titles = ["Show A", "Show B", "Show C"]
-    svt = SweepSvt({t: [SvtSearchHit(f"id{i}", t, "TvSeries")]
-                    for i, t in enumerate(titles)})
-    sonarr = FakeSonarr([
-        {"id": i, "tvdbId": 500 + i, "title": t} for i, t in enumerate(titles)
-    ])
+    svt = SweepSvt(
+        {t: [SvtSearchHit(f"id{i}", t, "TvSeries")]
+         for i, t in enumerate(titles)},
+        episodes_by_slug={derive_slug(t): _svt_run() for t in titles},
+    )
+    sonarr = FakeSonarr(
+        [{"id": i, "tvdbId": 500 + i, "title": t} for i, t in enumerate(titles)],
+        episodes={i: _sonarr_run(i) for i in range(len(titles))},
+    )
     client, maps = _sweep_client(tmp_path, svt, sonarr)
 
     # Patched only now, so the fixture's own setup write is not counted.
@@ -3899,17 +4105,25 @@ def test_only_what_the_gate_approved_is_written_alongside_it(tmp_path: Path):
     # a loosened route could quietly slip the ambiguous one into the same
     # batch -- the confident row makes the write happen, and the extra row
     # rides along inside it.
-    svt = SweepSvt({
-        "Confident Show": [SvtSearchHit("c1", "Confident Show", "TvSeries")],
-        OTHER: [
-            SvtSearchHit("a1", OTHER, "TvSeries"),
-            SvtSearchHit("a2", OTHER.upper(), "TvSeries"),
-        ],
-    })
+    svt = SweepSvt(
+        {
+            "Confident Show": [
+                SvtSearchHit("c1", "Confident Show", "TvSeries")
+            ],
+            OTHER: [
+                SvtSearchHit("a1", OTHER, "TvSeries"),
+                SvtSearchHit("a2", OTHER.upper(), "TvSeries"),
+            ],
+        },
+        # Only the confident one has evidence. The ambiguous pair share a
+        # derived slug and are left with nothing to corroborate, which is
+        # a refusal, not a write.
+        episodes_by_slug={derive_slug("Confident Show"): _svt_run()},
+    )
     sonarr = FakeSonarr([
         {"id": 8, "tvdbId": 888, "title": "Confident Show"},
         {"id": 9, "tvdbId": 999, "title": OTHER},
-    ])
+    ], episodes={8: _sonarr_run(8), 9: _sonarr_run(9)})
     client, maps = _sweep_client(tmp_path, svt, sonarr)
 
     r = _discover(client, maps)
@@ -4056,8 +4270,12 @@ def test_nothing_is_explained_when_nothing_was_auto_matched(tmp_path: Path):
 def test_a_swept_row_shows_its_marker_on_the_very_next_page_load(tmp_path: Path):
     # End to end, through the real writer rather than a hand-written file:
     # what the sweep writes is what the table then marks.
-    svt = SweepSvt({OTHER: [SvtSearchHit("vvm123", OTHER, "TvSeries")]})
-    sonarr = FakeSonarr([{"id": 9, "tvdbId": 999, "title": OTHER}])
+    svt = SweepSvt(
+        {OTHER: [SvtSearchHit("vvm123", OTHER, "TvSeries")]},
+        episodes_by_slug={derive_slug(OTHER): _svt_run()},
+    )
+    sonarr = FakeSonarr([{"id": 9, "tvdbId": 999, "title": OTHER}],
+                        episodes={9: _sonarr_run(9)})
     client, maps = _sweep_client(tmp_path, svt, sonarr)
 
     _discover(client, maps)
@@ -4078,11 +4296,17 @@ def test_two_sonarr_series_differing_only_by_year_write_one_row(tmp_path: Path):
     # S01E01, the resolver followed the slug to the original show, and the
     # file landed permanently under the reboot's name.
     hits = [SvtSearchHit("vvm", "Vem vet mest?", "TvSeries")]
-    svt = SweepSvt({"Vem vet mest?": hits, "Vem vet mest? (2021)": hits})
+    # Both series' episodes agree with the one SVT run -- Sonarr carrying
+    # the show twice -- so the gate corroborates both and only the
+    # batch-wide claim guard stops the second row.
+    svt = SweepSvt(
+        {"Vem vet mest?": hits, "Vem vet mest? (2021)": hits},
+        episodes_by_slug={"vem-vet-mest": _svt_run()},
+    )
     sonarr = FakeSonarr([
         {"id": 1, "tvdbId": 100, "title": "Vem vet mest?"},
         {"id": 2, "tvdbId": 200, "title": "Vem vet mest? (2021)"},
-    ])
+    ], episodes={1: _sonarr_run(1), 2: _sonarr_run(2)})
     client, maps = _sweep_client(tmp_path, svt, sonarr)
 
     r = _discover(client, maps)
@@ -4113,8 +4337,12 @@ def test_a_sweep_will_not_claim_a_programme_mapped_by_hand(tmp_path: Path):
     # The fixture row maps tvdb 288649 to svt jpmQD3q by hand. A sweep that
     # matches the same programme for a different series must not append a
     # second row to it.
-    svt = SweepSvt({OTHER: [SvtSearchHit("jpmQD3q", OTHER, "TvSeries")]})
-    sonarr = FakeSonarr([{"id": 9, "tvdbId": 999, "title": OTHER}])
+    svt = SweepSvt(
+        {OTHER: [SvtSearchHit("jpmQD3q", OTHER, "TvSeries")]},
+        episodes_by_slug={derive_slug(OTHER): _svt_run()},
+    )
+    sonarr = FakeSonarr([{"id": 9, "tvdbId": 999, "title": OTHER}],
+                        episodes={9: _sonarr_run(9)})
     client, maps = _sweep_client(tmp_path, svt, sonarr)
 
     r = _discover(client, maps)
