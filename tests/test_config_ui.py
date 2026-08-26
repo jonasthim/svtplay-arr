@@ -3972,11 +3972,25 @@ def test_the_sweep_corroborates_at_the_tolerance_the_service_booted_with(
 
 
 def test_the_sweep_page_never_renders_the_api_key(tmp_path: Path):
-    svt = SweepSvt({OTHER: [SvtSearchHit("vvm123", OTHER, "TvSeries")]})
-    sonarr = FakeSonarr([{"id": 9, "tvdbId": 999, "title": OTHER}])
+    # Both the corroborated path and the surfaced-with-evidence path: the
+    # sweep now renders per-candidate evidence and several new failure
+    # reasons, and none of them may carry the key.
+    svt = SweepSvt(
+        {
+            OTHER: [SvtSearchHit("vvm123", OTHER, "TvSeries")],
+            "Show B": [SvtSearchHit("b1", "Show B", "TvSeries")],
+        },
+        episodes_by_slug={derive_slug(OTHER): _svt_run()},
+    )
+    sonarr = FakeSonarr([
+        {"id": 9, "tvdbId": 999, "title": OTHER},
+        {"id": 10, "tvdbId": 1000, "title": "Show B"},
+    ], episodes={9: _sonarr_run(9), 10: _sonarr_run(10)})
     client, maps = _sweep_client(tmp_path, svt, sonarr)
 
-    assert "SECRET-KEY-VALUE" not in _discover(client, maps).text
+    body = _discover(client, maps).text
+    assert "8 of 8 episodes matched" in body      # the page really rendered
+    assert "SECRET-KEY-VALUE" not in body
 
 
 def test_an_svt_search_failure_is_reported_per_series(tmp_path: Path):
@@ -4027,6 +4041,77 @@ def test_hitting_the_search_cap_is_said_out_loud(tmp_path: Path, monkeypatch):
     assert "per-run limit of 2" in said
     assert "4 unmapped series were" in said
     assert "Run Find mappings again" in said
+
+
+def test_hitting_the_request_budget_is_said_out_loud(tmp_path: Path, monkeypatch):
+    # A partial sweep reported as a complete one is the failure mode that
+    # matters most here: the operator reads "0 need a decision" and
+    # concludes the library holds nothing more to map, when the run simply
+    # stopped asking SVT.
+    import svtplay_arr.api.config_ui as config_ui
+
+    svt = SweepSvt({})
+    sonarr = FakeSonarr([
+        {"id": i, "tvdbId": 1000 + i, "title": f"Show {i}"} for i in range(6)
+    ])
+    client, maps = _sweep_client(tmp_path, svt, sonarr)
+    monkeypatch.setattr(config_ui, "_SWEEP_REQUEST_BUDGET", 2)
+    monkeypatch.setattr(config_ui, "_SWEEP_CONCURRENCY", 1)
+
+    r = _discover(client, maps)
+
+    assert len(svt.queries) == 2
+    warnings = " ".join(
+        " ".join(m.split())
+        for m in re.findall(r'<p class="warn">(.*?)</p>', r.text, re.S)
+    )
+    assert "budget of 2 SVT requests" in warnings
+    assert "this sweep is incomplete" in warnings
+    assert "Run Find mappings again" in warnings
+    # ...and the four it never reached are named as unchecked, not as
+    # series SVT had nothing for.
+    assert "Not checked this run" in r.text
+
+
+def test_the_budget_warning_is_absent_when_the_budget_was_not_reached(
+    tmp_path: Path
+):
+    svt = SweepSvt(
+        {OTHER: [SvtSearchHit("vvm123", OTHER, "TvSeries")]},
+        episodes_by_slug={derive_slug(OTHER): _svt_run()},
+    )
+    sonarr = FakeSonarr([{"id": 9, "tvdbId": 999, "title": OTHER}],
+                        episodes={9: _sonarr_run(9)})
+    client, maps = _sweep_client(tmp_path, svt, sonarr)
+
+    r = _discover(client, maps)
+
+    assert "sweep is incomplete" not in r.text
+    assert "Not checked this run" not in r.text
+
+
+def test_a_sonarr_episode_outage_is_a_rendered_page_not_a_500(tmp_path: Path):
+    # Corroboration reads Sonarr's episode list, which is a new way for
+    # this route to fail. It gets the same treatment as every other
+    # failure here: a rendered page, an untouched file, and no 500.
+    class ExplodingSonarr(FakeSonarr):
+        async def episodes(self, series_id):
+            raise RuntimeError("episode request failed")
+
+    svt = SweepSvt(
+        {OTHER: [SvtSearchHit("vvm123", OTHER, "TvSeries")]},
+        episodes_by_slug={derive_slug(OTHER): _svt_run()},
+    )
+    sonarr = ExplodingSonarr([{"id": 9, "tvdbId": 999, "title": OTHER}])
+    client, maps = _sweep_client(tmp_path, svt, sonarr)
+    before = maps.read_text(encoding="utf-8")
+
+    r = _discover(client, maps)
+
+    assert r.status_code == 200
+    assert MappingTable.load(maps).for_tvdb(999) is None
+    assert maps.read_text(encoding="utf-8") == before
+    assert "Could not be checked" in r.text
 
 
 def test_the_cap_warning_is_absent_when_the_cap_was_not_reached(tmp_path: Path):

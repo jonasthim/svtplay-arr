@@ -376,48 +376,95 @@ write it replaces can go unnoticed until the next distinguishable change.
 ### Find mappings: the automatic sweep
 
 The **Find mappings** button on the configuration page searches SVT for every
-Sonarr series that is not mapped yet, saves the rows it is certain about, and
-lists everything else for you to decide with one click each.
+Sonarr series that is not mapped yet, saves the rows the *episodes* confirm,
+and lists everything else for you to decide with one click each.
 
-"Certain" means **both** of these, and nothing less:
+**The title is only the search query.** It used to be the decision, and that
+was a proxy that failed in both directions: it could never map `Married at
+First Sight Sweden` to `Gift vid första ögonkastet`, and it treated two
+different programmes both named `Vem vet mest?` as the same show. What decides
+now is whether the episodes line up.
 
-1. The Sonarr series title and the SVT programme name are **identical** once
-   casefolded and whitespace-collapsed. A trailing `(2019)` is stripped from
-   **Sonarr's** title only — carrying TVDB's disambiguating year is a fact
-   about Sonarr's data, not a statement that a year in a title is noise.
-   Stripping it from SVT's name too would make `Big Brother (2019)` match a
-   programme actually named `Big Brother (2020)`.
-2. **Exactly one** SVT programme (type `TvSeries` or `TvShow`) matches that
-   way.
-3. **No other series already claims that SVT programme.** Two mappings on one
-   programme answer a search for either with episodes of the same show. An
-   original and its year-tagged reboot both normalise to the same Sonarr-side
-   title, so this is the rule that stops both being written; the second is
-   listed under *Already claimed by another series*, one click from being
-   accepted deliberately if that is what you want.
+#### How a candidate is found
 
-Several candidates, a near miss, or nothing found are all surfaced, never
-written. Diacritics are deliberately **not** folded during the comparison:
-Swedish titles are distinguished by å/ä/ö, and folding them would manufacture
-exact matches between genuinely different shows — which is the one error this
-rule exists to prevent. A series whose TVDB title differs from SVT's Swedish
-title will therefore not match automatically; it becomes a suggestion.
+Each unmapped series is searched for under its own Sonarr title **and** the
+`alternateTitles` Sonarr carries — TVDB usually keeps the original-language
+title there, which for a Swedish show is very often exactly SVT's name.
+Queries are deduplicated (`Solsidan` and `Solsidan (2019)` are one search) and
+capped per series. Every programme returned is a candidate; the few most
+promising are the ones actually checked, with a name identical to one of the
+series' titles ranked first — not because that makes it right, but because if
+two programmes share a name it is those two whose episodes most need
+comparing.
+
+#### How a candidate is confirmed
+
+For each candidate the sweep reads that programme's SVT episode list and your
+series' episode list from Sonarr, and counts the episodes that correspond
+under **the resolver's own rule** — the one in `src/svtplay_arr/matching.py`,
+imported rather than restated, at your configured `air_date_tolerance_days`:
+
+- available on SVT (not flagged upcoming),
+- published within the tolerance of Sonarr's air date,
+- at the same episode number as SVT's ordinal within its run.
+
+An episode counts only when the correspondence is one-to-one in both
+directions, so a Sonarr special dated alongside the run or an SVT rerun listed
+twice can never inflate the count. Sonarr season 0 is excluded for the same
+reason.
+
+A row is written without you confirming it only when **all** of these hold:
+
+1. **Exactly one** candidate corroborates.
+2. It corroborates on at least **3** uniquely-matching episodes. Two is
+   reachable by coincidence — two weekly shows in the same broadcast slot share
+   an air date at episode 1 and again at episode 2 with nothing else in common.
+3. **Every other candidate that was checked corroborates on zero.** Not "fewer
+   than the winner": a rival that partly agrees has been out-scored, not ruled
+   out, and out-scoring is the reasoning that writes permanent filenames for
+   the wrong show.
+4. **No other series already claims that SVT programme.** Two mappings on one
+   programme answer a search for either with episodes of the same show. The
+   second is listed under *Already claimed by another series*, one click from
+   being accepted deliberately if that is what you want.
+
+**Short runs.** A series SVT has only just started publishing cannot reach
+three, and refusing it forever would be the old rule's failure in a new shape.
+So when fewer than 3 episodes are available to compare at all, *all* of them
+must correspond and there must be at least **2**. Never one: a single shared
+air date at episode 1 is a coincidence any weekly show produces.
+
+**No evidence is not confidence.** A series Sonarr knows about that has not
+aired, or that SVT has not published, gives nothing to compare — so it is
+surfaced for a decision and never written. The same goes for a candidate whose
+episode list could not be read: an unchecked candidate is not a refuted one,
+so an SVT outage part-way through a series' candidates refuses that series
+outright rather than writing on whichever candidate happened to answer.
+
+#### What you see for everything else
+
+Every candidate on the results page carries its evidence — "2 of 8 episodes
+matched", or "no episodes to compare", or "SVT's episode list could not be
+read". That count is the thing you need in order to decide; the heading is
+not.
 
 Practical notes:
 
-- Series that already have a row are skipped without an SVT search.
+- Series that already have a row are skipped without any request.
 - The whole batch is written in **one** atomic write, or not at all.
 - Rows land marked `source: auto`, and the mappings table shows them with an
   **Auto-matched** badge beside the series title, explained in one line under
-  the table. Check them — `series_title` is still the permanent filename — and
-  remove any that look wrong. Rows with no `source` field, which is every row
-  in a file written before this feature, are hand-confirmed and carry no
-  badge.
+  the table. Check them — `series_title` is still the permanent filename, and
+  still comes only from Sonarr's record — and remove any that look wrong. Rows
+  with no `source` field, which is every row in a file written before this
+  feature, are hand-confirmed and carry no badge.
 - A suggestion you accept by hand is an ordinary mapping and stays `manual`.
-- Bounded at 4 concurrent SVT searches and **200 searches per run**. Hitting
-  that limit is reported on the page rather than silently truncating your
-  library; run it again to continue, since this run's rows are now mapped and
-  skipped.
+- Bounded at 4 concurrent SVT requests, **200 series per run**, at most 3
+  searches and 3 episode-list reads per series, and **600 SVT requests per run
+  in total**. Whichever limit bites is reported on the page rather than
+  silently truncating your library — a partial sweep that reads as a complete
+  one is the failure that matters here. Run it again to continue, since this
+  run's rows are now mapped and skipped.
 - If `mappings.yaml` will not parse, nothing is searched and nothing is
   written. Fix the file first.
 
@@ -428,8 +475,9 @@ SVTPLAY_ARR_CONFIG=/etc/svtplay-arr/config.yaml \
   /opt/svtplay-arr/.venv/bin/svtplay-arr-suggest-mappings
 ```
 
-Runs exactly the sweep above and **never writes `mappings.yaml`**. Confident
-rows go to stdout as pasteable YAML — slug derived, `source: auto` included, so
+Runs exactly the sweep above, at the same configured `air_date_tolerance_days`,
+and **never writes `mappings.yaml`**. Corroborated rows go to stdout as
+pasteable YAML — slug derived, `source: auto` included, so
 they are byte-for-byte what the page would have written. Everything needing a
 decision goes to stderr, so `> rows.yaml` cannot sweep the undecided part into
 a file.

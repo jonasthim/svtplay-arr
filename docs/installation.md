@@ -243,13 +243,15 @@ copied verbatim from Sonarr's record rather than typed, which matters because
 it becomes the permanent filename.
 
 **Or map the whole library at once** with *Find mappings* on the same page. It
-searches SVT for every Sonarr series that is not mapped yet and saves only the
-ones where the Sonarr title and the SVT programme name are identical
-(casefolded and whitespace-collapsed; a trailing `(2019)` is stripped from
-Sonarr's title only), exactly one SVT programme matches, and no other series
-already claims that programme. Everything less certain is listed for you to accept
-with one click. Rows it writes are marked `source: auto` — check them, since
-`series_title` is still the permanent filename.
+searches SVT for every Sonarr series that is not mapped yet — under its own
+title and Sonarr's alternate titles — and then decides on the **episodes**: it
+reads each likely SVT programme's episode list and compares it against
+Sonarr's, and saves only the ones where enough episodes actually correspond
+(same air date within your tolerance, same episode number), where no other
+candidate corresponds at all, and where no other series already claims that
+programme. Everything less certain is listed for you to accept with one click,
+showing how many episodes matched. Rows it writes are marked `source: auto` —
+check them, since `series_title` is still the permanent filename.
 
 **Or from the terminal**, if you would rather seed the file by hand:
 

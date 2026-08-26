@@ -28,6 +28,7 @@ src/svtplay_arr/
   svt/
     parser.py     Show-page parsing
     client.py     GraphQL search, episode listing, quality resolution
+  matching.py     The one episode-matching rule, shared
   resolver.py     The confidence gate
   downloader.py   Downloader protocol + the svtplay-dl implementation
   worker.py       Job execution, atomic publish
@@ -47,11 +48,17 @@ The seams are the design, and they are worth stating as rules:
 - **`config_ui.py` contains no matching logic and no SVT knowledge.** It calls
   the same clients `discovery.py` does. That seam is what makes it impossible
   for a UI change to alter what gets grabbed.
+- **Only `matching.py` holds the episode-matching rule.** `resolver.py` and
+  `discovery.py` both import it and neither restates it, because the sweep
+  decides whether a *series* mapping is safe by counting how often that exact
+  rule holds — and a sweep corroborating under a looser rule than the resolver
+  later matches under would write mappings the resolver then refuses.
 - **Only `discovery.py` decides that a mapping may be written unconfirmed.**
-  It mirrors `resolver.py` one level up — two independent signals, refuse on
-  any doubt — and it is the only place that rule lives. Its normalisation is
-  asymmetric on purpose: the trailing-year strip applies to Sonarr's title and
-  not to SVT's name.
+  It mirrors `resolver.py` one level up — refuse on any doubt — and it is the
+  only place that rule lives. It decides on **episodes**, not on titles; the
+  title is only the search query. Its normalisation survives for ranking and
+  deduplication, and is asymmetric on purpose: the trailing-year strip applies
+  to Sonarr's title and not to SVT's name.
 - **`app.py` only assembles.** If you find yourself adding matching, download
   or wire-format logic there, it belongs somewhere else.
 
@@ -195,6 +202,15 @@ require.
 
 ### The two-signal gate
 
+The rule below lives in
+[`src/svtplay_arr/matching.py`](../src/svtplay_arr/matching.py) as
+`episode_matches`, in exactly one copy. `resolver.py` calls it forwards (to
+answer a Sonarr search) and backwards (for the RSS feed's reverse rule), and
+`discovery.py` calls it repeatedly to decide whether a whole series mapping may
+be written with nobody confirming it. Those callers are pinned as holding the
+same function object, as actually calling it, and as doing none of the
+air-date arithmetic themselves.
+
 Given a mapped series and a target episode, an SVT episode is a candidate only
 if **all** of these hold:
 
@@ -264,8 +280,9 @@ rule directly, because there is no `(season, episode)` to start from.
 So it walks the match backwards: for each mapped series, take SVT episodes that
 are available, have an ordinal and a publication date, and fall inside
 `rss_window_days`. For each, find Sonarr episodes where the season is greater
-than zero, the episode number equals SVT's ordinal, and the air dates agree
-within tolerance. **Exactly one** match, or the candidate is skipped.
+than zero and `matching.episode_matches` holds — the same predicate as the
+forward rule, read from the other end, so the two cannot drift.
+**Exactly one** match, or the candidate is skipped.
 
 Season 0 is excluded deliberately: a special dated alongside the run would
 satisfy both signals and claim the episode, writing a permanent `S00Exx`
@@ -536,8 +553,9 @@ Server-rendered HTML mounted at `/config`. It contains no matching logic and no
 SVT knowledge — it calls the same `SvtClient` and `SonarrClient` that
 `discovery.py` does, which is the seam that guarantees a UI change cannot alter
 what gets grabbed. The Find mappings sweep is the one route that writes without
-a per-row confirmation, and it may write only what `discovery.confident_match`
-approved; that gate lives in `discovery.py`, not here.
+a per-row confirmation, and it may write only what
+`discovery.corroborated_match` approved; that gate lives in `discovery.py`,
+not here.
 
 Routes:
 
@@ -556,12 +574,16 @@ POST /config/mappings/discover          sweep Sonarr for unmapped series
 `expected_mtime`, loads mappings.yaml (refusing to sweep at all if it will not
 parse — without knowing what is already mapped it would re-search the library
 and could append a duplicate on top of a file it could not read), runs
-`discovery.sweep_for_mappings`, and writes the confident rows in **one** atomic
-`add_mappings` call. The sweep itself writes nothing, so a Sonarr outage
-part-way through leaves no partial file. Bounded at 4 concurrent SVT searches
-and 200 searches per run; hitting the cap is reported on the page, not silently
-applied. Rows land marked `source: auto`; a suggestion accepted by hand goes
-through `POST /config/mappings` like any other and stays `manual`.
+`discovery.sweep_for_mappings` (passing the `air_date_tolerance_days` the
+service booted with, so the sweep corroborates at the window the resolver will
+later match at), and writes the corroborated rows in **one** atomic
+`add_mappings` call. The sweep itself writes nothing, so a Sonarr or SVT outage
+part-way through leaves no partial file. Bounded at 4 concurrent SVT requests,
+200 series per run and 600 SVT requests per run; whichever limit bites is
+reported on the page, not silently applied — a partial sweep reported as a
+complete one is the failure mode that matters here. Rows land marked
+`source: auto`; a suggestion accepted by hand goes through
+`POST /config/mappings` like any other and stays `manual`.
 
 The rules it inherits, all of them pinned by tests:
 

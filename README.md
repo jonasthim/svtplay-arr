@@ -156,26 +156,42 @@ Adding a show means adding one of these rows — through the configuration page
 by hand.
 
 **Find mappings** on the configuration page sweeps your whole Sonarr library
-at once: it searches SVT for every series that is not mapped yet and saves the
-rows it is certain about. "Certain" is deliberately narrow — the Sonarr title
-and the SVT programme name must be *identical* once casefolded, and exactly one
-SVT programme may match. A trailing `(2019)` is stripped from **Sonarr's** title
-only, because carrying TVDB's disambiguating year is a fact about Sonarr's data;
-stripping it from SVT's name too would make `Big Brother (2019)` and `Big
-Brother (2020)` the same show. And no two series may be mapped to one SVT
-programme, so an original and its year-tagged reboot cannot both claim it. Anything less —
-several candidates, a near miss, nothing found — is listed for you to decide,
-one click each, and never written. A wrong series mapping is exactly the
+at once: it searches SVT for every series that is not mapped yet — under its
+own title *and* the alternate titles Sonarr carries — and then decides on the
+**episodes**, not on the name.
+
+For each likely SVT programme it reads that programme's episode list and your
+series' episode list from Sonarr, and counts how many episodes correspond under
+the resolver's own rule: available on SVT, published within your
+`air_date_tolerance_days` of Sonarr's air date, at the same episode number. A
+genuine match produces a run of agreeing episodes; a different show with the
+same name produces none. The title is only the search query.
+
+A row is saved without you confirming it only when exactly one candidate
+corroborates, on at least **3** uniquely-matching episodes, and every other
+candidate it checked corroborates on **zero**. A run SVT has only just started
+publishing falls back to "all of the episodes available to compare, and at
+least **2**" — never one, which is a coincidence any weekly show produces. A
+series with nothing aired to compare is no evidence, so it is never written.
+And no two series may be mapped to one SVT programme, so an original and its
+year-tagged reboot cannot both claim it.
+
+Everything not saved is listed for you to decide, one click each, *with the
+count that decided it* — "2 of 8 episodes matched" is what tells you whether
+you are looking at the right show. A wrong series mapping is exactly the
 mistake this project refuses to make on its own, and one level larger than a
 wrong episode match: it makes *every* episode of that show a permanently wrong
 filename.
 
 Rows written that way carry `source: auto` in the file and an **Auto-matched**
 badge in the mappings table, so a mapping nobody confirmed is never
-indistinguishable from one you picked yourself — in the file or on the page. Diacritics
-are deliberately *not* folded during the comparison: Swedish titles are
-distinguished by å/ä/ö, and folding them would manufacture exact matches
-between genuinely different shows.
+indistinguishable from one you picked yourself — in the file or on the page.
+
+Reading episode lists costs requests, so a run is bounded: a few searches per
+series, an episode list per candidate it checks, and a hard ceiling on the
+total. A run that stops at that ceiling says so on the page rather than
+reading as a complete sweep that found nothing — run it again to continue,
+since this run's rows are now mapped and skipped.
 
 `svtplay-arr-suggest-mappings` runs the same sweep from a terminal and prints
 what it would write, without writing anything.
@@ -213,8 +229,14 @@ blocklist works — a bad grab is not something a retry fixes.
 So the trade is explicit and it is not a bug: **some episodes will need manual
 intervention, and that is preferred over any chance of writing a permanently
 wrong filename into the library.** Every rule in
-`src/svtplay_arr/resolver.py` exists because of a specific trap observed in
+`src/svtplay_arr/matching.py` exists because of a specific trap observed in
 real SVT data; each one is commented with the trap it was written against.
+
+That rule lives in one file and has exactly one implementation, because
+**Find mappings** now uses it too: deciding a whole *series* mapping is the
+same question asked many times over, and a sweep that corroborated under a
+looser rule than the resolver later matches under would write mappings the
+resolver then refuses.
 
 ## The configuration page
 

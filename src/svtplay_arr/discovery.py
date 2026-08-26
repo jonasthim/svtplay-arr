@@ -252,6 +252,12 @@ class Evidence:
         if self.comparable <= 0:
             # Nothing aired, or nothing published: no evidence, so no
             # confidence. Never a write.
+            #
+            # Redundant with the short-run floor below as the numbers
+            # currently stand (0 == 0 but 0 < 2), and deliberately kept:
+            # "no evidence is not confidence" is a rule this module states,
+            # not a result it lets fall out of arithmetic that a later
+            # change to SHORT_RUN_MIN_EPISODES could quietly invert.
             return False
         if self.comparable >= ACCEPT_MIN_EPISODES:
             return self.matched >= ACCEPT_MIN_EPISODES
