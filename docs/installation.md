@@ -242,17 +242,24 @@ series beside the results; pick one of each and confirm. The `series_title` is
 copied verbatim from Sonarr's record rather than typed, which matters because
 it becomes the permanent filename.
 
-**Or from the terminal**, if you would rather seed the file:
+**Or map the whole library at once** with *Find mappings* on the same page. It
+searches SVT for every Sonarr series that is not mapped yet and saves only the
+ones where the Sonarr title and the SVT programme name are identical
+(casefolded, whitespace-collapsed, a trailing `(2019)` stripped) and exactly
+one SVT programme matches. Everything less certain is listed for you to accept
+with one click. Rows it writes are marked `source: auto` — check them, since
+`series_title` is still the permanent filename.
+
+**Or from the terminal**, if you would rather seed the file by hand:
 
 ```sh
 SVTPLAY_ARR_CONFIG=/etc/svtplay-arr/config.yaml \
   /opt/svtplay-arr/.venv/bin/svtplay-arr-suggest-mappings
 ```
 
-This searches SVT for every series title in your Sonarr and prints candidate
-rows as YAML to stdout. It **never writes the file**. Check every row, fill in
-`svt_slug` by hand from the SVT Play URL (the tool leaves it blank), and paste
-what survives into `mappings.yaml`.
+This runs the same sweep and **never writes the file**. Confident rows print to
+stdout as pasteable YAML, with the slug already derived; everything needing a
+decision prints to stderr.
 
 Mappings are re-read while the service runs — adding a show takes effect on the
 next search, with no restart. Settings are not; those need

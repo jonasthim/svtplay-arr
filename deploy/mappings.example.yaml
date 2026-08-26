@@ -17,15 +17,20 @@
 # outright if nothing comes back. Add at least one mapping before adding the
 # indexer in Sonarr.
 #
-# Prefer the configuration page (/config) or the packaged suggestion script
-# over hand-editing:
+# Prefer the configuration page (/config) over hand-editing. Its "Find
+# mappings" button sweeps your whole Sonarr library, writes the rows where
+# the Sonarr title and the SVT programme name match exactly and exactly one
+# SVT programme matches, and lists everything less certain than that for you
+# to decide with one click each. Rows it writes carry `source: auto`.
+#
+# The packaged script runs the same sweep and writes nothing at all:
 #
 #     SVTPLAY_ARR_CONFIG=/etc/svtplay-arr/config.yaml \
 #       /opt/svtplay-arr/.venv/bin/svtplay-arr-suggest-mappings
 #
-# That script prints candidate rows and never writes this file. A wrong
-# mapping is the class of mistake this project treats as unrecoverable by
-# automation, so every row is confirmed by a human before it lands here.
+# A wrong mapping is the class of mistake this project refuses to make on a
+# guess -- it makes every episode of that show a permanently wrong filename
+# -- so anything short of an exact, unambiguous match waits for a human.
 
 series:
   # tvdb_id       The TVDB id Sonarr uses for the series. This is the key
@@ -38,14 +43,21 @@ series:
   # svt_slug      The slug in the SVT Play URL for the series, e.g.
   #               https://www.svtplay.se/gift-vid-forsta-ogonkastet
   #                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^
-  #               The suggestion script leaves this blank; fill it in from
-  #               the URL.
+  #               The page and the script both derive this for you; check it
+  #               against the URL if a show does not resolve.
   #
   # series_title  Sonarr's spelling of the series title, EXACTLY -- it
   #               becomes the output filename stem, and with Sonarr's
   #               renameEpisodes disabled Sonarr never fixes a mismatch
   #               afterwards. It is permanent for that file. Copy it from
   #               Sonarr; never type it. Diacritics matter.
+  #
+  # source        Optional. `auto` marks a row the "Find mappings" sweep
+  #               wrote without anyone confirming it; absent means a human
+  #               did. Nothing resolves differently because of it -- it is
+  #               there so those rows can be audited or reverted as a group.
+  #               A field this version does not know is ignored, never
+  #               refused, which is what lets one be added safely.
   - tvdb_id: 288649
     svt_series_id: jpmQD3q
     svt_slug: gift-vid-forsta-ogonkastet

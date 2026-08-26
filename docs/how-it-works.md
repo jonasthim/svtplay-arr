@@ -23,6 +23,7 @@ src/svtplay_arr/
   yamlio.py       Atomic YAML write, backup, mtime conflict detection
   store.py        SQLite job store
   mappings.py     The TVDB -> SVT table, its writer, live reload
+  discovery.py    Which mappings may be written unconfirmed, + the CLI
   sonarr.py       Sonarr API client (the metadata oracle)
   svt/
     parser.py     Show-page parsing

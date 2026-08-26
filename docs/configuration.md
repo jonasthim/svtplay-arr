@@ -294,9 +294,11 @@ both by the service and by the `svtplay-arr-suggest-mappings` console script.
 
 ## The mappings file (`mappings.yaml`)
 
-The TVDB → SVT series table. One row per show, each one confirmed by a human.
+The TVDB → SVT series table. One row per show, either confirmed by a human or
+written by the **Find mappings** sweep on the configuration page under a
+deliberately narrow confidence rule (see [below](#find-mappings-the-automatic-sweep)).
 [The README](../README.md#mappings-the-part-you-would-not-guess) explains why
-this cannot be derived automatically.
+the general case cannot be derived automatically.
 
 Unlike `config.yaml`, this file is **re-read while the service runs**. Adding a
 series takes effect on the next search or RSS poll, with no restart.
@@ -317,6 +319,7 @@ series:
 | `svt_series_id` | SVT's own id for the series, from the SVT Play URL or from the configuration page's search results. |
 | `svt_slug` | The slug in the SVT Play series URL — the `gift-vid-forsta-ogonkastet` in `https://www.svtplay.se/gift-vid-forsta-ogonkastet`. This is what the episode list is fetched with. |
 | `series_title` | Sonarr's spelling of the series title, **exactly**. |
+| `source` | Optional. `auto` on a row written by the Find mappings sweep; absent (meaning `manual`) on every row a human confirmed. Nothing resolves or downloads differently because of it — it exists so a mapping nobody confirmed can be found, audited and reverted as a group. |
 
 ### `series_title` is the filename
 
@@ -337,8 +340,13 @@ series record.
   the configuration page writes when you remove the last row.
 - **Two rows may not share a `tvdb_id`.** The loader refuses the whole file
   rather than guessing which one you meant.
-- A row missing any of the four fields is skipped rather than crashing the
-  load; a `tvdb_id` that is not a number rejects the file.
+- A row missing any of the four required fields is skipped rather than crashing
+  the load; a `tvdb_id` that is not a number rejects the file.
+- **A field the loader has never heard of is ignored, not refused.** It reads
+  only the keys it knows, which is what lets a newer version add one (`source`
+  is the first) without an older version emptying the feed over it. An
+  unusable `source` value reads as `manual` and is never a load failure; an
+  unrecognised one is preserved verbatim rather than relabelled.
 
 ### What happens when it is invalid
 
@@ -365,17 +373,52 @@ Reload detection is based on the file's modification time. On storage with
 coarse timestamps, a fix written within the same timestamp tick as the broken
 write it replaces can go unnoticed until the next distinguishable change.
 
-### Seeding rows from the terminal
+### Find mappings: the automatic sweep
+
+The **Find mappings** button on the configuration page searches SVT for every
+Sonarr series that is not mapped yet, saves the rows it is certain about, and
+lists everything else for you to decide with one click each.
+
+"Certain" means **both** of these, and nothing less:
+
+1. The Sonarr series title and the SVT programme name are **identical** once
+   casefolded, whitespace-collapsed and stripped of a trailing `(2019)`.
+2. **Exactly one** SVT programme (type `TvSeries` or `TvShow`) matches that
+   way.
+
+Several candidates, a near miss, or nothing found are all surfaced, never
+written. Diacritics are deliberately **not** folded during the comparison:
+Swedish titles are distinguished by å/ä/ö, and folding them would manufacture
+exact matches between genuinely different shows — which is the one error this
+rule exists to prevent. A series whose TVDB title differs from SVT's Swedish
+title will therefore not match automatically; it becomes a suggestion.
+
+Practical notes:
+
+- Series that already have a row are skipped without an SVT search.
+- The whole batch is written in **one** atomic write, or not at all.
+- Rows land marked `source: auto`. Check them — `series_title` is still the
+  permanent filename — and remove any that look wrong.
+- A suggestion you accept by hand is an ordinary mapping and stays `manual`.
+- Bounded at 4 concurrent SVT searches and **200 searches per run**. Hitting
+  that limit is reported on the page rather than silently truncating your
+  library; run it again to continue, since this run's rows are now mapped and
+  skipped.
+- If `mappings.yaml` will not parse, nothing is searched and nothing is
+  written. Fix the file first.
+
+### The same sweep from the terminal
 
 ```sh
 SVTPLAY_ARR_CONFIG=/etc/svtplay-arr/config.yaml \
   /opt/svtplay-arr/.venv/bin/svtplay-arr-suggest-mappings
 ```
 
-Searches SVT for every series title in your Sonarr and prints candidate rows as
-YAML to stdout. It **never writes `mappings.yaml`**. Check every row, and fill
-in `svt_slug` by hand from the SVT Play URL — the tool leaves it blank on
-purpose.
+Runs exactly the sweep above and **never writes `mappings.yaml`**. Confident
+rows go to stdout as pasteable YAML — slug derived, `source: auto` included, so
+they are byte-for-byte what the page would have written. Everything needing a
+decision goes to stderr, so `> rows.yaml` cannot sweep the undecided part into
+a file.
 
 ---
 

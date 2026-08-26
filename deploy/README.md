@@ -189,18 +189,26 @@ becomes the output filename stem, and Sonarr's `renameEpisodes=False`
 setting means Sonarr will never fix a mismatch after the fact; it's
 permanent for that file.
 
-Rather than hand-writing rows, run the packaged console script from the
-install directory (it needs the same config/env as the service):
+Rather than hand-writing rows, use **Find mappings** on the configuration
+page. It searches SVT for every Sonarr series that is not mapped yet and
+saves the rows where the Sonarr title and the SVT programme name are
+identical (casefolded, whitespace-collapsed, a trailing `(2019)` stripped)
+*and* exactly one SVT programme matches. Anything less certain — several
+candidates, a near miss, nothing found — is listed for you to accept with
+one click, never written. Rows it writes carry `source: auto` so they can
+be told apart from ones you confirmed yourself.
+
+The same sweep runs from the install directory, writing nothing at all (it
+needs the same config/env as the service):
 
     SVTPLAY_ARR_CONFIG=/etc/svtplay-arr/config.yaml \
       /opt/svtplay-arr/.venv/bin/svtplay-arr-suggest-mappings
 
-This searches SVT for every series title currently in Sonarr and prints
-candidate rows as YAML to stdout. It **never writes `mappings.yaml`** — a
-wrong mapping is exactly the class of mistake this project treats as
-unrecoverable-by-automation, so every row it prints must be checked by a
-human (title match, and `svt_slug` filled in by hand from the SVT Play URL,
-since the tool leaves it blank) before being pasted into the real file.
+Confident rows go to stdout as pasteable YAML — slug derived, byte-for-byte
+what the page would have written; everything needing a decision goes to
+stderr. It **never writes `mappings.yaml`**. A wrong mapping is the class of
+mistake this project refuses to make on a guess: it makes every episode of
+that show a permanently wrong filename.
 
 ## The configuration page
 
