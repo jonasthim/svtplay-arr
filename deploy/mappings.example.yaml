@@ -1,0 +1,59 @@
+# svtplay-arr example series mappings
+#
+# Copy to /etc/svtplay-arr/mappings.yaml (or wherever `mappings_file` in
+# config.yaml points). This is the tvdb_id -> SVT series table the resolver
+# consults for every search Sonarr sends it.
+#
+# Unlike config.yaml, this file is re-read while the service runs: adding a
+# series takes effect on the next search or RSS poll, with no restart.
+#
+# The file must always hold a top-level `series` list. Deleting the rows but
+# leaving `series:` behind is NOT how to empty it -- that shape is refused,
+# /health reports mappings_degraded: true, and the service keeps serving the
+# last table that loaded. Write `series: []` for genuinely no mappings.
+#
+# An empty table is legal but has a consequence worth knowing: Sonarr tests
+# an indexer by firing a search with no tvdbid and rejects the indexer
+# outright if nothing comes back. Add at least one mapping before adding the
+# indexer in Sonarr.
+#
+# Prefer the configuration page (/config) or the packaged suggestion script
+# over hand-editing:
+#
+#     SVTPLAY_ARR_CONFIG=/etc/svtplay-arr/config.yaml \
+#       /opt/svtplay-arr/.venv/bin/svtplay-arr-suggest-mappings
+#
+# That script prints candidate rows and never writes this file. A wrong
+# mapping is the class of mistake this project treats as unrecoverable by
+# automation, so every row is confirmed by a human before it lands here.
+
+series:
+  # tvdb_id       The TVDB id Sonarr uses for the series. This is the key
+  #               Sonarr searches by, and the only thing the resolver looks
+  #               a series up by. Find it in Sonarr, not on TVDB's website.
+  #
+  # svt_series_id SVT's own id for the series, from the SVT Play URL or the
+  #               configuration page's search results.
+  #
+  # svt_slug      The slug in the SVT Play URL for the series, e.g.
+  #               https://www.svtplay.se/gift-vid-forsta-ogonkastet
+  #                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  #               The suggestion script leaves this blank; fill it in from
+  #               the URL.
+  #
+  # series_title  Sonarr's spelling of the series title, EXACTLY -- it
+  #               becomes the output filename stem, and with Sonarr's
+  #               renameEpisodes disabled Sonarr never fixes a mismatch
+  #               afterwards. It is permanent for that file. Copy it from
+  #               Sonarr; never type it. Diacritics matter.
+  - tvdb_id: 288649
+    svt_series_id: jpmQD3q
+    svt_slug: gift-vid-forsta-ogonkastet
+    series_title: Gift vid första ögonkastet
+
+  # A second row looks the same. Two rows may not share a tvdb_id -- the
+  # loader refuses the whole file rather than guessing which one you meant.
+  # - tvdb_id: 123456
+  #   svt_series_id: aBcDeFg
+  #   svt_slug: nagon-annan-serie
+  #   series_title: Någon annan serie

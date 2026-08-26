@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% block content %}
+<h2>Add a series: {{ query }}</h2>
+<section class="panel">
+  <div class="panel-inner">
+    <form method="post" action="/config/mappings">
+      <input type="hidden" name="expected_mtime" value="{{ mappings_mtime }}">
+      <!-- Round-trips the original query through a failed create so the page
+           can be rebuilt server-side from it, rather than trusting stale or
+           serialised SVT/Sonarr results carried in the form. -->
+      <input type="hidden" name="q" value="{{ query }}">
+
+      <h3>SVT Play</h3>
+      {% if svt_hits %}
+        {% for h in svt_hits %}
+          <label class="choice">
+            <input type="radio" name="svt" value="{{ h.svt_id }}|{{ h.slug }}" required{% if selected_svt and selected_svt == (h.svt_id ~ "|" ~ h.slug) %} checked{% endif %}>
+            {{ h.name }} <span class="help">{{ h.svt_id }} / {{ h.slug }}</span>
+          </label>
+        {% endfor %}
+      {% else %}
+        <p class="help">No SVT results. Enter the id and slug from the show's
+        SVT Play URL.</p>
+        <label for="svt_series_id">SVT series id</label>
+        <input type="text" id="svt_series_id" name="svt_series_id" value="{{ selected_svt_series_id or '' }}">
+        <label for="svt_slug">SVT slug</label>
+        <input type="text" id="svt_slug" name="svt_slug" value="{{ selected_svt_slug or '' }}">
+      {% endif %}
+
+      <h3>Sonarr</h3>
+      {% if sonarr_series %}
+        {% for s in sonarr_series %}
+          <label class="choice">
+            <input type="radio" name="sonarr" value="{{ s.tvdbId }}" required{% if selected_sonarr and selected_sonarr == (s.tvdbId ~ "") %} checked{% endif %}>
+            {{ s.title }} <span class="help">tvdbId {{ s.tvdbId }}</span>
+          </label>
+        {% endfor %}
+        <p class="help">The series title is copied from Sonarr exactly as shown.
+        It becomes the permanent filename, so it is never typed here.</p>
+      {% else %}
+        <p class="error">No Sonarr series matched. A mapping needs one: the title
+        and TVDB id must come from Sonarr, not be typed.</p>
+      {% endif %}
+
+      <div class="form-actions">
+        <button type="submit" class="primary">Add mapping</button>
+      </div>
+    </form>
+  </div>
+</section>
+<p><a href="/config">Cancel</a></p>
+{% endblock %}

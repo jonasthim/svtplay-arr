@@ -1,0 +1,579 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>svtplay-arr configuration</title>
+  <style>
+    /* This page sits beside Sonarr in the same media stack, and is read
+       the same way: a slim app bar, settings in panels, a short bold
+       label beside each control, and the explanation small and muted
+       underneath it. The palette approximates Sonarr's own dark UI --
+       neutral greys, one blue accent, colour reserved for state -- rather
+       than matching any brand value exactly; the numbers below were
+       picked to clear the contrast minimums in tests/test_config_ui_theme.py.
+
+       Colours live as custom properties on :root (light) and are
+       overridden wholesale under prefers-color-scheme: dark below. Every
+       rule reads a token, never a literal colour, so the two palettes
+       cannot drift apart silently -- and a token missing from one block
+       is a visible bug rather than a colour that quietly falls back to
+       black-on-white. */
+    :root {
+      color-scheme: light dark;
+      --bg: #f2f3f5;
+      --fg: #1e2227;
+      --muted-fg: #5b6169;
+      --border: #d3d7dc;
+      --panel-bg: #ffffff;
+      --panel-head-bg: #eceef1;
+      --topbar-bg: #22262b;
+      --topbar-fg: #f2f3f5;
+      --accent: #1f6cd0;
+      --on-accent: #ffffff;
+      --danger: #c62828;
+      --on-danger: #ffffff;
+      --btn-bg: #e9ebee;
+      --btn-fg: #1e2227;
+      --btn-border: #b9bec5;
+      --row-hover-bg: #f2f4f7;
+      --code-bg: #f0f1f3;
+      --code-border: #d3d7dc;
+      --input-bg: #ffffff;
+      --input-fg: #1e2227;
+      --input-border: #8b9199;
+      --error-bg: #fce4e4;
+      --error-border: #c62828;
+      --error-fg: #8a1418;
+      --notice-bg: #dff3e4;
+      --notice-border: #1e7c34;
+      --notice-fg: #14562a;
+      --warn-bg: #fdf0d0;
+      --warn-border: #946200;
+      --warn-fg: #6b4400;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #1a1d21;
+        --fg: #e8e8e8;
+        --muted-fg: #9aa0a6;
+        --border: #3a3f44;
+        --panel-bg: #262a2e;
+        --panel-head-bg: #2c3136;
+        --topbar-bg: #101316;
+        --topbar-fg: #e8e8e8;
+        --accent: #5799ef;
+        --on-accent: #0d1117;
+        --danger: #f05050;
+        --on-danger: #2a0808;
+        --btn-bg: #343a40;
+        --btn-fg: #e8e8e8;
+        --btn-border: #5a6169;
+        --row-hover-bg: #2f353a;
+        --code-bg: #1f2327;
+        --code-border: #3a3f44;
+        --input-bg: #1c2024;
+        --input-fg: #e8e8e8;
+        --input-border: #6b7278;
+        --error-bg: #39181a;
+        --error-border: #f05050;
+        --error-fg: #f5a3a3;
+        --notice-bg: #14301d;
+        --notice-border: #27c24c;
+        --notice-fg: #7fdc98;
+        --warn-bg: #33280c;
+        --warn-border: #e5a00d;
+        --warn-fg: #e9b955;
+      }
+    }
+    *, *::before, *::after { box-sizing: border-box; }
+    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+           margin: 0; padding: 0 0 3rem; line-height: 1.5; font-size: 15px;
+           background: var(--bg); color: var(--fg); }
+
+    /* ---- App chrome -------------------------------------------------
+       A slim bar carrying the app name, dark in both palettes so the
+       page furniture stays visibly distinct from the content beneath it
+       -- the same read as Sonarr's own header. */
+    .topbar { background: var(--topbar-bg); color: var(--topbar-fg); }
+    .topbar-inner { max-width: 58rem; margin: 0 auto;
+                    padding: 0 1rem; min-height: 2.75rem;
+                    display: flex; align-items: center; }
+    .brand { margin: 0; font-size: 1rem; font-weight: 700;
+             letter-spacing: .02em; color: var(--topbar-fg); }
+    .page { max-width: 58rem; margin: 0 auto; padding: 1.25rem 1rem 0; }
+
+    h2 { font-size: 1.0625rem; font-weight: 600; letter-spacing: .01em;
+         margin: 1.75rem 0 .6rem; }
+    /* Only when nothing precedes it -- with a banner above, the heading
+       needs its full separation back. */
+    .page > h2:first-child { margin-top: 0; }
+    h3 { font-size: .875rem; font-weight: 700; letter-spacing: .05em;
+         text-transform: uppercase; color: var(--muted-fg);
+         margin: 1.25rem 0 .4rem; }
+    a { color: var(--accent); }
+
+    /* ---- Panels -----------------------------------------------------
+       Every block of content sits on a card one step lighter than the
+       page, with a quiet header, rather than on the bare background.
+       `fieldset.settings-section` is a panel too: it stays a fieldset so
+       each settings group keeps being a real form group, and its
+       <legend> is floated so it can be styled as the card's header bar
+       (a legend is otherwise laid out in the border gap and ignores
+       width/background). */
+    .panel, fieldset.settings-section {
+      background: var(--panel-bg); border: 1px solid var(--border);
+      border-radius: 4px; margin: 0 0 1.25rem; padding: 0; }
+    fieldset.settings-section > legend,
+    .panel > .panel-head {
+      float: left; width: 100%; margin: 0;
+      padding: .5rem .9rem; border-bottom: 1px solid var(--border);
+      border-radius: 3px 3px 0 0; background: var(--panel-head-bg);
+      font-size: .75rem; font-weight: 700; letter-spacing: .06em;
+      text-transform: uppercase; color: var(--muted-fg); }
+    .panel-inner { clear: both; padding: .85rem .9rem; }
+
+    /* ---- Form rows --------------------------------------------------
+       Two columns on a wide viewport: a short bold label on the left, the
+       control (and its help text) on the right. `.field-danger` is the
+       same row -- it carries its own class rather than adding one,
+       because the dangerous-field tests match `<div class="field-danger">`
+       immediately followed by the field's own label. */
+    .field, .field-danger {
+      display: grid; grid-template-columns: 14rem minmax(0, 1fr);
+      gap: .2rem 1.1rem; align-items: start;
+      padding: .55rem 0 .55rem .85rem; }
+    .field { border-left: 3px solid transparent; }
+    .field > label, .field-danger > label {
+      margin: 0; padding-top: .45rem; font-size: .875rem; font-weight: 600;
+      line-height: 1.35; color: var(--fg); }
+    .control { min-width: 0; }
+    /* The single biggest thing wrong with the old page: every field's
+       explanation sat inside its <label> at near-body size, so each
+       field read as a paragraph with an input attached. The text is
+       unchanged -- it just stops competing with the label. It now sits
+       outside the label, so each control points at it with
+       aria-describedby (see index.html) and it is still announced with
+       the field. */
+    .help { display: block; font-weight: 400; font-size: .8125rem;
+            line-height: 1.45; color: var(--muted-fg); margin: .35rem 0 0; }
+    .field .help, .field-danger .help { margin-top: .3rem; }
+    label { display: block; margin: .9rem 0 .25rem; font-weight: 600;
+            font-size: .875rem; }
+    /* A whole row that is one choice -- a radio and the thing it selects
+       (mapping_search.html), or the paths confirmation (index.html). The
+       label is the hit area, so it stays a block, but it is prose rather
+       than a field name and is not set like one. */
+    label.choice, label.confirm-label {
+      font-weight: 400; font-size: .875rem; margin: .3rem 0; }
+    label.choice input, label.confirm-label input { margin-right: .35rem; }
+    /* Lines up under the option's own text rather than under its radio. */
+    label.choice .help { margin: 0 0 .25rem 1.3rem; }
+    .confirm { margin: 1rem 0 0; }
+    .panel-actions { margin: .75rem 0 0; }
+    input[type=text], input[type=password], input[type=search] {
+      width: 100%; padding: .4rem .5rem; font: inherit; font-size: .875rem;
+      background: var(--input-bg); color: var(--input-fg);
+      border: 1px solid var(--input-border); border-radius: 3px; }
+    input[type=text]:focus, input[type=password]:focus,
+    input[type=search]:focus, button:focus-visible, a:focus-visible {
+      outline: 2px solid var(--accent); outline-offset: 1px; }
+
+    /* ---- Buttons ----------------------------------------------------
+       Flat, small radius, readable padding. Neutral by default; the
+       accent is spent on the primary action and red on the destructive
+       one. The mapping Check button is styled through its form's class
+       because its markup is pinned verbatim by
+       test_the_check_control_is_a_plain_form_reachable_without_javascript. */
+    button {
+      font: inherit; font-size: .8125rem; font-weight: 600; line-height: 1.3;
+      padding: .4rem .8rem; border-radius: 3px; cursor: pointer;
+      background: var(--btn-bg); color: var(--btn-fg);
+      border: 1px solid var(--btn-border); }
+    button:hover { filter: brightness(1.08); }
+    button[disabled] { opacity: .6; cursor: default; }
+    button.primary, form.check-form button {
+      background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
+    form.delete-form button {
+      background: var(--danger); color: var(--on-danger); border-color: var(--danger); }
+    .form-actions { margin: 1.25rem 0 0; }
+
+    /* ---- Status strip -----------------------------------------------
+       Layout only -- no colour of its own. Each chip is either bare (an
+       "everything's fine" fact) or additionally carries one of the
+       .error/.warn classes below, which is what actually makes a bad
+       state look different rather than just reading different. */
+    .status-strip { display: flex; flex-wrap: wrap; gap: .4rem; margin: 0 0 1rem; }
+    .status-chip {
+      display: inline-block; border-radius: 3px;
+      border: 1px solid var(--border); background: var(--code-bg);
+      color: var(--fg); }
+    /* The four message styles carry the difference between "this failed",
+       "this worked" and "this needs a restart" in their wording already;
+       the leading glyph and distinct colour tokens back that up for a
+       glance, and for anyone who cannot rely on hue to tell them apart. */
+    .error, .notice, .warn, .pending {
+      padding: .55rem .75rem; margin: .3rem 0; border-radius: 3px;
+      border: 1px solid; font-size: .875rem; }
+    .error::before { content: "\2715 "; font-weight: 700; }
+    .notice::before { content: "\2713 "; font-weight: 700; }
+    .warn::before { content: "\26a0 "; font-weight: 700; }
+    .pending::before { content: "\21bb "; font-weight: 700; }
+    .error { background: var(--error-bg); border-color: var(--error-border); color: var(--error-fg); }
+    .notice { background: var(--notice-bg); border-color: var(--notice-border); color: var(--notice-fg); }
+    .warn, .pending { background: var(--warn-bg); border-color: var(--warn-border); color: var(--warn-fg); }
+    .pending { font-weight: 600; border-width: 2px; }
+    /* A chip that carries .error/.warn takes those colours but not their
+       banner sizing -- without this the degraded chips grow taller than
+       the healthy ones and the strip reads as a ragged pile. Declared
+       after the message block so it wins on order, and it overrides only
+       geometry, never colour. */
+    .status-strip .status-chip {
+      padding: .25rem .55rem; margin: 0; font-size: .8125rem; }
+
+    /* ---- Dangerous fields -------------------------------------------
+       Fields whose consequences are silent and severe (DANGEROUS_FIELDS
+       in config.py). These used to be filled amber slabs -- label, help
+       and input all inside a saturated block -- and three in a row made
+       ordinary settings look like errors. The signal is now a thin amber
+       left border plus the "Careful" badge on the label, with the help
+       text in the same muted style every other field gets. */
+    .field-danger { border-left: 3px solid var(--warn-border); }
+    /* The marker used to be a `::before { content: "\26a0 " }` on the label
+       and nothing else, which is how it reached production as an unlabelled
+       glyph -- the first question asked of the live page was literally
+       "what does the ! mean". The word now lives in the markup (index.html),
+       where it is in the page source, survives CSS being off, and is
+       announced with the field; this rule only styles it, and the glyph
+       beside it is aria-hidden so it decorates rather than speaks. */
+    .danger-badge {
+      display: inline-block; margin-right: .35rem; padding: 0 .3rem;
+      border: 1px solid var(--warn-border); border-radius: 3px;
+      background: var(--bg); color: var(--warn-fg);
+      font-size: .6875rem; font-weight: 700; letter-spacing: .04em;
+      text-transform: uppercase; vertical-align: .05em; }
+
+    /* ---- Secret field ----------------------------------------------
+       A masked input with a Show/Hide button sitting inside its own right
+       edge (index.html), rather than the value repeated in a second
+       element beside it. The button is created by initSecretToggles at the
+       bottom of this file, never by the server, so every rule that makes
+       room for it is keyed off `.has-toggle` -- a class the script adds --
+       and a page with JavaScript off gets a plain full-width input with no
+       reserved dead space in it.
+
+       No fill and no border of its own: a filled chip would need a visible
+       boundary against --input-bg, and no button token pair clears the 3:1
+       UI minimum against it (tests/test_config_ui_theme.py). Accent ink on
+       the input's own background does clear the 4.5:1 text minimum in both
+       palettes, and is pinned there. Its focus ring comes from the shared
+       button:focus-visible rule above. */
+    .secret-field { position: relative; }
+    /* Room for the button, so it never sits on top of a typed-in key.
+       Both types, because the button switches the input between them. */
+    .secret-field.has-toggle input[type=password],
+    .secret-field.has-toggle input[type=text] { padding-right: 4.25rem; }
+    /* Stretched to the input's full inner height (inside its 1px border)
+       rather than centred at its natural text height: a two-line word at
+       .75rem is about 19px tall, under the 24px minimum target size, and
+       this page is used from a phone. Spanning the field costs nothing
+       visually and makes the whole right-hand end of it the hit area. */
+    .secret-toggle {
+      position: absolute; top: 1px; right: 1px; bottom: 1px;
+      padding: 0 .6rem; font-size: .75rem; font-weight: 700;
+      letter-spacing: .03em;
+      background: none; border: 0; border-radius: 0 2px 2px 0;
+      color: var(--accent); }
+    .secret-toggle:hover { text-decoration: underline; filter: none; }
+
+    /* ---- Mappings table ---------------------------------------------
+       Read as a Sonarr list: a quiet header row, subtle separation
+       between rows, a hover state, comfortable padding. */
+    table { border-collapse: collapse; width: 100%; }
+    th, td { text-align: left; padding: .45rem .6rem; border-bottom: 1px solid var(--border); }
+    table.mappings th {
+      padding-top: .3rem; font-size: .75rem; font-weight: 700;
+      letter-spacing: .05em; text-transform: uppercase; color: var(--muted-fg);
+      border-bottom: 1px solid var(--border); }
+    table.mappings td { font-size: .875rem; }
+    table.mappings tbody tr.mapping-row:hover > td { background: var(--row-hover-bg); }
+    /* Per-row mapping controls: the Check button and its result, both
+       reachable with JavaScript off (a plain form POST) or on (patched in
+       place by initCheckForms in the script below). Overrides the
+       .error/.notice/.warn block's page-banner sizing so the result reads
+       as a small in-row status, not another full-width banner. */
+    td.mapping-actions { white-space: nowrap; text-align: right; }
+    td form.check-form { display: inline-block; margin-left: .35rem; }
+    td form.delete-form { display: inline-block; }
+    .check-result { margin: .35rem 0; padding: .35rem .55rem; font-size: .8125rem; }
+    /* The result gets a row of its own spanning the table (index.html), so
+       the separator between mappings belongs under that row rather than
+       between a mapping and its own result. With no result showing, the
+       cell is empty and collapses to just the rule. */
+    table.mappings tr.mapping-row > td { border-bottom: 0; }
+    table.mappings tr.mapping-check-row > td { padding: 0 .6rem; }
+    #mapping-filter { margin: 0 0 .75rem; }
+    /* ---- Narrow viewports ------------------------------------------
+       Below this width the two-column form rows stack, and the mappings
+       table stops being a table. Series / TVDB / SVT plus two buttons in
+       a fixed table layout on a phone collapses the title column to a few
+       characters and renders the multi-sentence check result as a
+       vertical ribbon two words wide. Each row becomes a stacked block
+       instead, with every cell labelled by its own column heading.
+
+       A media query, deliberately: the switch has to be correct before
+       the first frame and identical to what the server rendered, and
+       JavaScript measuring widths would be neither -- and would break
+       entirely with JS off, which everything on this page still works
+       without. Above the breakpoint the table is untouched. */
+    @media (max-width: 40rem) {
+      .field, .field-danger { grid-template-columns: minmax(0, 1fr); }
+      .field > label, .field-danger > label { padding-top: 0; }
+      table.mappings, table.mappings tbody, table.mappings tr,
+      table.mappings td { display: block; }
+      /* Column headings only mean something above a row of cells. */
+      table.mappings thead { display: none; }
+      table.mappings tr.mapping-row {
+        border-top: 1px solid var(--border); padding: .6rem 0 0; }
+      table.mappings td { border-bottom: 0; padding: .1rem 0; }
+      table.mappings tr.mapping-check-row > td { padding: 0; }
+      /* What replaces the headings: each cell says which column it is. */
+      table.mappings td[data-label]::before {
+        content: attr(data-label); display: block;
+        font-size: .6875rem; letter-spacing: .04em; text-transform: uppercase;
+        color: var(--muted-fg); }
+      table.mappings td.mapping-actions {
+        padding-top: .5rem; white-space: normal; text-align: left; }
+      table.mappings td.mapping-actions form {
+        display: block; margin: 0 0 .4rem; }
+      table.mappings td.mapping-actions button {
+        width: 100%; min-height: 2.75rem; }
+      /* `display: block` above is an author rule and outranks the UA
+         sheet's `[hidden] { display: none }`, so without this the live
+         filter (initMappingFilter) would hide nothing at all on exactly
+         the viewport these rules exist for. Two class selectors, so it
+         also outranks the stacking rule above. */
+      table.mappings tbody [hidden] { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner"><h1 class="brand">svtplay-arr</h1></div>
+  </header>
+  <main class="page">
+  {# The one place these facts are rendered; the dict is /health's own
+     response, produced by the single compute_health() call app.py hands
+     both /health and this page -- see build_config_router's status_provider
+     docstring. This block only ever displays what it is given, never
+     recomputes any of it (health.status included: it is /health's own
+     already-computed ok/degraded verdict, not a second copy of that
+     logic). #}
+  {% if status_unavailable %}
+  <p class="warn">Status unavailable.</p>
+  {% elif health %}
+  <div class="status-strip">
+    <span class="status-chip{{ ' error' if health.status != 'ok' else '' }}">
+      Service: {{ health.status }}
+    </span>
+    <span class="status-chip{{ '' if health.worker_alive else ' error' }}">
+      Worker: {{ 'alive' if health.worker_alive else 'dead' }}
+    </span>
+    <span class="status-chip{{ ' error' if health.mappings_degraded else '' }}">
+      Mappings: {{ health.mappings if health.mappings is not none else '?' }}
+      {%- if health.mappings_degraded %} &mdash; DEGRADED: mappings.yaml
+      failed to load; serving the last known-good table{% endif %}
+    </span>
+    <span class="status-chip{{ '' if health.same_filesystem else ' warn' }}">
+      {%- if health.same_filesystem %}
+      Same filesystem: yes
+      {%- else %}
+      Same filesystem: no &mdash; atomic publish has degraded to copy+delete
+      {%- endif %}
+    </span>
+    <span class="status-chip{{ '' if health.active_jobs is not none else ' warn' }}">
+      Active jobs:
+      {{- ' ' }}{{ health.active_jobs if health.active_jobs is not none else 'unknown' }}
+    </span>
+  </div>
+  {% endif %}
+  {% if error %}<p class="error">{{ error }}</p>{% endif %}
+  {% if notice %}<p class="notice">{{ notice }}</p>{% endif %}
+  {% if pending %}<p class="pending">{{ pending }}</p>{% endif %}
+  {% block content %}{% endblock %}
+  </main>
+  <script>
+    // Progressive enhancement only. Every element this script touches or
+    // creates already works as a plain form POST / full page without it --
+    // see check_mapping's docstring in config_ui.py and the "no filter
+    // input rendered here" comment in index.html. Inline, vanilla, no
+    // bundler, no CDN: the deploy path is `git pull` + `uv sync` + restart
+    // and has no node in it.
+    (function () {
+      "use strict";
+
+      function initCheckForms() {
+        document.querySelectorAll("form.check-form").forEach(function (form) {
+          form.addEventListener("submit", function (evt) {
+            evt.preventDefault();
+            var tvdbId = form.getAttribute("data-tvdb-id");
+            var result = document.querySelector(
+              '.check-result[data-tvdb-id="' + tvdbId + '"]'
+            );
+            var button = form.querySelector("button");
+            if (button) { button.disabled = true; }
+            if (result) {
+              result.hidden = false;
+              result.className = "check-result";
+              result.textContent = "Checking…";
+            }
+            // Same route the no-JS form posts to; the only difference is
+            // this Accept header, which is how check_mapping (config_ui.py)
+            // decides to hand back just the result instead of the whole
+            // page. Both branches render the one _check_context computation
+            // verbatim, so this can never disagree with a full page reload.
+            fetch(form.action, {
+              method: "POST",
+              headers: { Accept: "application/json" },
+              body: new FormData(form),
+            })
+              .then(function (r) {
+                // A proxy's error body, or an SSO JSON 401 from the
+                // gateway in front of this page, parses as perfectly good
+                // JSON and would paint the row with the literal string
+                // "undefined" -- a control whose only job is trustworthy
+                // signal reporting a confident nothing. Anything that is
+                // not this route's own success goes to the .catch below
+                // and is reported as a check that did not happen.
+                if (!r.ok) {
+                  throw new Error("check request failed: " + r.status);
+                }
+                return r.json();
+              })
+              .then(function (data) {
+                if (!result) { return; }
+                // Same reasoning one step later: a 200 whose body is not
+                // this route's result shape is not a check result either.
+                if (!data || typeof data.message !== "string" ||
+                    typeof data.css_class !== "string") {
+                  throw new Error("check response was not a check result");
+                }
+                // textContent, never innerHTML: data.message embeds
+                // svt_slug, which this page accepts unvalidated from the
+                // manual-entry form and stores verbatim. There is no sink
+                // here only because this is textContent, so it is pinned
+                // by a test -- see
+                // test_the_inline_script_never_writes_markup_into_the_page.
+                result.className = "check-result " + data.css_class;
+                result.textContent = data.message;
+              })
+              .catch(function () {
+                if (!result) { return; }
+                result.className = "check-result error";
+                result.textContent =
+                  "Check failed: could not reach svtplay-arr itself. " +
+                  "Try again, or reload the page and use the Check button " +
+                  "without JavaScript.";
+              })
+              .finally(function () {
+                if (button) { button.disabled = false; }
+              });
+          });
+        });
+      }
+
+      function initMappingFilter() {
+        var table = document.querySelector("table.mappings");
+        if (!table) { return; }
+        var rows = table.querySelectorAll("tr[data-filter-text]");
+        if (!rows.length) { return; }
+
+        var input = document.createElement("input");
+        input.type = "search";
+        input.id = "mapping-filter";
+        input.placeholder = "Filter mappings…";
+        input.setAttribute("aria-label", "Filter mappings");
+        table.parentNode.insertBefore(input, table);
+
+        input.addEventListener("input", function () {
+          var needle = input.value.trim().toLowerCase();
+          rows.forEach(function (row) {
+            var haystack = row.getAttribute("data-filter-text") || "";
+            row.hidden = needle !== "" && haystack.indexOf(needle) === -1;
+          });
+        });
+      }
+
+      // The one control on this page that JavaScript does not merely
+      // enhance: nothing but script can flip an <input type=password> to
+      // readable. So the button is built here rather than rendered by the
+      // server -- a Show button that does nothing is worse than a field
+      // that stays masked, and masked is a working state: the field is
+      // still fully editable, and replacing the key is what it is for.
+      // Nothing about the exposure changes either way; the value is in
+      // this page's source whichever type the input is currently set to.
+      function initSecretToggles() {
+        document.querySelectorAll(".secret-field").forEach(function (field) {
+          var input = field.querySelector("input");
+          if (!input) { return; }
+          var what = field.getAttribute("data-secret-label") || "the value";
+          var button = document.createElement("button");
+          // Never a submit. This sits inside the settings <form>, where a
+          // <button> defaults to type="submit": it would save every
+          // setting on the page on each click, and -- being the first
+          // submit button in that form -- would also take over implicit
+          // submission from Save settings when Enter is pressed in a field.
+          button.type = "button";
+          button.className = "secret-toggle";
+
+          function render() {
+            var shown = input.type === "text";
+            // A word, not an eye glyph. An unlabelled icon carrying the
+            // only signal is how the dangerous-field marker reached
+            // production as a "!" whose first review question was what it
+            // meant. The visible word names the action the next click
+            // performs, and the accessible name is that same word plus
+            // the field it acts on -- read off the field's own
+            // data-secret-label, so this script holds no second copy of
+            // that string.
+            //
+            // Deliberately no aria-pressed alongside it. A toggle button
+            // does one of two things: keep a fixed name and expose its
+            // state through aria-pressed, or rename itself to describe
+            // the next action. Doing both announces "Hide Sonarr API key,
+            // toggle button, pressed", which is worse than either alone.
+            // The label is the state here.
+            button.textContent = shown ? "Hide" : "Show";
+            button.setAttribute(
+              "aria-label", (shown ? "Hide " : "Show ") + what
+            );
+          }
+
+          button.addEventListener("click", function () {
+            input.type = input.type === "password" ? "text" : "password";
+            render();
+          });
+
+          render();
+          // Only now does the input need room on its right-hand edge --
+          // see the .has-toggle rules in the stylesheet above.
+          field.classList.add("has-toggle");
+          field.appendChild(button);
+        });
+      }
+
+      function init() {
+        initCheckForms();
+        initMappingFilter();
+        initSecretToggles();
+      }
+
+      if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", init);
+      } else {
+        init();
+      }
+    })();
+  </script>
+</body>
+</html>

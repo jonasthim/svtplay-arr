@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+*.egg-info/
+build/
+dist/
+
+# Local configuration and state, if anyone runs the service from a checkout
+config.yaml
+mappings.yaml
+*.yaml.bak
+*.db
+
+# Claude Code worktrees and session state
+.claude/
+.superpowers/

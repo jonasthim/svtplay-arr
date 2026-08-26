@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block content %}
+<h2>Add a series</h2>
+<section class="panel">
+  <div class="panel-inner">
+<form method="post" action="/config/mappings/search">
+  <label for="q">Show title</label>
+  <input type="text" id="q" name="q" autofocus required aria-describedby="q-help">
+  <p class="help" id="q-help">Searched against SVT Play and against Sonarr's own
+  series list.</p>
+  <div class="form-actions">
+    <button type="submit" class="primary">Search</button>
+  </div>
+</form>
+  </div>
+</section>
+<p><a href="/config">Cancel</a></p>
+{% endblock %}

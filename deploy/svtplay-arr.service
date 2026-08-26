@@ -1,0 +1,30 @@
+[Unit]
+Description=svtplay-arr
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=svtplay
+Group=media
+UMask=0002
+# Creates /var/lib/svtplay-arr, owned svtplay:media, before the process
+# starts -- this is where Settings.db_path defaults to
+# (/var/lib/svtplay-arr/jobs.db). If db_path is ever overridden in
+# config.yaml to point somewhere else, update this to match (or drop it and
+# pre-create/chown that path by hand instead; see deploy/README.md).
+StateDirectory=svtplay-arr
+# Deliberately empty. The key lives in config.yaml so the configuration page
+# can edit it; a non-empty value here silently overrides the file, and a key
+# saved through the page would then be written and never used. The page warns
+# when it sees this variable set, but leaving it unset is the answer.
+Environment=SONARR_API_KEY=
+Environment=SVTPLAY_ARR_CONFIG=/etc/svtplay-arr/config.yaml
+ExecStart=/opt/svtplay-arr/.venv/bin/uvicorn \
+  --factory svtplay_arr.app:create_app_from_env \
+  --host 0.0.0.0 --port 9800
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

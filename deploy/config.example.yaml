@@ -1,0 +1,75 @@
+# svtplay-arr example configuration
+#
+# Copy to /etc/svtplay-arr/config.yaml (or wherever $SVTPLAY_ARR_CONFIG
+# points) and adjust. Keep it readable only by the service account -- it
+# holds the Sonarr API key:
+#
+#     chmod 750 /etc/svtplay-arr
+#     chmod 640 /etc/svtplay-arr/config.yaml
+#
+# Every key below is what Settings.load() understands; the comments are the
+# same help text the configuration page shows for each field. Keys marked
+# "default shown" may be omitted entirely -- the service runs on the value
+# printed here, and the configuration page renders that same value rather
+# than an empty box.
+#
+# There is deliberately no listen host/port key: the systemd unit passes
+# --host/--port straight to uvicorn, and the download link handed to Sonarr
+# is built from the host Sonarr used to reach this service.
+#
+# Changing anything here needs a service restart to take effect. Series
+# mappings (mappings.yaml) do not -- see mappings.example.yaml.
+
+# Sonarr URL. Where Sonarr lives. Restart required to apply.
+# Required.
+sonarr_url: "http://sonarr.example.internal:8989"
+
+# Sonarr API key. From Sonarr's Settings > General. The value is rendered
+# into this page, so anyone who can sign in to this site can read it -- it is
+# in the page source while the field is still showing dots, and the Show
+# button only changes what is on your screen. It is also in your browser's
+# cache, your history, and any screenshot of this page. Restart required to
+# apply.
+# Required.
+sonarr_api_key: "paste-your-sonarr-api-key-here"
+
+# Incomplete directory. Downloads in progress. Must be on the same
+# filesystem as the completed directory, or publishing stops being atomic
+# and a half-copied file can be imported. Restart required to apply.
+# Required.
+incomplete_dir: "/downloads/incomplete"
+
+# Completed directory. Finished files, where Sonarr imports from. Must be on
+# the same filesystem as the incomplete directory and must not contain it.
+# Restart required to apply.
+# Required.
+completed_dir: "/downloads/completed"
+
+# Air date tolerance (days). How far an SVT publication date may sit from
+# Sonarr's air date. Widening this makes episodes that share an air date
+# ambiguous with their neighbours, and ambiguity makes the resolver return
+# nothing at all. Restart required to apply.
+air_date_tolerance_days: 1   # default shown
+
+# RSS window (days). How far back the RSS feed looks. Each candidate costs
+# SVT requests on every poll. Restart required to apply.
+rss_window_days: 7   # default shown
+
+# Concurrent downloads. Parallel downloads. Restart required to apply.
+max_concurrent_downloads: 1   # default shown
+
+# Where the tvdb_id -> SVT series table lives. Not editable from the
+# configuration page.
+mappings_file: "/etc/svtplay-arr/mappings.yaml"   # default shown
+
+# SQLite job database. The systemd unit's StateDirectory= creates the parent
+# directory owned by the service account, so leave this alone unless you
+# move it.
+db_path: "/var/lib/svtplay-arr/jobs.db"   # default shown
+
+# The client identifier sent to SVT's GraphQL API as its `ua` query
+# parameter. Read from this file, but not editable from the configuration
+# page: a wrong value here makes every SVT call fail, and this exists as an
+# escape hatch for SVT rejecting the default rather than as a knob to turn.
+# Leave it out unless you have a reason.
+svt_ua: "svtplaywebb-play-render-prod-client"   # default shown

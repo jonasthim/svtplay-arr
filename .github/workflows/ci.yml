@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  test:
+    name: pytest (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # requires-python is >=3.12; test the floor and the current release.
+        python-version: ["3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --extra dev --python ${{ matrix.python-version }}
+
+      # The `integration` marker is EXCLUDED here on purpose, and must stay
+      # excluded.
+      #
+      # Those tests call SVT Play's real API and download real media. SVT
+      # geo-restricts its content (`onlyAvailableInSweden: true`), and
+      # GitHub's hosted runners do not have a Swedish IP, so the tests
+      # cannot pass here -- not because anything is broken, but because the
+      # content is not served to the runner at all. They also depend on a
+      # third party's unofficial API being up and unchanged, which is not a
+      # thing CI should gate a merge on.
+      #
+      # pyproject.toml already sets `addopts = "-m 'not integration'"`, so
+      # the flag below is belt and braces: it keeps the exclusion visible in
+      # the workflow rather than hidden in config, and it survives someone
+      # editing addopts.
+      #
+      # If CI ever fails with an SVT connection error, the fix is to find
+      # what re-enabled these tests -- NOT to delete the marker or to relax
+      # the exclusion. Run them yourself, from Sweden:
+      #     uv run --extra dev pytest -m integration -v
+      #
+      # `-W error` turns every warning into a failure, so warnings cannot
+      # accumulate unnoticed. It could only be turned on once JobStore had a
+      # close(): 33 `ResourceWarning: unclosed database` from stores the
+      # fixtures never closed made this run fail, which is exactly why the
+      # gate was off and why nothing else was being caught either.
+      #
+      # If a future dependency starts emitting a DeprecationWarning, the fix
+      # is to deal with the warning -- not to drop this flag. A third-party
+      # warning genuinely outside our control gets one targeted
+      # `-W ignore::...` beside this, never a blanket removal.
+      - name: Run the test suite (integration tests excluded, see above)
+        run: uv run --extra dev pytest -m "not integration" -q -W error
