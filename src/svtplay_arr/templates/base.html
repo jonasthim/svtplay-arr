@@ -313,6 +313,32 @@
     table.mappings tr.mapping-row > td { border-bottom: 0; }
     table.mappings tr.mapping-check-row > td { padding: 0 .6rem; }
     #mapping-filter { margin: 0 0 .75rem; }
+
+    /* ---- Find mappings ----------------------------------------------
+       The sweep's own controls and its result page. `.panel-actions` now
+       carries a form beside a link, so it lays them out on one baseline
+       instead of stacking a block-level form above an inline anchor.
+       Every button here is a plain submit -- the sweep and each one-click
+       accept work with JavaScript off -- so they need no styling of their
+       own beyond the shared button rules above. */
+    .panel-actions { display: flex; flex-wrap: wrap;
+                     align-items: center; gap: .75rem; }
+    .sweep-summary { display: flex; flex-wrap: wrap; gap: .35rem 1.25rem;
+                     list-style: none; margin: 0; padding: 0;
+                     font-size: .875rem; }
+    /* One proposal: its title, why it is here, and the controls that
+       resolve it. Separated by a rule rather than a card each, so a
+       library-sized list stays scannable. */
+    .sweep-item { padding: .6rem 0; border-bottom: 1px solid var(--border); }
+    .sweep-item:last-child { border-bottom: 0; padding-bottom: 0; }
+    .sweep-title { margin: 0 0 .25rem; font-size: .9375rem; font-weight: 600; }
+    .sweep-title .help { display: inline; margin-left: .4rem; }
+    /* The accept control and the id it would write, on one line -- the
+       operator is choosing between near-identical names, so the slug has
+       to be visible beside the button that writes it. */
+    form.accept-form { display: flex; flex-wrap: wrap; align-items: center;
+                       gap: .5rem; margin: .3rem 0; }
+    form.accept-form .help { margin: 0; }
     /* ---- Narrow viewports ------------------------------------------
        Below this width the two-column form rows stack, and the mappings
        table stops being a table. Series / TVDB / SVT plus two buttons in

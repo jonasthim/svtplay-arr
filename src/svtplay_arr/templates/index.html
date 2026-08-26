@@ -114,7 +114,22 @@
 {% if check and not ns.check_matched %}
 <p class="{{ check.css_class }}">Check for tvdb_id {{ check.tvdb_id }}: {{ check.message }}</p>
 {% endif %}
-<p class="panel-actions"><a href="/config/mappings/new">Add a series</a></p>
+{# Two ways in, both plain forms/links: sweep the whole Sonarr library at
+   once, or add one series by hand. The sweep writes only what
+   discovery.confident_match approved and surfaces the rest -- see
+   `discover` in config_ui.py. It is a form POST because it writes, and
+   needs no JavaScript to work. #}
+<div class="panel-actions">
+  <form method="post" action="/config/mappings/discover" class="discover-form">
+    <input type="hidden" name="expected_mtime" value="{{ mappings_mtime }}">
+    <button type="submit" class="primary">Find mappings</button>
+  </form>
+  <a href="/config/mappings/new">Add a series</a>
+</div>
+<p class="help">Find mappings searches SVT for every Sonarr series that is
+not mapped yet. It saves only the ones where the Sonarr title and the SVT
+programme name match exactly and only one SVT programme matches; everything
+else is listed for you to decide.</p>
   </div>
 </section>
 

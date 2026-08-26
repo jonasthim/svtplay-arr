@@ -1,12 +1,18 @@
 """The configuration page.
 
 Contains no matching logic and no SVT knowledge: it calls SvtClient and
-SonarrClient the same way `suggest_mappings` does. That seam is what makes
-it impossible for a UI change to alter what gets grabbed. The per-mapping
-Check control (`_check_slug`, `_check_context`, `check_mapping`) is the one
-place this module makes a live SVT call, and it does so the same way
-`Resolver` does -- `svt.list_episodes(slug)` -- strictly on demand, never on
-a page render, and never writing anything.
+SonarrClient the same way `discovery.sweep_for_mappings` does. That seam is
+what makes it impossible for a UI change to alter what gets grabbed.
+
+Two controls here make live SVT calls, both strictly on demand and never on
+a page render. The per-mapping Check control (`_check_slug`,
+`_check_context`, `check_mapping`) calls `svt.list_episodes(slug)` the same
+way `Resolver` does, and writes nothing. The Find mappings sweep
+(`discover`) calls `svt.search_series(title)` once per unmapped series and
+is the one route that writes without a per-row confirmation -- it may write
+only what `discovery.confident_match` approved, and that gate lives in
+`discovery.py`, not here. This module holds no matching rule of its own,
+here as everywhere else.
 """
 
 import logging
@@ -27,7 +33,15 @@ from svtplay_arr.config import (
     save_settings,
     setting_defaults,
 )
-from svtplay_arr.mappings import MappingError, MappingTable, add_mapping, remove_mapping
+from svtplay_arr.discovery import sweep_for_mappings
+from svtplay_arr.mappings import (
+    MappingError,
+    MappingTable,
+    add_mapping,
+    add_mappings,
+    remove_mapping,
+)
+from svtplay_arr.models import SOURCE_AUTO
 from svtplay_arr.svt.client import SvtApiError, derive_slug
 from svtplay_arr.yamlio import ConcurrentModification, read_with_mtime
 
@@ -42,6 +56,13 @@ _TEMPLATES = Jinja2Templates(
 # re-render and the JSON the JS fetch consumes) read `css_class` off the
 # same dict rather than each deciding independently, so they cannot pick
 # different colours for the same result.
+# What one "Find mappings" click may cost SVT: one search per unmapped
+# series against an unofficial API. Module-level rather than defaults on
+# the call, so the bound is stated in one visible place -- and so a test
+# can shrink it without reaching inside the router closure.
+_SWEEP_CONCURRENCY = 4
+_SWEEP_CAP = 200
+
 _CHECK_CSS_CLASS = {
     "found": "notice",
     "not_found": "warn",
@@ -925,6 +946,128 @@ def build_config_router(
             )
         return _index(request, notice=f"Added {match.get('title')!r}. "
                                       "Mappings apply immediately.")
+
+    @router.post("/mappings/discover", response_class=HTMLResponse)
+    async def discover(request: Request):
+        """The Find mappings sweep.
+
+        Walks Sonarr's library, asks SVT about each unmapped series, writes
+        the rows `discovery.confident_match` approved, and surfaces
+        everything else for one click. A plain form POST with no JavaScript
+        anywhere in the path: the sweep works with JS off, like every other
+        control on this page.
+
+        The order of operations is the safety argument, and each step
+        exists because skipping it would allow a bad write:
+
+        1. `expected_mtime` is parsed first, so a corrupted concurrency
+           token costs SVT nothing -- the alternative is a full sweep
+           followed by a refused write.
+        2. mappings.yaml is loaded. If it will not parse, nothing is
+           searched and nothing is written: without knowing what is already
+           mapped, the sweep would re-search the whole library and could
+           append a duplicate row on top of a file it could not read.
+        3. The sweep runs and returns a value. It writes nothing itself, so
+           a Sonarr outage part-way through leaves no partial file to clean
+           up -- there is simply nothing to write.
+        4. One atomic write for the whole batch, honouring the same
+           concurrency check every other write route uses. Refused for any
+           reason means refused entirely; the matches are then shown as
+           found-but-not-saved rather than quietly dropped.
+
+        `series_title` comes from Sonarr's own record inside the sweep and
+        from nowhere else. Nothing in the submitted form reaches the file --
+        the form carries only `expected_mtime`.
+
+        Never a 500: every failure renders the config page with an error.
+        """
+        form = dict(await request.form())
+        expected, mtime_error = _parse_expected_mtime(form.get("expected_mtime"))
+        if mtime_error is not None:
+            return _index(request, error=mtime_error)
+
+        try:
+            mapped = {m.tvdb_id for m in MappingTable.load(mappings_path).all()}
+        except Exception as exc:
+            log.warning(
+                "mappings file %s is invalid; refusing to sweep over it",
+                mappings_path, exc_info=True,
+            )
+            return _index(
+                request,
+                error=(
+                    f"{mappings_path} is invalid: {exc}. Nothing was "
+                    "searched and nothing was written -- fix the file first."
+                ),
+            )
+
+        try:
+            sweep = await sweep_for_mappings(
+                sonarr, svt,
+                mapped_tvdb_ids=mapped,
+                concurrency=_SWEEP_CONCURRENCY,
+                cap=_SWEEP_CAP,
+            )
+        except Exception as exc:
+            log.warning("mapping sweep failed", exc_info=True)
+            return _index(
+                request,
+                error=f"Could not search for mappings ({exc}); nothing was written.",
+            )
+
+        written = ()
+        write_error = None
+        if sweep.confident:
+            try:
+                add_mappings(
+                    mappings_path,
+                    [
+                        {
+                            "tvdb_id": m.tvdb_id,
+                            "svt_series_id": m.svt_series_id,
+                            "svt_slug": m.svt_slug,
+                            # Sonarr's own spelling, carried through the
+                            # sweep untouched. Never SVT's name, and never
+                            # anything from the form.
+                            "series_title": m.series_title,
+                            "source": SOURCE_AUTO,
+                        }
+                        for m in sweep.confident
+                    ],
+                    expected_mtime=expected,
+                )
+                written = sweep.confident
+            except (MappingError, ConcurrentModification) as exc:
+                write_error = str(exc)
+            except Exception as exc:
+                log.exception("mapping sweep write failed")
+                write_error = f"could not save the mappings found: {exc}"
+
+        return _TEMPLATES.TemplateResponse(
+            request,
+            "mapping_discover.html",
+            {
+                "sweep": sweep,
+                # Deliberately separate from `sweep.confident`: what the
+                # gate approved and what actually reached the file are two
+                # facts, and after a refused write they differ. Saying
+                # "mapped" for a batch that was rejected would be the worst
+                # lie this page could tell.
+                "written": written,
+                "write_error": write_error,
+                # Re-read after the write, so the accept buttons below carry
+                # the file's current mtime rather than the one the sweep
+                # started from -- otherwise every one-click accept on this
+                # page would be refused as a concurrent modification by the
+                # sweep's own write.
+                "mappings_mtime": (
+                    "" if _mappings_mtime() is None else _mappings_mtime()
+                ),
+                "error": write_error,
+                "notice": None,
+                **_status_strip_context(),
+            },
+        )
 
     @router.post("/mappings/{tvdb_id}/delete", response_class=HTMLResponse)
     async def delete_mapping(request: Request, tvdb_id: int):

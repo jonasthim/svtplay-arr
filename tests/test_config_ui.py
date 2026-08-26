@@ -3522,3 +3522,348 @@ def test_a_provider_that_raises_leaves_the_page_rendering(tmp_path: Path):
     assert "Status unavailable" in r.text
     # ...and the rest of the page still works.
     assert TITLE in r.text
+
+
+# --- Find mappings: the automatic sweep ------------------------------
+#
+# The confidence gate itself is tested in tests/test_discovery.py. These
+# tests are about the page around it: that it writes only what the gate
+# approved, in one write, never from the form, and that every failure is
+# a rendered page rather than a 500 or a half-written file.
+
+
+class SweepSvt(FakeSvt):
+    """FakeSvt with per-query search results, and a call log."""
+
+    def __init__(self, results=None, error=None, **kwargs):
+        super().__init__(**kwargs)
+        self.results = results or {}
+        self.error = error
+        self.queries: list[str] = []
+
+    async def search_series(self, query):
+        self.queries.append(query)
+        if self.error is not None:
+            raise self.error
+        return self.results.get(query, [])
+
+
+class BrokenSonarr:
+    def __init__(self):
+        self.calls = 0
+
+    async def all_series(self):
+        self.calls += 1
+        raise RuntimeError("sonarr is unreachable")
+
+
+def _sweep_client(tmp_path: Path, svt, sonarr):
+    cfg, maps = _paths(tmp_path)
+    app = FastAPI()
+    app.include_router(build_config_router(cfg, maps, svt, sonarr))
+    return TestClient(app), maps
+
+
+def _discover(client, maps, **extra):
+    data = {"expected_mtime": str(maps.stat().st_mtime)}
+    data.update(extra)
+    return client.post("/config/mappings/discover", data=data)
+
+
+def test_the_index_offers_find_mappings_as_a_plain_form(tmp_path: Path):
+    # No JS: the sweep must work with JavaScript off, so the control is a
+    # form POST, not a fetch.
+    body = _client(tmp_path).get("/config").text
+    assert 'action="/config/mappings/discover"' in body
+    assert "Find mappings" in body
+
+
+def test_a_confident_match_is_written(tmp_path: Path):
+    svt = SweepSvt({OTHER: [SvtSearchHit("vvm123", OTHER, "TvSeries")]})
+    sonarr = FakeSonarr([
+        {"id": 7, "tvdbId": 288649, "title": TITLE},      # already mapped
+        {"id": 9, "tvdbId": 999, "title": OTHER},
+    ])
+    client, maps = _sweep_client(tmp_path, svt, sonarr)
+
+    r = _discover(client, maps)
+
+    assert r.status_code == 200
+    created = MappingTable.load(maps).for_tvdb(999)
+    assert created is not None
+    assert created.series_title == OTHER
+    assert created.svt_series_id == "vvm123"
+    assert created.svt_slug == derive_slug(OTHER)
+    assert OTHER in r.text
+
+
+def test_a_written_row_is_marked_as_auto(tmp_path: Path):
+    svt = SweepSvt({OTHER: [SvtSearchHit("vvm123", OTHER, "TvSeries")]})
+    sonarr = FakeSonarr([{"id": 9, "tvdbId": 999, "title": OTHER}])
+    client, maps = _sweep_client(tmp_path, svt, sonarr)
+
+    _discover(client, maps)
+
+    assert MappingTable.load(maps).for_tvdb(999).source == "auto"
+
+
+def test_an_already_mapped_series_is_never_searched(tmp_path: Path):
+    svt = SweepSvt({})
+    sonarr = FakeSonarr([{"id": 7, "tvdbId": 288649, "title": TITLE}])
+    client, maps = _sweep_client(tmp_path, svt, sonarr)
+
+    _discover(client, maps)
+
+    assert svt.queries == []
+
+
+def test_two_qualifying_candidates_are_offered_not_written(tmp_path: Path):
+    svt = SweepSvt({OTHER: [
+        SvtSearchHit("a1", OTHER, "TvSeries"),
+        SvtSearchHit("a2", OTHER.upper(), "TvSeries"),
+    ]})
+    sonarr = FakeSonarr([{"id": 9, "tvdbId": 999, "title": OTHER}])
+    client, maps = _sweep_client(tmp_path, svt, sonarr)
+
+    r = _discover(client, maps)
+
+    assert MappingTable.load(maps).for_tvdb(999) is None
+    # Each candidate is one click: a form to the existing create route,
+    # carrying the same "svt_id|slug" value a radio pick would.
+    assert 'value="a1|' in r.text
+    assert 'value="a2|' in r.text
+    assert 'action="/config/mappings"' in r.text
+    assert 'value="999"' in r.text
+
+
+def test_a_near_miss_is_offered_not_written(tmp_path: Path):
+    svt = SweepSvt({OTHER: [SvtSearchHit("j1", OTHER + " Junior", "TvSeries")]})
+    sonarr = FakeSonarr([{"id": 9, "tvdbId": 999, "title": OTHER}])
+    client, maps = _sweep_client(tmp_path, svt, sonarr)
+
+    r = _discover(client, maps)
+
+    assert MappingTable.load(maps).for_tvdb(999) is None
+    assert "Junior" in r.text
+
+
+def test_no_svt_match_at_all_is_reported_not_written(tmp_path: Path):
+    svt = SweepSvt({})
+    sonarr = FakeSonarr([{"id": 9, "tvdbId": 999, "title": OTHER}])
+    client, maps = _sweep_client(tmp_path, svt, sonarr)
+
+    r = _discover(client, maps)
+
+    assert MappingTable.load(maps).for_tvdb(999) is None
+    assert OTHER in r.text
+    assert "no svt" in r.text.lower() or "nothing on svt" in r.text.lower()
+
+
+def test_a_sonarr_outage_writes_nothing_and_does_not_500(tmp_path: Path):
+    cfg, maps = _paths(tmp_path)
+    before = maps.read_text(encoding="utf-8")
+    app = FastAPI()
+    app.include_router(build_config_router(cfg, maps, SweepSvt({}), BrokenSonarr()))
+    client = TestClient(app)
+
+    r = client.post("/config/mappings/discover",
+                    data={"expected_mtime": str(maps.stat().st_mtime)})
+
+    assert r.status_code == 200
+    assert "unreachable" in _error_text(r.text)
+    # Byte-identical: no partial write, no rewrite, no .bak churn.
+    assert maps.read_text(encoding="utf-8") == before
+    assert not (maps.parent / "mappings.yaml.bak").exists()
+
+
+def test_a_form_supplied_series_title_cannot_reach_the_file(tmp_path: Path):
+    # The same guarantee the manual path has, on the automatic one: the
+    # title is the permanent filename and comes only from Sonarr's record.
+    svt = SweepSvt({OTHER: [SvtSearchHit("vvm123", OTHER, "TvSeries")]})
+    sonarr = FakeSonarr([{"id": 9, "tvdbId": 999, "title": OTHER}])
+    client, maps = _sweep_client(tmp_path, svt, sonarr)
+
+    _discover(client, maps, series_title="WRONG TITLE FROM FORM",
+              svt_series_id="WRONG", svt_slug="wrong-slug")
+
+    created = MappingTable.load(maps).for_tvdb(999)
+    assert created.series_title == OTHER
+    assert created.svt_slug == derive_slug(OTHER)
+    assert "WRONG" not in maps.read_text(encoding="utf-8")
+
+
+def test_an_svt_name_is_never_used_as_the_series_title(tmp_path: Path):
+    # SVT's spelling differs only in case, so the gate matches -- and the
+    # file must still carry Sonarr's spelling byte for byte.
+    svt = SweepSvt({OTHER: [SvtSearchHit("vvm123", OTHER.upper(), "TvSeries")]})
+    sonarr = FakeSonarr([{"id": 9, "tvdbId": 999, "title": OTHER}])
+    client, maps = _sweep_client(tmp_path, svt, sonarr)
+
+    _discover(client, maps)
+
+    assert MappingTable.load(maps).for_tvdb(999).series_title == OTHER
+    assert OTHER.upper() not in maps.read_text(encoding="utf-8")
+
+
+def test_an_invalid_mappings_file_is_never_swept_over(tmp_path: Path):
+    # Without knowing what is already mapped the sweep would re-search
+    # everything and could write a duplicate row on top of a file it could
+    # not read. Refuse before calling anything.
+    cfg, maps = _paths(tmp_path)
+    maps.write_text("series: [{tvdb_id: 1, ", encoding="utf-8")
+    before = maps.read_text(encoding="utf-8")
+    svt = SweepSvt({})
+    sonarr = FakeSonarr([{"id": 9, "tvdbId": 999, "title": OTHER}])
+    app = FastAPI()
+    app.include_router(build_config_router(cfg, maps, svt, sonarr))
+
+    r = TestClient(app).post("/config/mappings/discover", data={})
+
+    assert r.status_code == 200
+    assert "invalid" in _error_text(r.text)
+    assert svt.queries == []
+    assert maps.read_text(encoding="utf-8") == before
+
+
+def test_a_corrupt_expected_mtime_is_refused_before_any_search(tmp_path: Path):
+    svt = SweepSvt({OTHER: [SvtSearchHit("vvm123", OTHER, "TvSeries")]})
+    sonarr = FakeSonarr([{"id": 9, "tvdbId": 999, "title": OTHER}])
+    client, maps = _sweep_client(tmp_path, svt, sonarr)
+
+    r = client.post("/config/mappings/discover",
+                    data={"expected_mtime": "not-a-number"})
+
+    assert r.status_code == 200
+    assert "expected_mtime" in _error_text(r.text)
+    assert svt.queries == []
+    assert MappingTable.load(maps).for_tvdb(999) is None
+
+
+def test_a_concurrent_modification_refuses_the_whole_batch(tmp_path: Path):
+    svt = SweepSvt({OTHER: [SvtSearchHit("vvm123", OTHER, "TvSeries")]})
+    sonarr = FakeSonarr([{"id": 9, "tvdbId": 999, "title": OTHER}])
+    client, maps = _sweep_client(tmp_path, svt, sonarr)
+    before = maps.read_text(encoding="utf-8")
+
+    r = client.post("/config/mappings/discover",
+                    data={"expected_mtime": "1.0"})
+
+    assert r.status_code == 200
+    assert _error_text(r.text)
+    assert maps.read_text(encoding="utf-8") == before
+
+
+def test_the_sweep_never_asks_svt_for_an_episode_list(tmp_path: Path):
+    svt = SweepSvt({OTHER: [SvtSearchHit("vvm123", OTHER, "TvSeries")]})
+    sonarr = FakeSonarr([{"id": 9, "tvdbId": 999, "title": OTHER}])
+    client, maps = _sweep_client(tmp_path, svt, sonarr)
+
+    _discover(client, maps)
+
+    assert svt.list_episodes_calls == []
+
+
+def test_the_sweep_page_never_renders_the_api_key(tmp_path: Path):
+    svt = SweepSvt({OTHER: [SvtSearchHit("vvm123", OTHER, "TvSeries")]})
+    sonarr = FakeSonarr([{"id": 9, "tvdbId": 999, "title": OTHER}])
+    client, maps = _sweep_client(tmp_path, svt, sonarr)
+
+    assert "SECRET-KEY-VALUE" not in _discover(client, maps).text
+
+
+def test_an_svt_search_failure_is_reported_per_series(tmp_path: Path):
+    svt = SweepSvt({}, error=SvtApiError("SVT timed out"))
+    sonarr = FakeSonarr([{"id": 9, "tvdbId": 999, "title": OTHER}])
+    client, maps = _sweep_client(tmp_path, svt, sonarr)
+
+    r = _discover(client, maps)
+
+    assert r.status_code == 200
+    assert "SVT timed out" in r.text
+    assert MappingTable.load(maps).for_tvdb(999) is None
+
+
+def test_a_sweep_with_nothing_to_do_does_not_rewrite_the_file(tmp_path: Path):
+    svt = SweepSvt({})
+    sonarr = FakeSonarr([{"id": 7, "tvdbId": 288649, "title": TITLE}])
+    client, maps = _sweep_client(tmp_path, svt, sonarr)
+    before = maps.stat().st_mtime, maps.read_text(encoding="utf-8")
+
+    r = _discover(client, maps)
+
+    assert r.status_code == 200
+    assert (maps.stat().st_mtime, maps.read_text(encoding="utf-8")) == before
+
+
+def test_hitting_the_search_cap_is_said_out_loud(tmp_path: Path):
+    import svtplay_arr.api.config_ui as config_ui
+
+    svt = SweepSvt({})
+    sonarr = FakeSonarr([
+        {"id": i, "tvdbId": 1000 + i, "title": f"Show {i}"} for i in range(6)
+    ])
+    client, maps = _sweep_client(tmp_path, svt, sonarr)
+    config_ui._SWEEP_CAP, old = 2, config_ui._SWEEP_CAP
+    try:
+        r = _discover(client, maps)
+    finally:
+        config_ui._SWEEP_CAP = old
+
+    assert len(svt.queries) == 2
+    assert "4" in r.text and "not searched" in r.text.lower()
+
+
+def test_a_hand_accepted_suggestion_is_not_marked_auto(tmp_path: Path):
+    # The one-click accept goes through the ordinary create route, so the
+    # row it writes is what it is: confirmed by a human. Marking it `auto`
+    # would defeat the point of recording provenance at all.
+    svt = SweepSvt({OTHER: [
+        SvtSearchHit("a1", OTHER + " Junior", "TvSeries"),
+        SvtSearchHit("a2", OTHER + " Senior", "TvSeries"),
+    ]})
+    sonarr = FakeSonarr([{"id": 9, "tvdbId": 999, "title": OTHER}])
+    client, maps = _sweep_client(tmp_path, svt, sonarr)
+
+    _discover(client, maps)
+    client.post("/config/mappings", data={
+        "expected_mtime": str(maps.stat().st_mtime),
+        "q": OTHER,
+        "svt": "a1|vem-vet-mest-junior",
+        "sonarr": "999",
+    })
+
+    created = MappingTable.load(maps).for_tvdb(999)
+    assert created.series_title == OTHER      # still Sonarr's, never SVT's
+    assert created.source == "manual"
+
+
+def test_every_confident_row_is_written_in_a_single_write(
+    tmp_path: Path, monkeypatch
+):
+    # N add_mapping calls would be N chances for a concurrent modification
+    # to land mid-sweep and leave the library half-mapped, and N .bak
+    # churns for one logical change.
+    import svtplay_arr.api.config_ui as config_ui
+    import svtplay_arr.mappings as mappings_mod
+
+    titles = ["Show A", "Show B", "Show C"]
+    svt = SweepSvt({t: [SvtSearchHit(f"id{i}", t, "TvSeries")]
+                    for i, t in enumerate(titles)})
+    sonarr = FakeSonarr([
+        {"id": i, "tvdbId": 500 + i, "title": t} for i, t in enumerate(titles)
+    ])
+    client, maps = _sweep_client(tmp_path, svt, sonarr)
+
+    # Patched only now, so the fixture's own setup write is not counted.
+    writes = []
+    real = mappings_mod.atomic_write_yaml
+    monkeypatch.setattr(
+        mappings_mod, "atomic_write_yaml",
+        lambda *a, **k: (writes.append(a[0]), real(*a, **k))[1],
+    )
+    assert config_ui.add_mappings is mappings_mod.add_mappings
+
+    _discover(client, maps)
+
+    assert len(writes) == 1
+    assert len(MappingTable.load(maps).all()) == 4  # the fixture row plus three

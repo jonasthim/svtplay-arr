@@ -1,0 +1,162 @@
+{% extends "base.html" %}
+{% block content %}
+{# The result of one Find mappings sweep. Reports three different things
+   and never blurs them: what was written without anyone confirming it,
+   what needs a human decision, and what SVT had nothing for. Every
+   control here is a plain form POST -- the sweep and everything it offers
+   work with JavaScript off. #}
+<h2>Find mappings</h2>
+
+<section class="panel">
+  <div class="panel-head">This run</div>
+  <div class="panel-inner">
+    <ul class="sweep-summary">
+      <li><strong>{{ written | length }}</strong> mapped automatically</li>
+      <li><strong>{{ sweep.needs_decision | length }}</strong> need a decision</li>
+      <li><strong>{{ sweep.no_match | length }}</strong> with no SVT match</li>
+      {% if sweep.search_failed %}
+      <li><strong>{{ sweep.search_failed | length }}</strong> could not be searched</li>
+      {% endif %}
+      <li><strong>{{ sweep.already_mapped }}</strong> already mapped, not searched</li>
+    </ul>
+    {% if sweep.capped %}
+    {# Said out loud rather than silently truncating: the operator has to
+       know the library was not swept end to end. Re-running continues,
+       because this run's confident rows are now mapped and skipped. #}
+    <p class="warn">Stopped at the per-run limit of {{ sweep.cap }} SVT
+      searches: {{ sweep.not_searched }} unmapped series were
+      <strong>not searched</strong> this run. Run Find mappings again to
+      continue with the rest.</p>
+    {% endif %}
+    {% if sweep.skipped_records %}
+    <p class="help">{{ sweep.skipped_records }} Sonarr record(s) had no
+      usable title or TVDB id and were skipped.</p>
+    {% endif %}
+  </div>
+</section>
+
+{% if written %}
+<h2>Mapped automatically</h2>
+<p class="help">Written because the Sonarr title and the SVT programme name
+matched exactly and exactly one SVT programme matched. Anything less
+confident than that is below, unwritten. These rows are marked
+<code>source: auto</code> in mappings.yaml so they can be told apart from
+mappings you confirmed yourself &mdash; check them, and remove any that
+look wrong: the series title becomes the permanent filename in your
+library.</p>
+<section class="panel">
+  <div class="panel-inner">
+    <table class="mappings">
+      <thead><tr><th>Series</th><th>TVDB</th><th>SVT</th></tr></thead>
+      <tbody>
+      {% for m in written %}
+      <tr class="mapping-row">
+        <td data-label="Series">{{ m.series_title }}</td>
+        <td data-label="TVDB">{{ m.tvdb_id }}</td>
+        <td data-label="SVT">{{ m.svt_series_id }} / {{ m.svt_slug }}</td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% elif sweep.confident and write_error %}
+{# The gate approved these and the write was refused. Saying "mapped"
+   would be the worst lie this page could tell, so they are shown as
+   found-but-not-saved, with the same one-click accept everything else
+   gets. #}
+<h2>Found, but not saved</h2>
+<p class="warn">The error above stopped these from being written. Nothing
+was saved. Accept them one at a time, or reload and run Find mappings
+again.</p>
+<section class="panel">
+  <div class="panel-inner">
+  {% for m in sweep.confident %}
+    <div class="sweep-item">
+      <p class="sweep-title">{{ m.series_title }}
+        <span class="help">tvdbId {{ m.tvdb_id }}</span></p>
+      <form method="post" action="/config/mappings" class="accept-form">
+        <input type="hidden" name="expected_mtime" value="{{ mappings_mtime }}">
+        <input type="hidden" name="q" value="{{ m.series_title }}">
+        <input type="hidden" name="svt" value="{{ m.svt_series_id }}|{{ m.svt_slug }}">
+        <input type="hidden" name="sonarr" value="{{ m.tvdb_id }}">
+        <button type="submit">Use {{ m.svt_name }}</button>
+      </form>
+    </div>
+  {% endfor %}
+  </div>
+</section>
+{% endif %}
+
+{% if sweep.needs_decision %}
+<h2>Needs a decision</h2>
+<p class="help">SVT returned programmes for these, but not exactly one whose
+name matches the Sonarr title &mdash; so nothing was written. Pick one and
+it is saved immediately; the series title always comes from Sonarr, never
+from SVT.</p>
+<section class="panel">
+  <div class="panel-inner">
+  {% for p in sweep.needs_decision %}
+    <div class="sweep-item">
+      <p class="sweep-title">{{ p.series_title }}
+        <span class="help">tvdbId {{ p.tvdb_id }}</span></p>
+      <p class="help">{{ p.reason }}</p>
+      {% for c in p.candidates %}
+      {# One click per candidate: the same create route, carrying the same
+         "svt_id|slug" value a radio pick on the search page would. #}
+      <form method="post" action="/config/mappings" class="accept-form">
+        <input type="hidden" name="expected_mtime" value="{{ mappings_mtime }}">
+        <input type="hidden" name="q" value="{{ p.series_title }}">
+        <input type="hidden" name="svt" value="{{ c.svt_id }}|{{ c.slug }}">
+        <input type="hidden" name="sonarr" value="{{ p.tvdb_id }}">
+        <button type="submit">Use {{ c.name }}</button>
+        <span class="help">{{ c.svt_id }} / {{ c.slug }}</span>
+      </form>
+      {% endfor %}
+    </div>
+  {% endfor %}
+  </div>
+</section>
+{% endif %}
+
+{% if sweep.no_match %}
+<h2>No SVT match</h2>
+<p class="help">SVT returned nothing usable for these titles. They may not
+be on SVT Play at all, or SVT may spell them differently from TVDB &mdash;
+try a shorter query in the manual search.</p>
+<section class="panel">
+  <div class="panel-inner">
+  {% for p in sweep.no_match %}
+    <div class="sweep-item">
+      <p class="sweep-title">{{ p.series_title }}
+        <span class="help">tvdbId {{ p.tvdb_id }}</span></p>
+      <form method="post" action="/config/mappings/search" class="accept-form">
+        <input type="hidden" name="q" value="{{ p.series_title }}">
+        <button type="submit">Search SVT manually</button>
+      </form>
+    </div>
+  {% endfor %}
+  </div>
+</section>
+{% endif %}
+
+{% if sweep.search_failed %}
+<h2>Could not be searched</h2>
+<p class="help">The SVT search itself failed for these. That says nothing
+about whether a match exists &mdash; run Find mappings again once SVT is
+reachable.</p>
+<section class="panel">
+  <div class="panel-inner">
+  {% for p in sweep.search_failed %}
+    <div class="sweep-item">
+      <p class="sweep-title">{{ p.series_title }}
+        <span class="help">tvdbId {{ p.tvdb_id }}</span></p>
+      <p class="warn">{{ p.reason }}</p>
+    </div>
+  {% endfor %}
+  </div>
+</section>
+{% endif %}
+
+<p><a href="/config">Back to configuration</a></p>
+{% endblock %}
