@@ -465,3 +465,29 @@ def test_the_old_first_hit_wins_helper_is_gone():
 
     assert not hasattr(mappings_mod, "suggest_mappings")
     assert not hasattr(mappings_mod, "main")
+
+
+def test_the_sweep_cannot_reach_the_matching_or_download_path():
+    # A structural version of the rule: this module writes mappings and
+    # nothing else. If it ever imports the resolver, the worker or the job
+    # store, "the sweep only writes mappings" has stopped being true by
+    # construction and become a thing someone has to remember.
+    import ast
+    from pathlib import Path
+
+    tree = ast.parse(Path("src/svtplay_arr/discovery.py").read_text("utf-8"))
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module)
+        elif isinstance(node, ast.Import):
+            imported.update(a.name for a in node.names)
+
+    forbidden = {
+        "svtplay_arr.resolver",
+        "svtplay_arr.worker",
+        "svtplay_arr.store",
+        "svtplay_arr.downloader",
+        "svtplay_arr.naming",
+    }
+    assert not (imported & forbidden)
