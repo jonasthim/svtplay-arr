@@ -19,9 +19,10 @@
 #
 # Prefer the configuration page (/config) over hand-editing. Its "Find
 # mappings" button sweeps your whole Sonarr library, writes the rows where
-# the Sonarr title and the SVT programme name match exactly and exactly one
-# SVT programme matches, and lists everything less certain than that for you
-# to decide with one click each. Rows it writes carry `source: auto`.
+# the Sonarr title and the SVT programme name match exactly, exactly one SVT
+# programme matches, and no other series already claims that programme, and
+# lists everything less certain for you to decide with one click each. Rows
+# it writes carry `source: auto`.
 #
 # The packaged script runs the same sweep and writes nothing at all:
 #

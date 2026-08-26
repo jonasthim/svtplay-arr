@@ -397,8 +397,12 @@ async def sweep_for_mappings(
     # on one slug means Sonarr asking for the reboot's S01E01 is answered
     # with an episode of the original -- permanently, because
     # renameEpisodes=False.
-    claimed: dict[str, str] = {
-        m.svt_series_id: m.series_title for m in existing if m.svt_series_id
+    # Title *and* tvdb id: the case this guard exists for is two series
+    # whose titles differ only by a year, so naming the holder by title
+    # alone is ambiguous exactly when it matters most.
+    claimed: dict[str, tuple[str, int]] = {
+        m.svt_series_id: (m.series_title, m.tvdb_id)
+        for m in existing if m.svt_series_id
     }
     gate = asyncio.Semaphore(max(concurrency, 1))
 
@@ -436,15 +440,17 @@ async def sweep_for_mappings(
                 outcome="already_claimed",
                 reason=(
                     f"SVT programme {best.name!r} is already mapped to "
-                    f"{claimed[best.svt_id]!r}. Two series pointing at one "
-                    "SVT programme would answer a search for either with "
-                    "episodes of the same show, so this was not written."
+                    f"{claimed[best.svt_id][0]!r} "
+                    f"(tvdbId {claimed[best.svt_id][1]}). Two series "
+                    "pointing at one SVT programme would answer a search "
+                    "for either with episodes of the same show, so this "
+                    "was not written."
                 ),
                 candidates=(Candidate.of(best),),
             ))
             continue
         if best is not None:
-            claimed[best.svt_id] = target.title
+            claimed[best.svt_id] = (target.title, target.tvdb_id)
             confident.append(ConfidentMatch(
                 tvdb_id=target.tvdb_id,
                 # Sonarr's spelling, never SVT's. This is the permanent

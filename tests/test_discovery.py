@@ -583,9 +583,11 @@ async def test_a_second_series_claiming_one_programme_is_surfaced_not_written():
     assert [m.tvdb_id for m in sweep.confident] == [100]
     (p,) = sweep.already_claimed
     assert p.tvdb_id == 200
-    # Names the series it collides with, so the operator can tell which of
-    # the two is the one they actually want mapped.
+    # Names the series it collides with *and its tvdb id*: the case this
+    # guard exists for is two series whose titles differ only by a year,
+    # where the title alone does not identify which one holds it.
     assert "Vem vet mest?" in p.reason
+    assert "tvdbId 100" in p.reason
     # Still one click away, because a human may legitimately decide this
     # is the row they want -- the writer permits it once confirmed.
     assert [c.svt_id for c in p.candidates] == ["vvm"]

@@ -49,7 +49,9 @@ The seams are the design, and they are worth stating as rules:
   for a UI change to alter what gets grabbed.
 - **Only `discovery.py` decides that a mapping may be written unconfirmed.**
   It mirrors `resolver.py` one level up — two independent signals, refuse on
-  any doubt — and it is the only place that rule lives.
+  any doubt — and it is the only place that rule lives. Its normalisation is
+  asymmetric on purpose: the trailing-year strip applies to Sonarr's title and
+  not to SVT's name.
 - **`app.py` only assembles.** If you find yourself adding matching, download
   or wire-format logic there, it belongs somewhere else.
 

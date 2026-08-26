@@ -158,8 +158,12 @@ by hand.
 **Find mappings** on the configuration page sweeps your whole Sonarr library
 at once: it searches SVT for every series that is not mapped yet and saves the
 rows it is certain about. "Certain" is deliberately narrow — the Sonarr title
-and the SVT programme name must be *identical* once casefolded and stripped of
-a trailing `(2019)`, and exactly one SVT programme may match. Anything less —
+and the SVT programme name must be *identical* once casefolded, and exactly one
+SVT programme may match. A trailing `(2019)` is stripped from **Sonarr's** title
+only, because carrying TVDB's disambiguating year is a fact about Sonarr's data;
+stripping it from SVT's name too would make `Big Brother (2019)` and `Big
+Brother (2020)` the same show. And no two series may be mapped to one SVT
+programme, so an original and its year-tagged reboot cannot both claim it. Anything less —
 several candidates, a near miss, nothing found — is listed for you to decide,
 one click each, and never written. A wrong series mapping is exactly the
 mistake this project refuses to make on its own, and one level larger than a

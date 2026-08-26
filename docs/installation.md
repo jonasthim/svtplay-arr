@@ -245,8 +245,9 @@ it becomes the permanent filename.
 **Or map the whole library at once** with *Find mappings* on the same page. It
 searches SVT for every Sonarr series that is not mapped yet and saves only the
 ones where the Sonarr title and the SVT programme name are identical
-(casefolded, whitespace-collapsed, a trailing `(2019)` stripped) and exactly
-one SVT programme matches. Everything less certain is listed for you to accept
+(casefolded and whitespace-collapsed; a trailing `(2019)` is stripped from
+Sonarr's title only), exactly one SVT programme matches, and no other series
+already claims that programme. Everything less certain is listed for you to accept
 with one click. Rows it writes are marked `source: auto` — check them, since
 `series_title` is still the permanent filename.
 

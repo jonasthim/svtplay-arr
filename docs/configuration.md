@@ -382,9 +382,19 @@ lists everything else for you to decide with one click each.
 "Certain" means **both** of these, and nothing less:
 
 1. The Sonarr series title and the SVT programme name are **identical** once
-   casefolded, whitespace-collapsed and stripped of a trailing `(2019)`.
+   casefolded and whitespace-collapsed. A trailing `(2019)` is stripped from
+   **Sonarr's** title only — carrying TVDB's disambiguating year is a fact
+   about Sonarr's data, not a statement that a year in a title is noise.
+   Stripping it from SVT's name too would make `Big Brother (2019)` match a
+   programme actually named `Big Brother (2020)`.
 2. **Exactly one** SVT programme (type `TvSeries` or `TvShow`) matches that
    way.
+3. **No other series already claims that SVT programme.** Two mappings on one
+   programme answer a search for either with episodes of the same show. An
+   original and its year-tagged reboot both normalise to the same Sonarr-side
+   title, so this is the rule that stops both being written; the second is
+   listed under *Already claimed by another series*, one click from being
+   accepted deliberately if that is what you want.
 
 Several candidates, a near miss, or nothing found are all surfaced, never
 written. Diacritics are deliberately **not** folded during the comparison:

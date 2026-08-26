@@ -192,8 +192,9 @@ permanent for that file.
 Rather than hand-writing rows, use **Find mappings** on the configuration
 page. It searches SVT for every Sonarr series that is not mapped yet and
 saves the rows where the Sonarr title and the SVT programme name are
-identical (casefolded, whitespace-collapsed, a trailing `(2019)` stripped)
-*and* exactly one SVT programme matches. Anything less certain — several
+identical (casefolded and whitespace-collapsed; a trailing `(2019)` is
+stripped from Sonarr's title only), exactly one SVT programme matches, and
+no other series already claims that programme. Anything less certain — several
 candidates, a near miss, nothing found — is listed for you to accept with
 one click, never written. Rows it writes carry `source: auto` so they can
 be told apart from ones you confirmed yourself.
