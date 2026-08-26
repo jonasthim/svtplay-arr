@@ -1797,6 +1797,61 @@ def test_a_form_supplied_series_title_is_ignored(tmp_path: Path):
     assert "WRONG TITLE FROM FORM" not in maps.read_text(encoding="utf-8")
 
 
+def test_the_typed_query_is_never_used_as_the_series_title(tmp_path: Path):
+    """The mutation this exists for survived the whole suite.
+
+    Changing the accept route to
+    `series_title=str(form.get("q") or match.get("title") or "")` passed
+    every test: `test_a_form_supplied_series_title_is_ignored` posts a
+    `series_title` key the code never reads, and every other accept test
+    posts a `q` that happens to *equal* Sonarr's title.
+
+    Every accept form on the sweep and search pages posts `q`, and on the
+    search page `q` is whatever the operator typed. So a future "reuse the
+    query we already have" refactor would land green and file every
+    episode of the series as `gift - S01E01`, permanently, because Sonarr
+    runs with renameEpisodes=False.
+    """
+    cfg, maps = _paths(tmp_path)
+    sonarr = FakeSonarr([{"id": 9, "tvdbId": 999, "title": OTHER}])
+    app = FastAPI()
+    app.include_router(build_config_router(cfg, maps, FakeSvt(), sonarr))
+    client = TestClient(app)
+
+    # What someone actually types to find "Vem vet mest?": not its title.
+    client.post("/config/mappings", data={
+        "expected_mtime": str(maps.stat().st_mtime),
+        "q": "vem vet",
+        "svt": "abc123|vem-vet-mest",
+        "sonarr": "999",
+    })
+
+    created = MappingTable.load(maps).for_tvdb(999)
+    assert created is not None
+    assert created.series_title == OTHER
+    assert "vem vet\n" not in maps.read_text(encoding="utf-8")
+
+
+def test_the_notice_names_sonarrs_title_not_the_query(tmp_path: Path):
+    # The same guarantee one step further out: the confirmation an
+    # operator reads must name what was actually written, or a wrong title
+    # is invisible until it reaches the filesystem.
+    cfg, maps = _paths(tmp_path)
+    sonarr = FakeSonarr([{"id": 9, "tvdbId": 999, "title": OTHER}])
+    app = FastAPI()
+    app.include_router(build_config_router(cfg, maps, FakeSvt(), sonarr))
+
+    r = TestClient(app).post("/config/mappings", data={
+        "expected_mtime": str(maps.stat().st_mtime),
+        "q": "vem vet",
+        "svt": "abc123|vem-vet-mest",
+        "sonarr": "999",
+    })
+
+    assert OTHER in _notice_text(r.text)
+    assert "vem vet" not in _notice_text(r.text)
+
+
 def _pending_text(html: str) -> str:
     m = re.search(r'<p class="pending">(.*?)</p>', html, re.S)
     assert m, f"no pending-restart banner in:\n{html}"

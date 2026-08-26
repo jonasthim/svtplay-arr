@@ -34,7 +34,18 @@ from svtplay_arr.discovery import (
 from svtplay_arr.models import Mapping, SonarrEpisode, SvtEpisode, SvtSearchHit
 
 # A weekly Swedish show: one episode every seven days from this date.
-FIRST = date(2026, 8, 3)
+#
+# Relative to today rather than a fixed calendar date, because the gate now
+# asks how many of Sonarr's episodes have *aired* -- so a fixture pinned to
+# 2026-08-03 would quietly change meaning as the real date moved past it,
+# and a run that reads as "eight aired episodes" today would read as "four"
+# a month before it was written.
+FIRST = date.today() - timedelta(days=70)
+
+# A season SVT has only just started publishing: episode 1 last week,
+# episode 2 today, the rest still to come. This is the shape the short-run
+# fallback exists for, and it is short on *both* sides.
+JUST_STARTED = date.today() - timedelta(days=7)
 
 
 def _hit(name, svt_id="abc123", typename="TvSeries"):
@@ -198,10 +209,16 @@ def test_corroboration_honours_the_configured_tolerance(tolerance, drift, expect
 # --- the gate --------------------------------------------------------
 
 
-def _checked(name, matched, comparable, svt_id=None, error=None):
+def _checked(name, matched, comparable, svt_id=None, error=None, aired=None):
+    # `aired` defaults to `comparable`, i.e. a series whose history is
+    # exactly as long as what SVT offers -- the neutral case. Tests that
+    # care about the long-Sonarr-run hole say so explicitly.
     return Candidate(
         svt_id=svt_id or name, name=name, slug=name.lower(),
-        evidence=Evidence(matched=matched, comparable=comparable, error=error),
+        evidence=Evidence(
+            matched=matched, comparable=comparable,
+            aired=comparable if aired is None else aired, error=error,
+        ),
     )
 
 
@@ -236,8 +253,48 @@ def test_one_matching_episode_is_never_enough():
 
 
 def test_the_short_run_fallback_accepts_a_complete_short_run():
-    assert corroborated_match([_checked("A", 2, 2)]) is not None
+    assert corroborated_match([_checked("A", 2, 2, aired=2)]) is not None
     assert SHORT_RUN_MIN_EPISODES == 2
+
+
+def test_a_long_running_series_can_never_reach_the_short_run_fallback():
+    """The hole this closes admitted the exact coincidence the floor of 3
+    exists to refuse.
+
+    `comparable` counts SVT's side. A 15-season Sonarr series whose SVT
+    candidate happens to list only two available episodes therefore had
+    `comparable == 2`, dropped straight into the weak branch, and was
+    written on two agreeing episodes -- while the *correct* 8-episode
+    programme for the same series had to clear 3.
+
+    Worse than merely inconsistent: a wrong candidate with a genuinely
+    short run has a small denominator by construction, so the weak path
+    was preferentially available to the wrong answer.
+    """
+    assert corroborated_match([_checked("A", 2, 2, aired=120)]) is None
+    # And it is not the SVT side that saves it -- the same two episodes
+    # against a series with no history behind them are still accepted.
+    assert corroborated_match([_checked("A", 2, 2, aired=2)]) is not None
+
+
+def test_the_strict_floor_applies_as_soon_as_either_side_is_long_enough():
+    # Sonarr long, SVT short: strict.
+    assert corroborated_match([_checked("A", 2, 2, aired=ACCEPT_MIN_EPISODES)]) is None
+    # Sonarr short, SVT long: strict too -- a candidate listing plenty of
+    # episodes has supplied plenty of chances to disagree.
+    assert corroborated_match([_checked("A", 2, 8, aired=2)]) is None
+    # Both short: the fallback, which is the only case it is for.
+    assert corroborated_match([
+        _checked("A", 2, 2, aired=ACCEPT_MIN_EPISODES - 1)
+    ]) is not None
+
+
+def test_the_evidence_names_sonarrs_side_when_that_is_what_refused_it():
+    # "1 of 2 matched; at least 3 are needed" reads as a contradiction
+    # until you know the threshold comes from the series having aired 120.
+    note = Evidence(matched=2, comparable=2, aired=120).describe()
+    assert "2 of 2 episodes matched" in note
+    assert "aired 120 episodes" in note
 
 
 def test_the_short_run_fallback_refuses_a_lone_agreement():
@@ -486,31 +543,60 @@ async def test_two_matching_episodes_on_a_long_running_series_are_surfaced():
     assert "2 of 8 episodes matched" in p.candidates[0].note()
 
 
+async def test_a_returning_series_is_not_written_on_two_agreeing_episodes():
+    # The sweep-level form of the hole. Sonarr has 20 aired episodes of a
+    # returning show; a wrong candidate lists exactly two, on two dates
+    # that happen to line up. Two weekly shows in the same broadcast slot
+    # produce precisely this.
+    sonarr_run = _sonarr_weekly(20, start=FIRST - timedelta(days=100))
+    coincidence = [
+        _svt_ep(1, FIRST - timedelta(days=100)),
+        _svt_ep(2, FIRST - timedelta(days=93)),
+    ]
+    sweep = await _sweep(
+        [{"id": 1, "tvdbId": 7, "title": "Solsidan"}],
+        {"Solsidan": [_hit("Solsidan", "s1")]},
+        episodes={"solsidan": coincidence},
+        sonarr_episodes={1: sonarr_run},
+    )
+
+    assert sweep.confident == ()
+    (p,) = sweep.needs_decision
+    assert "aired 20 episodes" in p.candidates[0].note()
+
+
 async def test_the_short_run_fallback_writes_a_complete_two_episode_run():
     # SVT has published two episodes of a new season; the rest are
-    # upcoming. Refusing this forever is the old gate's failure wearing a
-    # new hat, so all-of-a-short-run is accepted -- but never one.
-    svt = _weekly(2) + [
-        _svt_ep(3, FIRST + timedelta(days=14), available=False),
+    # upcoming, and Sonarr has aired exactly those two. Refusing this
+    # forever is the old gate's failure wearing a new hat, so
+    # all-of-a-short-run is accepted -- but never one.
+    svt = _weekly(2, start=JUST_STARTED) + [
+        _svt_ep(3, JUST_STARTED + timedelta(days=14), available=False),
     ]
     sweep = await _sweep(
         [{"id": 1, "tvdbId": 7, "title": "Solsidan"}],
         {"Solsidan": [_hit("Solsidan", "s1")]},
         episodes={"solsidan": svt},
-        sonarr_episodes={1: _sonarr_weekly(6)},
+        sonarr_episodes={1: _sonarr_weekly(6, start=JUST_STARTED)},
     )
 
     (written,) = sweep.confident
     assert (written.evidence.matched, written.evidence.comparable) == (2, 2)
+    # Short on Sonarr's side too, which is what makes the weak path
+    # legitimately available here.
+    assert written.evidence.aired == 2
 
 
 async def test_the_short_run_fallback_refuses_when_one_of_two_disagrees():
-    svt = [_svt_ep(1, FIRST), _svt_ep(2, FIRST + timedelta(days=99))]
+    svt = [
+        _svt_ep(1, JUST_STARTED),
+        _svt_ep(2, JUST_STARTED - timedelta(days=99)),
+    ]
     sweep = await _sweep(
         [{"id": 1, "tvdbId": 7, "title": "Solsidan"}],
         {"Solsidan": [_hit("Solsidan", "s1")]},
         episodes={"solsidan": svt},
-        sonarr_episodes={1: _sonarr_weekly(6)},
+        sonarr_episodes={1: _sonarr_weekly(6, start=JUST_STARTED)},
     )
 
     assert sweep.confident == ()
@@ -521,8 +607,8 @@ async def test_a_single_agreeing_episode_is_never_written():
     sweep = await _sweep(
         [{"id": 1, "tvdbId": 7, "title": "Solsidan"}],
         {"Solsidan": [_hit("Solsidan", "s1")]},
-        episodes={"solsidan": [_svt_ep(1, FIRST)]},
-        sonarr_episodes={1: _sonarr_weekly(6)},
+        episodes={"solsidan": [_svt_ep(1, JUST_STARTED)]},
+        sonarr_episodes={1: _sonarr_weekly(6, start=JUST_STARTED)},
     )
 
     assert sweep.confident == ()
@@ -536,8 +622,8 @@ async def test_a_series_with_nothing_aired_is_surfaced_never_written():
         [{"id": 1, "tvdbId": 7, "title": "Solsidan"}],
         {"Solsidan": [_hit("Solsidan", "s1")]},
         episodes={"solsidan": [
-            _svt_ep(1, FIRST, available=False),
-            _svt_ep(2, FIRST + timedelta(days=7), available=False),
+            _svt_ep(1, JUST_STARTED, available=False),
+            _svt_ep(2, JUST_STARTED + timedelta(days=7), available=False),
         ]},
         sonarr_episodes={1: [_sonarr_ep(1, None), _sonarr_ep(2, None)]},
     )
@@ -678,6 +764,52 @@ async def test_repeated_alternate_titles_cost_one_search():
     # "Solsidan (2019)" dedupes against "Solsidan" on the Sonarr-side form,
     # which is what that asymmetry is still for.
     assert svt.queries == ["Solsidan", "Sunny Side"]
+
+
+async def test_scene_release_names_do_not_burn_a_query():
+    # Sonarr's alternateTitles are largely scene names. SVT's search is a
+    # title search and will never match a dotted form, so each one spent is
+    # a request to an unofficial API with no possible outcome *and* a turn
+    # the useful alternate below it does not get -- the per-series query
+    # budget is only three.
+    sonarr = FakeSonarr([{
+        "id": 1, "tvdbId": 7, "title": "Solsidan",
+        "alternateTitles": [
+            {"title": "Solsidan.S15"},
+            {"title": "Gift.vid.forsta.ogonkastet"},
+            {"title": "Sunny Side"},
+        ],
+    }])
+    svt = FakeSvt({})
+
+    await sweep_for_mappings(sonarr, svt, existing_mappings=(), tolerance_days=1)
+
+    assert svt.queries == ["Solsidan", "Sunny Side"]
+
+
+async def test_a_real_title_containing_a_dot_is_not_mistaken_for_a_scene_name():
+    # The filter is narrow on purpose: whitespace anywhere, or a single
+    # token, means it is a title rather than a release name.
+    sonarr = FakeSonarr([{
+        "id": 1, "tvdbId": 7, "title": "Solsidan",
+        "alternateTitles": [{"title": "Dr. Sannolik"}, {"title": "Solsidan2"}],
+    }])
+    svt = FakeSvt({})
+
+    await sweep_for_mappings(sonarr, svt, existing_mappings=(), tolerance_days=1)
+
+    assert svt.queries == ["Solsidan", "Dr. Sannolik", "Solsidan2"]
+
+
+async def test_sonarrs_own_title_is_never_filtered_as_a_scene_name():
+    # However odd it looks, Sonarr's title is the best thing we have to
+    # ask SVT for, and dropping it would leave the series unsearchable.
+    sonarr = FakeSonarr([{"id": 1, "tvdbId": 7, "title": "Solsidan.S15"}])
+    svt = FakeSvt({})
+
+    await sweep_for_mappings(sonarr, svt, existing_mappings=(), tolerance_days=1)
+
+    assert svt.queries == ["Solsidan.S15"]
 
 
 async def test_the_number_of_searches_per_series_is_capped():
@@ -1031,6 +1163,108 @@ async def test_a_run_inside_its_budget_is_not_reported_as_exhausted():
     assert sweep.requests_used == 2
 
 
+async def test_the_budget_finishes_series_rather_than_starving_all_of_them():
+    """The failure this test exists for wrote nothing on a real library.
+
+    Every series' coroutine is started at once by `asyncio.gather`. When
+    the only bound was a semaphore around each individual *request*, and
+    `asyncio.Semaphore` is FIFO, each series advanced exactly one request
+    per round: the budget was spent breadth-first, every series ended up
+    half-done, and a 200-series run spent all 600 requests and wrote
+    **zero** rows. Because nothing was written, nothing was skipped next
+    run, so "run Find mappings again to continue" was an instruction to
+    repeat an identical 600-request sweep against an unofficial API
+    forever.
+
+    Ten series needing two requests each (one search, one episode list)
+    against a budget of ten. Depth-first, five finish. Breadth-first, the
+    ten searches consume the budget and none do.
+    """
+    for concurrency in (1, 3):
+        sonarr = FakeSonarr(
+            [{"id": i, "tvdbId": 1000 + i, "title": f"Show {i}"}
+             for i in range(10)],
+            episodes={i: _sonarr_weekly(8) for i in range(10)},
+        )
+        svt = FakeSvt(
+            {f"Show {i}": [_hit(f"Show {i}", f"s{i}")] for i in range(10)},
+            episodes={f"show-{i}": _weekly(8) for i in range(10)},
+            # Load-bearing. Without it the fake never awaits anything real,
+            # so every coroutine runs start to finish before the next is
+            # scheduled and the sweep is accidentally sequential -- which
+            # is to say, this test would pass against the very defect it
+            # exists to catch.
+            delay=0.001,
+        )
+
+        sweep = await sweep_for_mappings(
+            sonarr, svt, existing_mappings=(), tolerance_days=1,
+            concurrency=concurrency, request_budget=10,
+        )
+
+        written = [m.tvdb_id for m in sweep.confident]
+        # A contiguous prefix of Sonarr's own order -- series that were
+        # finished, not a scattering of half-checked ones.
+        assert written == list(range(1000, 1000 + len(written))), concurrency
+        # Five would be perfect; at most `concurrency - 1` series can be
+        # cut off part-way through, because that many are legitimately in
+        # flight when the budget runs out. That waste is bounded by the
+        # concurrency, which is the whole difference from the defect: with
+        # no series bound, *every* series is in flight and none finishes.
+        assert len(written) >= 10 // 2 - (concurrency - 1), concurrency
+        assert sweep.requests_used == 10
+        assert sweep.budget_exhausted is True
+        # And the next run has that many fewer series to do, which is the
+        # entire basis of the "run it again to continue" instruction.
+        unfinished = {p.tvdb_id for p in sweep.out_of_budget}
+        assert unfinished == set(range(1000, 1010)) - set(written), concurrency
+
+
+async def test_a_run_that_fits_its_budget_writes_every_series():
+    # The boundary either side of the test above: two more requests and
+    # every one of the ten finishes.
+    sonarr = FakeSonarr(
+        [{"id": i, "tvdbId": 1000 + i, "title": f"Show {i}"} for i in range(10)],
+        episodes={i: _sonarr_weekly(8) for i in range(10)},
+    )
+    svt = FakeSvt(
+        {f"Show {i}": [_hit(f"Show {i}", f"s{i}")] for i in range(10)},
+        episodes={f"show-{i}": _weekly(8) for i in range(10)},
+        delay=0.001,
+    )
+
+    sweep = await sweep_for_mappings(
+        sonarr, svt, existing_mappings=(), tolerance_days=1,
+        concurrency=3, request_budget=20,
+    )
+
+    assert len(sweep.confident) == 10
+    assert sweep.budget_exhausted is False
+
+
+async def test_a_series_cut_off_between_searches_still_offers_what_was_found():
+    # The run paid SVT for a search that found the right programme, then
+    # ran out before the alternate-title search. Rendering that series
+    # with no accept button throws away an answer already bought.
+    sonarr = FakeSonarr(
+        [{"id": 1, "tvdbId": 7, "title": "Solsidan",
+          "alternateTitles": [{"title": "Sunny Side"}]}],
+        episodes={1: _sonarr_weekly(8)},
+    )
+    svt = FakeSvt({"Solsidan": [_hit("Solsidan", "s1")]},
+                  episodes={"solsidan": _weekly(8)})
+
+    sweep = await sweep_for_mappings(
+        sonarr, svt, existing_mappings=(), tolerance_days=1,
+        concurrency=1, request_budget=1,   # one search, then nothing
+    )
+
+    assert sweep.confident == ()
+    (p,) = sweep.out_of_budget
+    assert [c.svt_id for c in p.candidates] == ["s1"]
+    assert "not checked" in p.candidates[0].note()
+
+
 async def test_a_series_the_budget_cut_off_mid_check_is_never_written():
     # The budget ran out between two candidates. The first agreed; the
     # second is unknown, and an unknown rival is not a refuted one.
@@ -1056,22 +1290,36 @@ async def test_a_series_the_budget_cut_off_mid_check_is_never_written():
 async def test_concurrency_is_bounded():
     # Every SVT request counts, not just the searches: a library of 300
     # shows must not become 300 simultaneous requests to an unofficial API.
+    #
+    # The bound is now a semaphore around a whole *series* (see the
+    # comment at its definition -- bounding requests alone starved every
+    # series of budget). That still bounds requests only because a series
+    # issues its own sequentially, so this test gives each series two
+    # alternate titles and three candidates: anything that parallelised
+    # inside a series would show up here as peak_in_flight above the
+    # limit, which is the assumption the single semaphore rests on.
     sonarr = FakeSonarr(
-        [{"id": i, "tvdbId": 1000 + i, "title": f"Show {i}"} for i in range(20)],
+        [{"id": i, "tvdbId": 1000 + i, "title": f"Show {i}",
+          "alternateTitles": [{"title": f"Alt A {i}"}, {"title": f"Alt B {i}"}]}
+         for i in range(20)],
         episodes={i: _sonarr_weekly(8) for i in range(20)},
     )
     svt = FakeSvt(
-        {f"Show {i}": [_hit(f"Show {i}", f"s{i}")] for i in range(20)},
+        {f"Show {i}": [_hit(f"Show {i} a", f"a{i}"), _hit(f"Show {i} b", f"b{i}"),
+                       _hit(f"Show {i} c", f"c{i}")]
+         for i in range(20)},
         delay=0.005,
-        episodes={f"show-{i}": _weekly(8) for i in range(20)},
+        episodes={},
     )
 
     await sweep_for_mappings(
-        sonarr, svt, existing_mappings=(), tolerance_days=1, concurrency=3
+        sonarr, svt, existing_mappings=(), tolerance_days=1, concurrency=3,
+        request_budget=10_000,
     )
 
     assert svt.peak_in_flight <= 3
-    assert len(svt.queries) == 20 and len(svt.slugs) == 20
+    # Three searches and three episode lists per series, all bounded.
+    assert len(svt.queries) == 60 and len(svt.slugs) == 60
 
 
 async def test_the_sweep_never_resolves_a_stream():

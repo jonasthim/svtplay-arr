@@ -578,10 +578,14 @@ and could append a duplicate on top of a file it could not read), runs
 service booted with, so the sweep corroborates at the window the resolver will
 later match at), and writes the corroborated rows in **one** atomic
 `add_mappings` call. The sweep itself writes nothing, so a Sonarr or SVT outage
-part-way through leaves no partial file. Bounded at 4 concurrent SVT requests,
+part-way through leaves no partial file. Bounded at 4 concurrent **series**,
 200 series per run and 600 SVT requests per run; whichever limit bites is
 reported on the page, not silently applied — a partial sweep reported as a
-complete one is the failure mode that matters here. Rows land marked
+complete one is the failure mode that matters here. The concurrency bound is on
+series rather than on requests because `asyncio.gather` starts every series at
+once: a request-level semaphore is FIFO, so each series advanced one request per
+round, the budget was spent breadth-first and a real-sized run finished nothing.
+Holding it per series makes the run depth-first. Rows land marked
 `source: auto`; a suggestion accepted by hand goes through
 `POST /config/mappings` like any other and stays `manual`.
 

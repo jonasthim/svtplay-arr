@@ -390,8 +390,11 @@ now is whether the episodes line up.
 Each unmapped series is searched for under its own Sonarr title **and** the
 `alternateTitles` Sonarr carries — TVDB usually keeps the original-language
 title there, which for a Swedish show is very often exactly SVT's name.
-Queries are deduplicated (`Solsidan` and `Solsidan (2019)` are one search) and
-capped per series. Every programme returned is a candidate; the few most
+Queries are deduplicated (`Solsidan` and `Solsidan (2019)` are one search),
+capped per series, and scene release forms among the alternates
+(`Gift.vid.forsta.ogonkastet`) are dropped rather than searched for — SVT's
+search is a title search and will not match one, so spending a query on it
+also costs the useful alternate below it its turn. Every programme returned is a candidate; the few most
 promising are the ones actually checked, with a name identical to one of the
 series' titles ranked first — not because that makes it right, but because if
 two programmes share a name it is those two whose episodes most need
@@ -430,9 +433,16 @@ A row is written without you confirming it only when **all** of these hold:
 
 **Short runs.** A series SVT has only just started publishing cannot reach
 three, and refusing it forever would be the old rule's failure in a new shape.
-So when fewer than 3 episodes are available to compare at all, *all* of them
-must correspond and there must be at least **2**. Never one: a single shared
-air date at episode 1 is a coincidence any weekly show produces.
+So when the run is short **on both sides** — fewer than 3 episodes available on
+SVT to compare, *and* fewer than 3 aired in Sonarr — *all* of them must
+correspond and there must be at least **2**. Never one: a single shared air
+date at episode 1 is a coincidence any weekly show produces.
+
+Both sides, because SVT's side alone was not a safe test. A returning
+15-season series whose candidate happens to list only two episodes has a
+denominator of two, which would drop it into the weak branch and write it on
+exactly the coincidence the floor of three exists to refuse — while the
+*correct* eight-episode programme for that same series had to clear three.
 
 **No evidence is not confidence.** A series Sonarr knows about that has not
 aired, or that SVT has not published, gives nothing to compare — so it is
@@ -440,6 +450,16 @@ surfaced for a decision and never written. The same goes for a candidate whose
 episode list could not be read: an unchecked candidate is not a refuted one,
 so an SVT outage part-way through a series' candidates refuses that series
 outright rather than writing on whichever candidate happened to answer.
+
+**Where the guarantee stops.** Rule 3 says "every other candidate *that was
+checked*", and only the first 3 ranked candidates are checked. A rival ranked
+4th or below is unexamined and does not block a write. It is tempting to argue
+this is safe because same-named candidates rank first — but the premise of this
+whole design is that the right programme's name often differs from Sonarr's, so
+a dangerous rival need not share a name either. What actually bounds it is that
+such a rival would have to clear the evidence threshold against the same series
+*and* have been returned by SVT below one that already clears it. If you are
+mapping a show you know SVT lists several times, check it by hand.
 
 #### What you see for everything else
 
@@ -459,12 +479,20 @@ Practical notes:
   with no `source` field, which is every row in a file written before this
   feature, are hand-confirmed and carry no badge.
 - A suggestion you accept by hand is an ordinary mapping and stays `manual`.
-- Bounded at 4 concurrent SVT requests, **200 series per run**, at most 3
+- Bounded at 4 concurrent **series**, **200 series per run**, at most 3
   searches and 3 episode-list reads per series, and **600 SVT requests per run
-  in total**. Whichever limit bites is reported on the page rather than
-  silently truncating your library — a partial sweep that reads as a complete
-  one is the failure that matters here. Run it again to continue, since this
-  run's rows are now mapped and skipped.
+  in total**. The concurrency bound is on series rather than on individual
+  requests deliberately: it makes the run depth-first, so a budget that runs
+  out leaves the tail of your library unexamined rather than leaving every
+  series half-checked and writing nothing at all. Whichever limit bites is
+  reported on the page rather than silently truncating your library — a
+  partial sweep that reads as a complete one is the failure that matters here.
+  Run it again to continue, since this run's rows are now mapped and skipped.
+- Widening `air_date_tolerance_days` widens what the sweep will corroborate on,
+  not just what the resolver will match. That is deliberate — they are the same
+  rule — but it means a generous tolerance makes automatic mapping more willing
+  as well as episode matching more willing. The default of 1 is the value both
+  were designed around.
 - If `mappings.yaml` will not parse, nothing is searched and nothing is
   written. Fix the file first.
 

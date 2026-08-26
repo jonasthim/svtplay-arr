@@ -66,10 +66,20 @@ is not a schedule artefact.
 
 **The short-run fallback.** A series SVT has only just started publishing
 cannot reach three, and refusing it forever is the old gate's failure mode
-wearing a new hat. So when fewer than 3 episodes are *available to compare
-at all*, every one of them must corroborate and there must be at least
+wearing a new hat. So when the run is short **on both sides** -- fewer than
+3 episodes available to compare, *and* fewer than 3 aired in Sonarr -- every
+one of them must corroborate and there must be at least
 `SHORT_RUN_MIN_EPISODES` (2). Never one: a single shared air date at ordinal
 1 is exactly the coincidence a weekly show produces.
+
+Both sides, and that is not belt-and-braces. Keyed on SVT's side alone, a
+15-season Sonarr series whose candidate happened to list two episodes had a
+denominator of 2, dropped into the weak branch and was written on the exact
+coincidence the floor of 3 exists to refuse -- while the *correct*
+eight-episode programme for the same series had to clear 3. And because a
+wrong candidate with a genuinely short run has a small denominator by
+construction, the weak path was preferentially available to the wrong
+answer.
 
 **No evidence is not confidence.** A series Sonarr knows about that has not
 aired, or that SVT has not published, yields nothing to compare -- so it is
@@ -110,6 +120,7 @@ import asyncio
 import logging
 import re
 from dataclasses import dataclass, replace
+from datetime import date
 
 from svtplay_arr.config import Settings
 from svtplay_arr.matching import episode_matches
@@ -162,6 +173,19 @@ _DEFAULT_TOLERANCE_DAYS = Settings.air_date_tolerance_days
 # `(2019)`; SVT's names do not. Anchored at the end, so a year that is part
 # of the title itself is untouched.
 _TRAILING_YEAR = re.compile(r"\s*\(\d{4}\)\s*$")
+
+# A scene release name: no whitespace at all, and two or more dot-separated
+# tokens -- `Gift.vid.forsta.ogonkastet`, `Solsidan.S15`. Sonarr's
+# `alternateTitles` are full of them, and they are worth filtering because
+# SVT's search is a title search: it will not match a dotted form, so the
+# query is a request to an unofficial API with no possible outcome. Each
+# one spent is also a query the *useful* alternate below it does not get,
+# since the per-series query budget is small.
+#
+# Deliberately narrow. A real title containing a dot but also a space
+# ("Dr. Sannolik") has whitespace and is kept; a single-word title has one
+# token and is kept. Only the unambiguous dotted form is dropped.
+_SCENE_NAME = re.compile(r"^\S+\.\S+$")
 
 
 def normalise_title(name: str) -> str:
@@ -230,10 +254,20 @@ class Evidence:
     evidence.
 
     `comparable` counts the SVT episodes that could have matched at all:
-    published, available, and at an ordinal Sonarr has an aired episode
-    for. It is the denominator the short-run fallback keys off, and it is
-    SVT-side on purpose -- what bounds the evidence is what SVT has
-    actually published, not how many seasons TVDB knows about.
+    published, available, and at an ordinal Sonarr has a dated episode
+    for. It is SVT-side on purpose -- what bounds the evidence is what SVT
+    has actually published, not how many seasons TVDB knows about.
+
+    `aired` counts Sonarr's own episodes that have aired by now, and it
+    exists solely to gate the short-run fallback. `comparable` alone was
+    not enough, and the hole was not theoretical: a 15-season series whose
+    SVT candidate happens to list only two available episodes has
+    `comparable == 2`, which bypassed the floor of 3 entirely and wrote on
+    two agreeing episodes -- the *exact* coincidence that floor exists to
+    refuse. Worse, a wrong candidate with a genuinely short run has a
+    small denominator by construction, so the weak path was preferentially
+    available to the wrong answer while the correct 8-episode programme
+    had to clear 3.
 
     `error` is set when the evidence could not be gathered (SVT's episode
     list was unreachable). That is doubt, not zero, and it is why
@@ -243,6 +277,7 @@ class Evidence:
 
     matched: int = 0
     comparable: int = 0
+    aired: int = 0
     error: str | None = None
 
     @property
@@ -259,11 +294,21 @@ class Evidence:
             # not a result it lets fall out of arithmetic that a later
             # change to SHORT_RUN_MIN_EPISODES could quietly invert.
             return False
-        if self.comparable >= ACCEPT_MIN_EPISODES:
+        # The strict floor applies whenever *either* side is long enough
+        # to supply real evidence. Keying it on SVT's side alone let a
+        # long-running Sonarr series slip into the weak branch whenever the
+        # candidate happened to list only a couple of episodes.
+        if (
+            self.comparable >= ACCEPT_MIN_EPISODES
+            or self.aired >= ACCEPT_MIN_EPISODES
+        ):
             return self.matched >= ACCEPT_MIN_EPISODES
-        # The short run: everything that could be compared must agree, and
-        # one agreement is never enough -- a single shared air date at
-        # ordinal 1 is a coincidence a weekly show produces.
+        # The short run, and only a genuinely short run: a series that has
+        # aired fewer than ACCEPT_MIN_EPISODES episodes *and* whose
+        # candidate lists fewer than that. Everything that could be
+        # compared must agree, and one agreement is never enough -- a
+        # single shared air date at ordinal 1 is a coincidence a weekly
+        # show produces.
         return (
             self.matched == self.comparable
             and self.matched >= SHORT_RUN_MIN_EPISODES
@@ -287,6 +332,14 @@ class Evidence:
         note = f"{self.matched} of {self.comparable} episode{plural} matched"
         if self.corroborates:
             return note
+        if self.aired >= ACCEPT_MIN_EPISODES:
+            # Naming Sonarr's side matters here: "1 of 2 matched, at least
+            # 3 are needed" reads as a contradiction until you know the
+            # threshold comes from the series having aired 120 episodes.
+            return (
+                f"{note}; this series has aired {self.aired} episodes, so at "
+                f"least {ACCEPT_MIN_EPISODES} must match"
+            )
         if self.comparable >= ACCEPT_MIN_EPISODES:
             return f"{note}; at least {ACCEPT_MIN_EPISODES} are needed"
         return (
@@ -333,6 +386,7 @@ def corroborate(
     svt_episodes: list[SvtEpisode],
     *,
     tolerance_days: int,
+    today: date | None = None,
 ) -> Evidence:
     """Count how far this SVT programme's episodes agree with this series'.
 
@@ -345,14 +399,27 @@ def corroborate(
     satisfies both signals (same ordinal, same air date) and would count as
     evidence for a programme it says nothing about; `Resolver._recent_for`
     excludes it for the same reason one level down.
+
+    `today` is injectable for tests and defaults to the real date, as
+    `Resolver.recent` does. It is used for one thing only -- counting how
+    many of Sonarr's episodes have actually aired, which gates the
+    short-run fallback -- and never for matching, so what an episode
+    *matches* stays independent of when the sweep happens to run.
     """
-    aired = [
+    today = today or date.today()
+    dated = [
         se
         for se in sonarr_episodes or ()
         if isinstance(se, SonarrEpisode)
         and se.season > 0
         and se.air_date is not None
     ]
+    # Deliberately "has aired", not "has a date". A brand-new series whose
+    # whole season is already scheduled has eight dated episodes and two
+    # aired ones, and it is the second number that says whether there is
+    # enough history for the strict floor to be fair -- which is exactly
+    # the case the short-run fallback exists for.
+    aired = sum(1 for se in dated if se.air_date <= today)
     listed = [
         e
         for e in svt_episodes or ()
@@ -366,7 +433,7 @@ def corroborate(
     # all. Bounded by what SVT has published, which is what makes the
     # short-run fallback reachable for a returning series whose back
     # catalogue Sonarr knows about but SVT no longer lists.
-    numbers = {se.episode for se in aired}
+    numbers = {se.episode for se in dated}
     comparable = sum(1 for e in listed if e.ordinal in numbers)
 
     # The numerator: strictly one-to-one agreements. A Sonarr episode with
@@ -375,7 +442,7 @@ def corroborate(
     # side, and counting it twice is how a coincidence would be inflated
     # into a threshold.
     partners: dict[str, int] = {}
-    for se in aired:
+    for se in dated:
         found = [
             e
             for e in listed
@@ -388,7 +455,9 @@ def corroborate(
         partners[found[0].svt_id] = partners.get(found[0].svt_id, 0) + 1
     matched = sum(1 for count in partners.values() if count == 1)
 
-    return Evidence(matched=matched, comparable=comparable)
+    return Evidence(
+        matched=matched, comparable=comparable, aired=aired
+    )
 
 
 def corroborated_match(candidates: list[Candidate]) -> Candidate | None:
@@ -571,6 +640,19 @@ def _ranked_candidates(
     *because* the gate did not decide, and narrowing by name here would
     leave them an empty list and no way forward -- and would reintroduce
     the exact-title rule as a hidden precondition.
+
+    **The residual risk, stated accurately.** Only the first
+    `corroborate_per_series` candidates are checked; the rest are shown as
+    unchecked and do not veto. So a rival that would also have
+    corroborated, but ranked below the cut, cannot block a write. It is
+    tempting to say this is bounded because same-named candidates rank
+    first -- but the whole premise of this design is that the right
+    programme's name often differs from Sonarr's, so a dangerous rival
+    need not share a name either. The honest statement is: **any candidate
+    ranked below the cut is unexamined**, name or no name. What actually
+    bounds the exposure is that such a rival must independently clear the
+    evidence threshold against this same series, and SVT would have to
+    have returned it below a candidate that already clears it.
     """
     seen: dict[str, Candidate] = {}
     ranks: dict[str, int] = {}
@@ -605,14 +687,23 @@ def _queries_for(title: str, alternates: list, limit: int) -> tuple[str, ...]:
 
     Deduplicated on the Sonarr-side normal form, so `Solsidan` and
     `Solsidan (2019)` cost one search rather than two, and the many
-    alternates that repeat a title verbatim cost nothing. Capped, because
-    a show can carry a dozen alternates and each one is a request.
+    alternates that repeat a title verbatim cost nothing. Scene release
+    forms (`Gift.vid.forsta.ogonkastet`) are dropped rather than searched
+    for -- SVT's search is a title search and will not match one, so
+    spending a query on it costs the useful alternate below it its turn.
+    Capped, because a show can carry a dozen alternates and each one is a
+    request.
+
+    Sonarr's own title is never filtered, only its alternates: if that is
+    somehow a dotted form, it is still the best thing we have to ask for.
     """
     out: list[str] = []
     seen: set[str] = set()
-    for raw in [title, *(alternates or ())]:
+    for index, raw in enumerate([title, *(alternates or ())]):
         text = str(raw or "").strip()
         if not text:
+            continue
+        if index and _SCENE_NAME.match(text):
             continue
         key = normalise_sonarr_title(text)
         if not key or key in seen:
@@ -808,33 +899,66 @@ async def sweep_for_mappings(
         )
 
     budget = _Budget(request_budget)
+    # Bounds concurrent **series**, not concurrent requests, and that
+    # distinction is the whole difference between a sweep that finishes
+    # some series and one that finishes none.
+    #
+    # This was a semaphore around each individual request. Every series'
+    # coroutine was started at once by `asyncio.gather`, so with the gate
+    # bounding only requests -- and `asyncio.Semaphore` being FIFO -- each
+    # series advanced exactly one request per round and the budget was
+    # spent breadth-first across the entire library. Nobody finished. A
+    # 200-series run spent all 600 requests and wrote *nothing*, then told
+    # the operator to run it again, which produced the identical result
+    # forever.
+    #
+    # Holding it around the whole series makes the run depth-first: the
+    # first `concurrency` series run to completion, then the next. Requests
+    # within one series are issued sequentially, so this still bounds
+    # in-flight SVT requests to `concurrency` -- pinned by
+    # `test_concurrency_is_bounded`, which is what fails if that ever stops
+    # being true.
     gate = asyncio.Semaphore(max(concurrency, 1))
 
     async def evaluate(target: _Target) -> _Evaluated:
         """One series, end to end: search, rank, corroborate.
 
         Search and corroboration are one coroutine per series rather than
-        two batched phases, so the run's budget is spent series by series
-        rather than exhausted on searches before a single candidate is
-        checked. With `concurrency` series in flight the exact cut-off
-        point is not strictly Sonarr's order, but what is left unfinished
-        is the tail of the library either way -- which is what makes "run
-        it again to continue" true rather than a hope.
+        two batched phases, and the caller holds a *series* semaphore
+        around this whole function. Together those make the run
+        depth-first: a series either finishes or is cleanly not started,
+        so a budget that runs out leaves the tail of the library
+        unexamined rather than leaving every series half-done.
+
+        That is what makes "run it again to continue" true rather than a
+        hope, and it is not a detail. Bounding only the individual
+        requests -- which is what this did -- spread the budget evenly
+        across every series at once and finished none of them, so a run
+        on a real-sized library wrote nothing at all and the next run
+        repeated it exactly.
         """
         hits: list = []
         failures: list[str] = []
         for query in target.queries:
             if not budget.take():
-                return _Evaluated(target, ran_out_of_budget=True)
-            async with gate:
-                try:
-                    hits.extend(await svt.search_series(query) or [])
-                except Exception as exc:
-                    log.warning(
-                        "SVT search for %r failed during the mapping sweep: %s",
-                        query, exc,
-                    )
-                    failures.append(str(exc))
+                # I2: hand back what the searches already found. A run cut
+                # off between a series' first and second query has paid SVT
+                # for a real answer, and dropping it renders that series
+                # with no accept button at all -- the operator cannot take
+                # the mapping the run already bought.
+                return _Evaluated(
+                    target,
+                    candidates=_ranked_candidates(hits, target.wanted),
+                    ran_out_of_budget=True,
+                )
+            try:
+                hits.extend(await svt.search_series(query) or [])
+            except Exception as exc:
+                log.warning(
+                    "SVT search for %r failed during the mapping sweep: %s",
+                    query, exc,
+                )
+                failures.append(str(exc))
 
         candidates = _ranked_candidates(hits, target.wanted)
         if failures and not candidates:
@@ -868,22 +992,21 @@ async def sweep_for_mappings(
                     target, candidates=candidates,
                     checked=tuple(checked), ran_out_of_budget=True,
                 )
-            async with gate:
-                try:
-                    svt_episodes = await svt.list_episodes(candidate.slug)
-                except Exception as exc:
-                    # Not zero: unknown. The gate treats it as doubt about
-                    # the whole series, which is what stops an SVT outage
-                    # part-way through a candidate list writing a row on
-                    # whichever candidate happened to answer.
-                    log.warning(
-                        "SVT episode list for %r failed during the mapping "
-                        "sweep: %s", candidate.slug, exc,
-                    )
-                    checked.append(replace(
-                        candidate, evidence=Evidence(error=str(exc))
-                    ))
-                    continue
+            try:
+                svt_episodes = await svt.list_episodes(candidate.slug)
+            except Exception as exc:
+                # Not zero: unknown. The gate treats it as doubt about the
+                # whole series, which is what stops an SVT outage part-way
+                # through a candidate list writing a row on whichever
+                # candidate happened to answer.
+                log.warning(
+                    "SVT episode list for %r failed during the mapping "
+                    "sweep: %s", candidate.slug, exc,
+                )
+                checked.append(replace(
+                    candidate, evidence=Evidence(error=str(exc))
+                ))
+                continue
             checked.append(replace(candidate, evidence=corroborate(
                 sonarr_episodes, svt_episodes, tolerance_days=tolerance_days
             )))
@@ -894,8 +1017,12 @@ async def sweep_for_mappings(
             checked=tuple(checked),
         )
 
+    async def evaluate_one(target: _Target) -> _Evaluated:
+        async with gate:
+            return await evaluate(target)
+
     results = await asyncio.gather(
-        *(evaluate(t) for t in searchable), return_exceptions=True
+        *(evaluate_one(t) for t in searchable), return_exceptions=True
     )
 
     confident: list[ConfidentMatch] = []
