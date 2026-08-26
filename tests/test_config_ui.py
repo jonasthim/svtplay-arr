@@ -3795,7 +3795,7 @@ def test_a_sweep_with_nothing_to_do_does_not_rewrite_the_file(tmp_path: Path):
     assert (maps.stat().st_mtime, maps.read_text(encoding="utf-8")) == before
 
 
-def test_hitting_the_search_cap_is_said_out_loud(tmp_path: Path):
+def test_hitting_the_search_cap_is_said_out_loud(tmp_path: Path, monkeypatch):
     import svtplay_arr.api.config_ui as config_ui
 
     svt = SweepSvt({})
@@ -3803,11 +3803,9 @@ def test_hitting_the_search_cap_is_said_out_loud(tmp_path: Path):
         {"id": i, "tvdbId": 1000 + i, "title": f"Show {i}"} for i in range(6)
     ])
     client, maps = _sweep_client(tmp_path, svt, sonarr)
-    config_ui._SWEEP_CAP, old = 2, config_ui._SWEEP_CAP
-    try:
-        r = _discover(client, maps)
-    finally:
-        config_ui._SWEEP_CAP = old
+    monkeypatch.setattr(config_ui, "_SWEEP_CAP", 2)
+
+    r = _discover(client, maps)
 
     assert len(svt.queries) == 2
     assert "4" in r.text and "not searched" in r.text.lower()

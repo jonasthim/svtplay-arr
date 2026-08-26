@@ -1043,6 +1043,12 @@ def build_config_router(
                 log.exception("mapping sweep write failed")
                 write_error = f"could not save the mappings found: {exc}"
 
+        # Re-read once, after the write. The accept buttons on the result
+        # page carry this as their concurrency token, so it has to be the
+        # file's mtime *now* -- seeded from before the sweep, every
+        # one-click accept would be refused as a concurrent modification
+        # caused by the sweep's own write.
+        mtime_after_write = _mappings_mtime()
         return _TEMPLATES.TemplateResponse(
             request,
             "mapping_discover.html",
@@ -1055,14 +1061,13 @@ def build_config_router(
                 # lie this page could tell.
                 "written": written,
                 "write_error": write_error,
-                # Re-read after the write, so the accept buttons below carry
-                # the file's current mtime rather than the one the sweep
-                # started from -- otherwise every one-click accept on this
-                # page would be refused as a concurrent modification by the
-                # sweep's own write.
                 "mappings_mtime": (
-                    "" if _mappings_mtime() is None else _mappings_mtime()
+                    "" if mtime_after_write is None else mtime_after_write
                 ),
+                # The same string in both places on purpose: base.html
+                # renders `error` as the page banner, and the template
+                # branches on `write_error` to decide whether the confident
+                # matches are shown as saved or as found-but-not-saved.
                 "error": write_error,
                 "notice": None,
                 **_status_strip_context(),

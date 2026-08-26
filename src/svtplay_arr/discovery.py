@@ -357,11 +357,18 @@ async def sweep_for_mappings(
                 series_title=target.title,
                 outcome="needs_decision",
                 reason=(
-                    "SVT offered "
-                    f"{len(candidates)} programme"
-                    f"{'s' if len(candidates) != 1 else ''}, but not exactly "
-                    "one whose name matches this title. Pick one, or leave "
-                    "it unmapped."
+                    # Two different situations, and "SVT offered 1
+                    # programme, but not exactly one matches" reads as a
+                    # contradiction rather than as the near miss it is.
+                    (
+                        "SVT offered one programme, but its name is not "
+                        "identical to this title."
+                        if len(candidates) == 1
+                        else f"SVT offered {len(candidates)} programmes, and "
+                        "no single one of them has a name identical to this "
+                        "title."
+                    )
+                    + " Pick one, or leave it unmapped."
                 ),
                 candidates=candidates,
             ))
