@@ -48,12 +48,26 @@ class Release:
     published: datetime
 
 
+# How a mapping row came to exist. Written into the file only when it is
+# not the default, so a hand-confirmed row and an operator's existing file
+# stay byte-for-byte what they always were, and the one thing worth
+# recording -- that nobody confirmed this row -- is the thing that shows up.
+SOURCE_MANUAL = "manual"   # a human picked it on the config page (or by hand)
+SOURCE_AUTO = "auto"       # written by the Find mappings sweep's confidence gate
+
+
 @dataclass(frozen=True)
 class Mapping:
     tvdb_id: int
     svt_series_id: str
     svt_slug: str
     series_title: str         # exactly as Sonarr spells it
+    # Provenance, so a guessed mapping and a hand-confirmed one are never
+    # indistinguishable later and the sweep's output can be audited or
+    # reverted as a group. Defaulted, because every row written before this
+    # field existed -- and every row a human writes by hand -- legitimately
+    # has no `source` key at all.
+    source: str = SOURCE_MANUAL
 
 
 class JobStatus(str, Enum):

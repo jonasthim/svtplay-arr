@@ -14,10 +14,32 @@ from pathlib import Path
 
 import yaml
 
-from svtplay_arr.models import Mapping
+from svtplay_arr.models import SOURCE_AUTO, SOURCE_MANUAL, Mapping
 from svtplay_arr.yamlio import atomic_write_yaml, read_with_mtime
 
 log = logging.getLogger(__name__)
+
+
+def _coerce_source(value: object) -> str:
+    """Read a row's provenance without ever making it a load failure.
+
+    Provenance is a *label*, not an identifier: nothing downstream resolves,
+    matches or downloads differently because of it. So an absent key (every
+    row written before this field existed, and every row a human writes by
+    hand), a non-string, or a value from some future version must all load
+    -- the mapping table must never go empty over a field this cosmetic.
+    Absent or unusable reads as `manual`; any other string is kept verbatim
+    rather than snapped to a known value, so a newer version's label
+    survives a round-trip through an older one intact.
+
+    The reverse direction is safe by construction: `MappingTable.load` only
+    ever reads the keys it knows, so a file carrying `source` -- or any
+    other field a later version adds -- loads unchanged on a version that
+    has never heard of it.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return SOURCE_MANUAL
+    return value.strip()
 
 
 class MappingTable:
@@ -101,6 +123,7 @@ class MappingTable:
                 svt_series_id=svt_series_id,
                 svt_slug=svt_slug,
                 series_title=series_title,
+                source=_coerce_source(entry.get("source")),
             )
         return cls(out)
 
@@ -233,6 +256,91 @@ def _write_rows(path: Path, rows: list[dict], expected_mtime: float | None) -> N
     )
 
 
+def add_mappings(
+    path: Path,
+    new_rows: list[dict],
+    *,
+    expected_mtime: float | None,
+) -> None:
+    """Append several mapping rows in exactly one atomic write.
+
+    The plural form exists for the Find mappings sweep, which proposes a
+    whole batch at once. Looping `add_mapping` over that batch would be N
+    separate atomic writes: N windows for a concurrent modification to slip
+    in mid-sweep (each one refusing the *rest* of the batch and leaving the
+    library half-mapped), and N `.bak` churns for what is logically a
+    single change. One write also means the concurrency check is evaluated
+    once, against the state the operator's form actually saw.
+
+    All or nothing. Every row is validated -- blank identifying fields,
+    duplicates against the file, and duplicates *within* the batch -- before
+    anything is written, so a batch containing one bad row writes none of
+    it. That is the same policy `add_mapping` has always had, applied to a
+    batch: the file must never be left in a state `MappingTable.load` would
+    reject, because that empties the feed and Sonarr rejects the indexer.
+
+    An empty batch is a no-op, not an empty write. A sweep that finds
+    nothing confident must not rewrite the file: that would bump the mtime
+    (invalidating every open form) and churn a `.bak` for no change.
+
+    Each row is a dict with `tvdb_id`, `svt_series_id`, `svt_slug`,
+    `series_title`, and an optional `source` (see `models.SOURCE_AUTO`).
+    `source` is written only when it is not the default, so a hand-confirmed
+    row stays byte-identical to what this writer has always produced.
+    """
+    prepared: list[dict] = []
+    seen: dict[int, str] = {}
+
+    rows = _rows(path)
+    existing: dict[int, str] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        row_id = _coerce_tvdb_id(row.get("tvdb_id"))
+        if row_id is not None:
+            existing.setdefault(row_id, str(row.get("series_title")))
+
+    for new_row in new_rows:
+        tvdb_id = _coerce_tvdb_id(new_row.get("tvdb_id"))
+        if tvdb_id is None:
+            raise MappingError(f"tvdb_id {new_row.get('tvdb_id')!r} is not a number")
+
+        values = {}
+        for field in ("svt_series_id", "svt_slug", "series_title"):
+            value = new_row.get(field)
+            if not isinstance(value, str) or not value.strip():
+                raise MappingError(f"{field} must not be blank")
+            values[field] = value
+
+        if tvdb_id in existing:
+            raise MappingError(
+                f"tvdb_id {tvdb_id} is already mapped to "
+                f"{existing[tvdb_id]!r}; remove that row first"
+            )
+        # Within the batch too. Two rows for one tvdb_id would produce
+        # exactly the file `MappingTable.load` refuses outright, and there
+        # is no more principled way to pick between them here than there is
+        # in `remove_mapping`.
+        if tvdb_id in seen:
+            raise MappingError(
+                f"tvdb_id {tvdb_id} appears twice in one batch "
+                f"({seen[tvdb_id]!r} and {values['series_title']!r})"
+            )
+        seen[tvdb_id] = values["series_title"]
+
+        prepared_row = {"tvdb_id": tvdb_id, **values}
+        source = new_row.get("source")
+        # Only a non-default provenance is recorded. See models.SOURCE_AUTO.
+        if isinstance(source, str) and source.strip() not in ("", SOURCE_MANUAL):
+            prepared_row["source"] = source.strip()
+        prepared.append(prepared_row)
+
+    if not prepared:
+        return
+
+    _write_rows(path, rows + prepared, expected_mtime)
+
+
 def add_mapping(
     path: Path,
     *,
@@ -240,9 +348,15 @@ def add_mapping(
     svt_series_id: str,
     svt_slug: str,
     series_title: str,
+    source: str = SOURCE_MANUAL,
     expected_mtime: float | None,
 ) -> None:
     """Append one mapping row.
+
+    One row through `add_mappings`, so the duplicate rejection, blank
+    rejection and validation semantics cannot drift between the single and
+    plural forms -- two implementations of one idea slowly disagreeing is
+    this codebase's most persistent defect.
 
     Refuses a duplicate tvdb_id rather than writing a file `MappingTable.load`
     would reject -- the UI must never be the thing that breaks startup.
@@ -250,30 +364,19 @@ def add_mapping(
     permanent filename in the library, so a whitespace-only value is a
     landmine the loader's `is None` check would happily accept.
     """
-    for field, value in (
-        ("svt_series_id", svt_series_id),
-        ("svt_slug", svt_slug),
-        ("series_title", series_title),
-    ):
-        if not isinstance(value, str) or not value.strip():
-            raise MappingError(f"{field} must not be blank")
-
-    rows = _rows(path)
-    for row in rows:
-        if isinstance(row, dict) and _coerce_tvdb_id(row.get("tvdb_id")) == tvdb_id:
-            raise MappingError(
-                f"tvdb_id {tvdb_id} is already mapped to "
-                f"{row.get('series_title')!r}; remove that row first"
-            )
-    rows.append(
-        {
-            "tvdb_id": tvdb_id,
-            "svt_series_id": svt_series_id,
-            "svt_slug": svt_slug,
-            "series_title": series_title,
-        }
+    add_mappings(
+        path,
+        [
+            {
+                "tvdb_id": tvdb_id,
+                "svt_series_id": svt_series_id,
+                "svt_slug": svt_slug,
+                "series_title": series_title,
+                "source": source,
+            }
+        ],
+        expected_mtime=expected_mtime,
     )
-    _write_rows(path, rows, expected_mtime)
 
 
 def remove_mapping(

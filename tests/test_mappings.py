@@ -417,3 +417,90 @@ def test_a_load_failure_stays_degraded_while_the_file_is_unchanged(tmp_path: Pat
 
     _rewrite(p, YAML)
     assert table.status()["degraded"] is False
+
+
+# --- Provenance, and staying loadable across versions ---
+
+
+def test_a_row_without_a_source_key_loads_as_manual(tmp_path: Path):
+    # Every row written before provenance existed. Absent means a human
+    # put it there, which is the truth for every such file.
+    p = tmp_path / "mappings.yaml"
+    p.write_text(
+        "series:\n"
+        "- tvdb_id: 1\n  svt_series_id: s1\n  svt_slug: sl1\n"
+        "  series_title: One\n",
+        encoding="utf-8",
+    )
+    assert MappingTable.load(p).for_tvdb(1).source == "manual"
+
+
+def test_a_source_of_auto_is_read_back(tmp_path: Path):
+    p = tmp_path / "mappings.yaml"
+    p.write_text(
+        "series:\n"
+        "- tvdb_id: 1\n  svt_series_id: s1\n  svt_slug: sl1\n"
+        "  series_title: One\n  source: auto\n",
+        encoding="utf-8",
+    )
+    assert MappingTable.load(p).for_tvdb(1).source == "auto"
+
+
+def test_an_unusable_source_value_is_not_a_load_failure(tmp_path: Path):
+    # Provenance is a label; nothing resolves or downloads differently
+    # because of it. The mapping table must never go empty over it.
+    p = tmp_path / "mappings.yaml"
+    p.write_text(
+        "series:\n"
+        "- tvdb_id: 1\n  svt_series_id: s1\n  svt_slug: sl1\n"
+        "  series_title: One\n  source: [not, a, string]\n",
+        encoding="utf-8",
+    )
+    table = MappingTable.load(p)
+    assert table.for_tvdb(1).series_title == "One"
+    assert table.for_tvdb(1).source == "manual"
+
+
+def test_a_field_this_version_has_never_heard_of_does_not_break_a_row(
+    tmp_path: Path,
+):
+    # The forward-compatibility guarantee that lets `source` be added at
+    # all: the loader reads only the keys it knows, so a file written by a
+    # newer version still loads here rather than emptying the feed.
+    p = tmp_path / "mappings.yaml"
+    p.write_text(
+        "series:\n"
+        "- tvdb_id: 1\n  svt_series_id: s1\n  svt_slug: sl1\n"
+        "  series_title: One\n  confirmed_by: someone\n  confidence: 0.9\n",
+        encoding="utf-8",
+    )
+    m = MappingTable.load(p).for_tvdb(1)
+    assert m.series_title == "One" and m.source == "manual"
+
+
+def test_a_source_key_does_not_make_a_table_report_degraded(tmp_path: Path):
+    from svtplay_arr.mappings import ReloadingMappingTable
+
+    p = tmp_path / "mappings.yaml"
+    p.write_text(
+        "series:\n"
+        "- tvdb_id: 1\n  svt_series_id: s1\n  svt_slug: sl1\n"
+        "  series_title: One\n  source: auto\n",
+        encoding="utf-8",
+    )
+    assert ReloadingMappingTable(p).status() == {
+        "ever_loaded": True, "degraded": False, "count": 1,
+    }
+
+
+def test_an_unknown_source_value_survives_a_round_trip(tmp_path: Path):
+    # A newer version's label must not be snapped to a value this version
+    # happens to know, or downgrading would silently relabel rows.
+    p = tmp_path / "mappings.yaml"
+    p.write_text(
+        "series:\n"
+        "- tvdb_id: 1\n  svt_series_id: s1\n  svt_slug: sl1\n"
+        "  series_title: One\n  source: imported-from-somewhere\n",
+        encoding="utf-8",
+    )
+    assert MappingTable.load(p).for_tvdb(1).source == "imported-from-somewhere"
