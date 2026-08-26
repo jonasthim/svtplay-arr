@@ -397,8 +397,12 @@ Practical notes:
 
 - Series that already have a row are skipped without an SVT search.
 - The whole batch is written in **one** atomic write, or not at all.
-- Rows land marked `source: auto`. Check them — `series_title` is still the
-  permanent filename — and remove any that look wrong.
+- Rows land marked `source: auto`, and the mappings table shows them with an
+  **Auto-matched** badge beside the series title, explained in one line under
+  the table. Check them — `series_title` is still the permanent filename — and
+  remove any that look wrong. Rows with no `source` field, which is every row
+  in a file written before this feature, are hand-confirmed and carry no
+  badge.
 - A suggestion you accept by hand is an ordinary mapping and stays `manual`.
 - Bounded at 4 concurrent SVT searches and **200 searches per run**. Hitting
   that limit is reported on the page rather than silently truncating your

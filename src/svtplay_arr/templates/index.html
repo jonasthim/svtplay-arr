@@ -9,6 +9,10 @@
    table below is simply the whole list, which is the honest degradation:
    a filter box that cannot filter is worse than no filter box. #}
 {% set ns = namespace(check_matched=false) %}
+{# Rows the Find mappings sweep wrote without anyone confirming them.
+   Counted once here rather than re-derived in each of the two places
+   that need it -- the note below only renders when the badge does. #}
+{% set auto_rows = mappings | selectattr('source', 'equalto', 'auto') | list %}
 {# thead/tbody are explicit so the narrow-viewport rules in base.html can
    drop the column headings -- each cell carries its own `data-label`
    instead -- without also hiding the first mapping. Those data-label
@@ -29,7 +33,21 @@
      would leave its result stranded under someone else's. #}
   {% set filter_text = (m.series_title ~ ' ' ~ m.tvdb_id ~ ' ' ~ m.svt_series_id ~ ' ' ~ m.svt_slug) | lower %}
   <tr class="mapping-row" data-filter-text="{{ filter_text }}">
-    <td data-label="Series">{{ m.series_title }}</td>
+    {# Provenance sits beside the title rather than in a column of its
+       own: the table's real content is series titles, and a fifth column
+       carrying one word on a minority of rows would cost every row width
+       for a fact most of them do not have. A hand-confirmed row gets no
+       decoration at all -- marking everything would make the marker mean
+       nothing -- and a row from a file written before this field existed
+       has no `source` key, loads as `manual`, and is therefore left
+       undecorated too, which is the truth about it.
+
+       A word, not a bare glyph. The dangerous-field marker reached
+       production as an unlabelled "!" whose first review question was
+       what it meant; the badge below is a legible phrase for exactly that
+       reason, explained once beneath the table rather than in a tooltip
+       nobody on a phone can open. #}
+    <td data-label="Series">{{ m.series_title }}{% if m.source == 'auto' %} <span class="auto-badge">Auto-matched</span>{% endif %}</td>
     <td data-label="TVDB">{{ m.tvdb_id }}</td>
     <td data-label="SVT">{{ m.svt_series_id }} / {{ m.svt_slug }}</td>
     <td class="mapping-actions">
@@ -111,6 +129,20 @@
    Check submit and this render. The common case (a check against a
    mapping still on the page) never reaches this; it is shown inline in
    the row above instead. #}
+{% if auto_rows %}
+{# Only when at least one badge is actually on the page. An explanation
+   of a marker that appears nowhere is noise on the page every operator
+   who never runs the sweep is looking at. #}
+<p class="help auto-note"><span class="auto-badge">Auto-matched</span>
+  marks the {{ auto_rows | length }} row{{ 's' if auto_rows | length != 1 else '' }}
+  that <strong>Find mappings</strong> wrote on its own, because the Sonarr
+  title and the SVT programme name were identical and only one SVT
+  programme matched. Nobody confirmed
+  {{ 'them' if auto_rows | length != 1 else 'it' }}. Check
+  {{ 'each one' if auto_rows | length != 1 else 'it' }} against SVT and
+  remove anything wrong: the series title is the permanent filename in
+  your library, and Sonarr will not fix it later.</p>
+{% endif %}
 {% if check and not ns.check_matched %}
 <p class="{{ check.css_class }}">Check for tvdb_id {{ check.tvdb_id }}: {{ check.message }}</p>
 {% endif %}

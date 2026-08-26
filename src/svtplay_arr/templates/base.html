@@ -246,7 +246,13 @@
        where it is in the page source, survives CSS being off, and is
        announced with the field; this rule only styles it, and the glyph
        beside it is aria-hidden so it decorates rather than speaks. */
-    .danger-badge {
+    /* `.auto-badge` shares this rule deliberately. Both markers say the
+       same thing in different places -- "this one is worth a second
+       look" -- and they never appear near each other, so giving the
+       mappings table its own colour decision would mean a second token
+       pair to contrast-check for one more shade of amber. The word
+       inside differs; the styling does not. */
+    .danger-badge, .auto-badge {
       display: inline-block; margin-right: .35rem; padding: 0 .3rem;
       border: 1px solid var(--warn-border); border-radius: 3px;
       background: var(--bg); color: var(--warn-fg);
@@ -312,6 +318,15 @@
        cell is empty and collapses to just the rule. */
     table.mappings tr.mapping-row > td { border-bottom: 0; }
     table.mappings tr.mapping-check-row > td { padding: 0 .6rem; }
+    /* Beside a series title rather than at the head of a label, so it
+       needs no right margin and should not push the title's baseline
+       around. */
+    .auto-badge { margin-right: 0; margin-left: .1rem; }
+    /* The note under the mappings table. Sits with the table it explains,
+       above the actions, and carries an inline copy of the badge so the
+       thing being explained is visible in the same sentence. */
+    .auto-note { margin: .6rem 0 0; max-width: 46rem; }
+    .auto-note .auto-badge { margin-left: 0; }
     #mapping-filter { margin: 0 0 .75rem; }
 
     /* ---- Find mappings ----------------------------------------------

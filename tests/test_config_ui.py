@@ -3892,3 +3892,141 @@ def test_only_what_the_gate_approved_is_written_alongside_it(tmp_path: Path):
     assert table.for_tvdb(888) is not None    # the gate approved this one
     assert table.for_tvdb(999) is None        # and refused this one
     assert {m.tvdb_id for m in table.all()} == {288649, 888}
+
+
+# --- Provenance in the mappings table --------------------------------
+#
+# A `source: auto` row that is only visible by opening mappings.yaml over
+# SSH is a marker that does not do its job: auditing what the sweep
+# guessed is exactly the workflow this page exists to remove. A guessed
+# mapping and a hand-confirmed one must be tellable apart in the view
+# most people will actually look at.
+
+
+def _series_cell(html: str, title: str) -> str:
+    """The Series cell for one mapping row, isolated.
+
+    Asserting on the whole body would pass on a marker rendered against
+    some other row -- or on one rendered nowhere near the table at all.
+    """
+    m = re.search(
+        r'<td data-label="Series">(.*?)</td>',
+        html[html.index(html_mod.escape(title, quote=False)) - 200:],
+        re.S,
+    )
+    assert m, f"no Series cell found for {title!r} in:\n{html}"
+    return m.group(1)
+
+
+def _auto_rows_client(tmp_path: Path, rows: str):
+    """A client over a mappings.yaml written verbatim, not through the writer.
+
+    The compatibility case needs a file with no `source` key at all --
+    which is what every deployment written before this feature has -- and
+    that is a property of the bytes on disk, not of anything the writer
+    would produce today.
+    """
+    cfg, maps = _paths(tmp_path)
+    maps.write_text(rows, encoding="utf-8")
+    app = FastAPI()
+    app.include_router(build_config_router(cfg, maps, FakeSvt(), FakeSonarr()))
+    return TestClient(app)
+
+
+# The rendered element, not the bare class name: `auto-badge` also
+# appears in base.html's stylesheet, where its presence proves nothing
+# about any row.
+_BADGE = '<span class="auto-badge">'
+
+_AUTO_ROW = (
+    "series:\n"
+    "- tvdb_id: 1\n  svt_series_id: s1\n  svt_slug: sl1\n"
+    "  series_title: Guessed Show\n  source: auto\n"
+)
+_MANUAL_ROW = (
+    "series:\n"
+    "- tvdb_id: 2\n  svt_series_id: s2\n  svt_slug: sl2\n"
+    "  series_title: Confirmed Show\n  source: manual\n"
+)
+_LEGACY_ROW = (
+    "series:\n"
+    "- tvdb_id: 3\n  svt_series_id: s3\n  svt_slug: sl3\n"
+    "  series_title: Legacy Show\n"
+)
+
+
+def test_an_auto_created_row_is_marked_in_the_mappings_table(tmp_path: Path):
+    body = _auto_rows_client(tmp_path, _AUTO_ROW).get("/config").text
+    assert _BADGE in _series_cell(body, "Guessed Show")
+
+
+def test_a_hand_confirmed_row_carries_no_marker(tmp_path: Path):
+    # A row a human picked needs no decoration; marking everything would
+    # make the marker mean nothing.
+    body = _auto_rows_client(tmp_path, _MANUAL_ROW).get("/config").text
+    assert _BADGE not in _series_cell(body, "Confirmed Show")
+    assert _BADGE not in body
+
+
+def test_a_row_from_a_file_with_no_source_field_is_not_called_a_guess(
+    tmp_path: Path,
+):
+    # The compatibility case: every mappings.yaml written before this
+    # feature existed has no `source` key at all, and those rows were all
+    # put there by a human. Rendering them as guesses would tell every
+    # existing operator their whole library was machine-written.
+    body = _auto_rows_client(tmp_path, _LEGACY_ROW).get("/config").text
+    assert "Legacy Show" in body                     # it still renders
+    assert _BADGE not in _series_cell(body, "Legacy Show")
+
+
+def test_the_auto_marker_says_what_it_means_in_words(tmp_path: Path):
+    # The lesson from the dangerous-field marker, which reached production
+    # as a bare "!" whose first review question was what it meant. A glyph
+    # alone carries nothing to someone seeing it for the first time.
+    cell = _series_cell(
+        _auto_rows_client(tmp_path, _AUTO_ROW).get("/config").text, "Guessed Show"
+    )
+    m = re.search(r'<span class="auto-badge"[^>]*>(.*?)</span>', cell, re.S)
+    assert m, f"no auto badge in:\n{cell}"
+    words = re.sub(r"<[^>]+>", "", m.group(1)).strip()
+    assert re.search(r"[A-Za-z]{4,}", words), (
+        f"the auto marker carries no word, only {words!r}"
+    )
+
+
+def _auto_note(html: str) -> str | None:
+    m = re.search(r'<p class="help auto-note">(.*?)</p>', html, re.S)
+    return m.group(1) if m else None
+
+
+def test_the_marker_is_explained_once_beneath_the_table(tmp_path: Path):
+    # Understandable without hovering or guessing: one note under the
+    # table saying what the badge means and what to do about it.
+    note = _auto_note(_auto_rows_client(tmp_path, _AUTO_ROW).get("/config").text)
+    assert note is not None, "the auto marker is never explained"
+    assert "confirm" in note.lower()
+    assert "filename" in note.lower()
+
+
+def test_nothing_is_explained_when_nothing_was_auto_matched(tmp_path: Path):
+    # An explanation of a marker that appears nowhere is noise on the page
+    # every operator who never runs the sweep will look at.
+    body = _auto_rows_client(tmp_path, _MANUAL_ROW).get("/config").text
+    assert _BADGE not in body
+    assert _auto_note(body) is None
+
+
+def test_a_swept_row_shows_its_marker_on_the_very_next_page_load(tmp_path: Path):
+    # End to end, through the real writer rather than a hand-written file:
+    # what the sweep writes is what the table then marks.
+    svt = SweepSvt({OTHER: [SvtSearchHit("vvm123", OTHER, "TvSeries")]})
+    sonarr = FakeSonarr([{"id": 9, "tvdbId": 999, "title": OTHER}])
+    client, maps = _sweep_client(tmp_path, svt, sonarr)
+
+    _discover(client, maps)
+    body = client.get("/config").text
+
+    assert _BADGE in _series_cell(body, OTHER)
+    # The fixture row was added by hand and must not have been relabelled.
+    assert _BADGE not in _series_cell(body, TITLE)

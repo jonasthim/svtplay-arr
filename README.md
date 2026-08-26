@@ -166,8 +166,9 @@ mistake this project refuses to make on its own, and one level larger than a
 wrong episode match: it makes *every* episode of that show a permanently wrong
 filename.
 
-Rows written that way carry `source: auto` in the file, so a mapping nobody
-confirmed is never indistinguishable from one you picked yourself. Diacritics
+Rows written that way carry `source: auto` in the file and an **Auto-matched**
+badge in the mappings table, so a mapping nobody confirmed is never
+indistinguishable from one you picked yourself — in the file or on the page. Diacritics
 are deliberately *not* folded during the comparison: Swedish titles are
 distinguished by å/ä/ö, and folding them would manufacture exact matches
 between genuinely different shows.
