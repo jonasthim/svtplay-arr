@@ -37,47 +37,6 @@ def test_duplicate_tvdb_ids_rejected(tmp_path: Path):
         MappingTable.load(p)
 
 
-async def test_suggest_mappings_proposes_rows_without_writing(tmp_path: Path):
-    from svtplay_arr.mappings import suggest_mappings
-    from svtplay_arr.models import SvtSearchHit
-
-    class FakeSonarr:
-        async def all_series(self):
-            return [{"id": 70, "tvdbId": 288649,
-                     "title": "Gift vid första ögonkastet"}]
-
-    class FakeSvt:
-        async def search_series(self, query):
-            return [SvtSearchHit("jpmQD3q", "Gift vid första ögonkastet",
-                                 "TvSeries")]
-
-    out = await suggest_mappings(FakeSonarr(), FakeSvt())
-    assert out == [{
-        "tvdb_id": 288649,
-        "svt_series_id": "jpmQD3q",
-        "svt_slug": "",
-        "series_title": "Gift vid första ögonkastet",
-        "svt_name": "Gift vid första ögonkastet",
-    }]
-    # Nothing is written: a wrong series mapping is exactly the error class the
-    # resolver refuses to make unaided, so a human confirms it.
-    assert list(tmp_path.iterdir()) == []
-
-
-async def test_suggest_mappings_skips_series_with_no_svt_hit():
-    from svtplay_arr.mappings import suggest_mappings
-
-    class FakeSonarr:
-        async def all_series(self):
-            return [{"id": 1, "tvdbId": 999, "title": "Nonexistent Show"}]
-
-    class FakeSvt:
-        async def search_series(self, query):
-            return []
-
-    assert await suggest_mappings(FakeSonarr(), FakeSvt()) == []
-
-
 # --- Hardening beyond the brief's reference code: a hand-edited YAML file is
 # at least as likely to be malformed as an API response, so MappingTable.load
 # treats it with the same "guard, don't crash" discipline as sonarr.py and
@@ -147,34 +106,6 @@ series:
     )
     with pytest.raises(ValueError):
         MappingTable.load(p)
-
-
-async def test_suggest_mappings_skips_non_dict_series_entry():
-    from svtplay_arr.mappings import suggest_mappings
-
-    class FakeSonarr:
-        async def all_series(self):
-            return ["not a dict"]
-
-    class FakeSvt:
-        async def search_series(self, query):
-            raise AssertionError("should not be called for a malformed entry")
-
-    assert await suggest_mappings(FakeSonarr(), FakeSvt()) == []
-
-
-async def test_suggest_mappings_skips_series_missing_tvdb_id():
-    from svtplay_arr.mappings import suggest_mappings
-
-    class FakeSonarr:
-        async def all_series(self):
-            return [{"id": 1, "title": "No TVDB ID"}]
-
-    class FakeSvt:
-        async def search_series(self, query):
-            raise AssertionError("should not be called for a malformed entry")
-
-    assert await suggest_mappings(FakeSonarr(), FakeSvt()) == []
 
 
 def test_all_returns_every_mapping(tmp_path: Path):

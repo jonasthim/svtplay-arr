@@ -45,7 +45,7 @@ import logging
 import re
 from dataclasses import dataclass
 
-from svtplay_arr.models import SvtSearchHit
+from svtplay_arr.models import SOURCE_AUTO, SvtSearchHit
 from svtplay_arr.svt.client import derive_slug
 
 log = logging.getLogger(__name__)
@@ -386,3 +386,148 @@ async def sweep_for_mappings(
         cap=cap,
         skipped_records=skipped,
     )
+
+
+# --- The CLI: the same sweep, reported rather than written -----------
+#
+# `svtplay-arr-suggest-mappings` (declared in pyproject.toml) used to call
+# a second, separate implementation of this idea -- `suggest_mappings` in
+# mappings.py -- which took the first SVT hit of a series typename with no
+# confidence check at all, and emitted rows with a blank `svt_slug` for a
+# human to fill in. That is precisely the guess this module exists to
+# refuse, and two implementations of one idea drifting apart is this
+# codebase's most persistent defect, so it was deleted rather than fixed
+# in parallel.
+#
+# The entry point stays, pointed here, because it is the only way to see
+# what a sweep would do without a browser -- and, unlike the config page,
+# it still writes nothing at all. Same gate, same slug derivation, same
+# `source: auto` marker: paste its output and you get byte-for-byte the
+# rows the page would have written.
+
+
+def confident_rows(sweep: Sweep) -> list[dict]:
+    """The confident matches as mappings.yaml rows, ready to paste.
+
+    Identical in shape and content to what the config page writes for the
+    same sweep -- including the derived slug and the `source: auto` marker,
+    so a row pasted from here is not silently a different kind of row from
+    one the page wrote.
+    """
+    return [
+        {
+            "tvdb_id": m.tvdb_id,
+            "svt_series_id": m.svt_series_id,
+            "svt_slug": m.svt_slug,
+            "series_title": m.series_title,
+            "source": SOURCE_AUTO,
+        }
+        for m in sweep.confident
+    ]
+
+
+def format_report(sweep: Sweep) -> str:
+    """The human half of the CLI's output: everything not safe to paste.
+
+    Deliberately separate from `confident_rows`, and written to stderr by
+    `main`, so `... > rows.yaml` captures only rows a human could paste
+    without re-reading them -- and the part that needs a decision cannot be
+    swept into a file by a shell redirect.
+    """
+    lines = [
+        f"{len(sweep.confident)} confident match(es) printed above; "
+        f"{len(sweep.needs_decision)} need a decision, "
+        f"{len(sweep.no_match)} had no SVT match, "
+        f"{len(sweep.search_failed)} could not be searched. "
+        f"{sweep.already_mapped} series were already mapped and not searched.",
+    ]
+    if sweep.capped:
+        lines.append(
+            f"Stopped at the per-run limit of {sweep.cap} SVT searches: "
+            f"{sweep.not_searched} unmapped series were NOT searched. Map "
+            "what is above, then run again to continue."
+        )
+    if sweep.skipped_records:
+        lines.append(
+            f"{sweep.skipped_records} Sonarr record(s) had no usable title "
+            "or TVDB id and were skipped."
+        )
+    for proposal in sweep.needs_decision:
+        lines.append(
+            f"\nNEEDS A DECISION  {proposal.series_title} "
+            f"(tvdbId {proposal.tvdb_id})\n  {proposal.reason}"
+        )
+        for c in proposal.candidates:
+            lines.append(f"    {c.svt_id}  {c.slug}  {c.name}")
+    for proposal in sweep.no_match:
+        lines.append(
+            f"\nNO SVT MATCH      {proposal.series_title} "
+            f"(tvdbId {proposal.tvdb_id})"
+        )
+    for proposal in sweep.search_failed:
+        lines.append(
+            f"\nSEARCH FAILED     {proposal.series_title} "
+            f"(tvdbId {proposal.tvdb_id})\n  {proposal.reason}"
+        )
+    return "\n".join(lines)
+
+
+def main() -> None:
+    """CLI: print what a Find mappings sweep would write. Writes nothing.
+
+    Entry point `svtplay-arr-suggest-mappings`. Confident rows go to
+    stdout as pasteable YAML; everything that needs a human goes to
+    stderr. The config page is what actually writes -- this is the
+    headless preview of the same decision, made by the same gate.
+    """
+    import asyncio
+    import os
+    import sys
+    from pathlib import Path
+
+    import httpx
+    import yaml as _yaml
+
+    from svtplay_arr.config import Settings
+    from svtplay_arr.mappings import MappingTable
+    from svtplay_arr.sonarr import SonarrClient
+    from svtplay_arr.svt.client import SvtClient
+
+    settings = Settings.load(
+        Path(os.environ.get("SVTPLAY_ARR_CONFIG", "/etc/svtplay-arr/config.yaml"))
+    )
+
+    # Already-mapped series are skipped here exactly as they are on the
+    # page: there is nothing to propose for a series that has a row, and
+    # searching for it would be a request to SVT with no possible outcome.
+    # A mappings file that will not parse is not a reason to re-search the
+    # whole library, so it stops the run rather than being read as empty.
+    try:
+        mapped = {m.tvdb_id for m in MappingTable.load(settings.mappings_file).all()}
+    except FileNotFoundError:
+        mapped = set()
+    except ValueError as exc:
+        print(f"{settings.mappings_file} is invalid: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+
+    async def run() -> Sweep:
+        async with httpx.AsyncClient(timeout=30.0) as http:
+            return await sweep_for_mappings(
+                SonarrClient(settings.sonarr_url, settings.sonarr_api_key, http),
+                SvtClient(http, settings.svt_ua),
+                mapped_tvdb_ids=mapped,
+            )
+
+    sweep = asyncio.run(run())
+    _yaml.safe_dump(
+        {"series": confident_rows(sweep)},
+        sys.stdout,
+        allow_unicode=True,
+        sort_keys=False,
+    )
+    print(
+        "\n# Rows above matched exactly and unambiguously; check them and "
+        "paste into mappings.yaml. Nothing was written.\n",
+        file=sys.stderr,
+    )
+    print(format_report(sweep), file=sys.stderr)

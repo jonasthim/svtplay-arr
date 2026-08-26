@@ -43,7 +43,7 @@ Repository = "https://github.com/jonasthim/svtplay-arr"
 Issues = "https://github.com/jonasthim/svtplay-arr/issues"
 
 [project.scripts]
-svtplay-arr-suggest-mappings = "svtplay_arr.mappings:main"
+svtplay-arr-suggest-mappings = "svtplay_arr.discovery:main"
 
 [build-system]
 requires = ["hatchling"]

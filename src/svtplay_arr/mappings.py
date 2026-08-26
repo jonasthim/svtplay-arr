@@ -1,11 +1,18 @@
-"""The tvdb_id -> SVT series table.
+"""The tvdb_id -> SVT series table, and the only writer for its file.
 
 Sonarr sends `tvdbid` on every search; this module is how the service knows
 which SVT programme is being asked about. Loading is intentionally strict
-(a duplicate tvdb_id is rejected loudly, not silently last-wins) and
-`suggest_mappings`/`main` only ever print candidate rows -- a wrong series
-mapping is exactly the class of error the resolver refuses to make on its
-own, so a human must confirm every row before it lands in mappings.yaml.
+-- a duplicate tvdb_id is rejected loudly, not silently last-wins -- and
+`ReloadingMappingTable` never lets a parse failure empty the table, because
+an empty feed is what makes Sonarr reject the indexer outright.
+
+This module holds no opinion about *which* SVT programme a series is. A
+wrong series mapping is the class of error `resolver.py` refuses to make on
+its own, one level larger, so the decision lives behind
+`discovery.confident_match`: either a human confirmed the row on the config
+page, or that gate found two independent signals agreeing. Rows of the
+second kind carry `source: auto` (see `models.SOURCE_AUTO`) so the two are
+never indistinguishable afterwards.
 """
 
 import logging
@@ -134,75 +141,6 @@ class MappingTable:
         """Every mapped series. Used by the RSS feed, which has no tvdb_id
         to look up -- Sonarr sends a bare tvsearch with no parameters."""
         return list(self._by_tvdb.values())
-
-
-async def suggest_mappings(sonarr, svt) -> list[dict]:
-    """Propose tvdb->SVT rows by searching SVT for each Sonarr series title.
-
-    Output is printed for a human to paste into mappings.yaml after checking.
-    Nothing is written automatically: a wrong series mapping is exactly the
-    class of error the resolver refuses to make on its own.
-    """
-    suggestions: list[dict] = []
-    for series in await sonarr.all_series():
-        if not isinstance(series, dict):
-            continue
-        title = series.get("title")
-        tvdb_id = series.get("tvdbId")
-        if not title or tvdb_id is None:
-            continue
-
-        hits = await svt.search_series(title)
-        best = next((h for h in hits if h.typename in ("TvSeries", "TvShow")), None)
-        if best is None:
-            continue
-        suggestions.append(
-            {
-                "tvdb_id": tvdb_id,
-                "svt_series_id": best.svt_id,
-                "svt_slug": "",  # human fills from the SVT Play URL
-                "series_title": title,
-                "svt_name": best.name,
-            }
-        )
-    return suggestions
-
-
-def main() -> None:
-    """CLI: print candidate mapping rows as YAML for a human to check.
-
-    Entry point `svtplay-arr-suggest-mappings`. Prints to stdout only; it never
-    edits mappings.yaml.
-    """
-    import asyncio
-    import os
-    import sys
-
-    import httpx
-    import yaml as _yaml
-
-    from svtplay_arr.config import Settings
-    from svtplay_arr.sonarr import SonarrClient
-    from svtplay_arr.svt.client import SvtClient
-
-    settings = Settings.load(
-        Path(os.environ.get("SVTPLAY_ARR_CONFIG", "/etc/svtplay-arr/config.yaml"))
-    )
-
-    async def run() -> list[dict]:
-        async with httpx.AsyncClient(timeout=30.0) as http:
-            return await suggest_mappings(
-                SonarrClient(settings.sonarr_url, settings.sonarr_api_key, http),
-                SvtClient(http, settings.svt_ua),
-            )
-
-    rows = asyncio.run(run())
-    _yaml.safe_dump({"series": rows}, sys.stdout, allow_unicode=True, sort_keys=False)
-    print(
-        "\n# Check every row, fill in svt_slug from the SVT Play URL, "
-        "then paste into mappings.yaml",
-        file=sys.stderr,
-    )
 
 
 class MappingError(RuntimeError):

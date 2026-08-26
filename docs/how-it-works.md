@@ -44,8 +44,11 @@ The seams are the design, and they are worth stating as rules:
 - **Only `svt/client.py` knows SVT exists.** An SVT API change should touch
   that file and nothing else.
 - **`config_ui.py` contains no matching logic and no SVT knowledge.** It calls
-  the same clients `suggest_mappings` does. That seam is what makes it
-  impossible for a UI change to alter what gets grabbed.
+  the same clients `discovery.py` does. That seam is what makes it impossible
+  for a UI change to alter what gets grabbed.
+- **Only `discovery.py` decides that a mapping may be written unconfirmed.**
+  It mirrors `resolver.py` one level up — two independent signals, refuse on
+  any doubt — and it is the only place that rule lives.
 - **`app.py` only assembles.** If you find yourself adding matching, download
   or wire-format logic there, it belongs somewhere else.
 
@@ -528,8 +531,10 @@ Jinja2 templates under `src/svtplay_arr/templates/`.
 
 Server-rendered HTML mounted at `/config`. It contains no matching logic and no
 SVT knowledge — it calls the same `SvtClient` and `SonarrClient` that
-`suggest_mappings` does, which is the seam that guarantees a UI change cannot
-alter what gets grabbed.
+`discovery.py` does, which is the seam that guarantees a UI change cannot alter
+what gets grabbed. The Find mappings sweep is the one route that writes without
+a per-row confirmation, and it may write only what `discovery.confident_match`
+approved; that gate lives in `discovery.py`, not here.
 
 Routes:
 
@@ -541,7 +546,19 @@ POST /config/mappings/search            SVT hits beside Sonarr series
 POST /config/mappings                   create one mapping
 POST /config/mappings/{tvdb_id}/delete  remove one
 POST /config/mappings/{tvdb_id}/check   live-check one mapping's slug
+POST /config/mappings/discover          sweep Sonarr for unmapped series
 ```
+
+`POST /config/mappings/discover` is the Find mappings sweep. It parses
+`expected_mtime`, loads mappings.yaml (refusing to sweep at all if it will not
+parse — without knowing what is already mapped it would re-search the library
+and could append a duplicate on top of a file it could not read), runs
+`discovery.sweep_for_mappings`, and writes the confident rows in **one** atomic
+`add_mappings` call. The sweep itself writes nothing, so a Sonarr outage
+part-way through leaves no partial file. Bounded at 4 concurrent SVT searches
+and 200 searches per run; hitting the cap is reported on the page, not silently
+applied. Rows land marked `source: auto`; a suggestion accepted by hand goes
+through `POST /config/mappings` like any other and stays `manual`.
 
 The rules it inherits, all of them pinned by tests:
 

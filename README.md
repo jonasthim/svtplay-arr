@@ -153,10 +153,27 @@ series:
 
 Adding a show means adding one of these rows — through the configuration page
 (which searches SVT for you and copies the title straight out of Sonarr), or
-by hand. Nothing is mapped automatically. There is a helper that *suggests*
-rows by searching SVT for every series title in your Sonarr, but it prints
-them to your terminal and never writes the file: a wrong series mapping is
-exactly the mistake this project refuses to make on its own.
+by hand.
+
+**Find mappings** on the configuration page sweeps your whole Sonarr library
+at once: it searches SVT for every series that is not mapped yet and saves the
+rows it is certain about. "Certain" is deliberately narrow — the Sonarr title
+and the SVT programme name must be *identical* once casefolded and stripped of
+a trailing `(2019)`, and exactly one SVT programme may match. Anything less —
+several candidates, a near miss, nothing found — is listed for you to decide,
+one click each, and never written. A wrong series mapping is exactly the
+mistake this project refuses to make on its own, and one level larger than a
+wrong episode match: it makes *every* episode of that show a permanently wrong
+filename.
+
+Rows written that way carry `source: auto` in the file, so a mapping nobody
+confirmed is never indistinguishable from one you picked yourself. Diacritics
+are deliberately *not* folded during the comparison: Swedish titles are
+distinguished by å/ä/ö, and folding them would manufacture exact matches
+between genuinely different shows.
+
+`svtplay-arr-suggest-mappings` runs the same sweep from a terminal and prints
+what it would write, without writing anything.
 
 Mappings are re-read while the service runs, so adding a show takes effect on
 the next search with no restart.

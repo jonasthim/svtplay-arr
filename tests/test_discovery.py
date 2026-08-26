@@ -353,3 +353,115 @@ async def test_the_sweep_never_asks_svt_for_an_episode_list():
 def test_candidate_is_hashable_and_carries_what_a_write_needs():
     c = Candidate(svt_id="s1", name="Solsidan", slug="solsidan")
     assert (c.svt_id, c.name, c.slug) == ("s1", "Solsidan", "solsidan")
+
+
+# --- The CLI's report ------------------------------------------------
+#
+# `svtplay-arr-suggest-mappings` used to be a second implementation of this
+# idea, taking the first SVT hit with no confidence check and emitting a
+# blank svt_slug. It now runs the same gate as the config page and still
+# writes nothing at all.
+
+
+async def _sweep(series, results, **kwargs):
+    return await sweep_for_mappings(
+        FakeSonarr(series), FakeSvt(results), mapped_tvdb_ids=set(), **kwargs
+    )
+
+
+async def test_the_cli_rows_are_what_the_page_would_have_written():
+    from svtplay_arr.discovery import confident_rows
+
+    sweep = await _sweep(
+        [{"id": 1, "tvdbId": 288649, "title": "Solsidan"}],
+        {"Solsidan": [_hit("Solsidan", "s1")]},
+    )
+
+    assert confident_rows(sweep) == [{
+        "tvdb_id": 288649,
+        "svt_series_id": "s1",
+        # Derived, never blank: the old CLI emitted "" here and left the
+        # operator to transcribe it off an SVT Play URL.
+        "svt_slug": "solsidan",
+        "series_title": "Solsidan",
+        # Marked, so a row pasted from the CLI is the same kind of row the
+        # page writes rather than silently passing as hand-confirmed.
+        "source": "auto",
+    }]
+
+
+async def test_the_cli_prints_no_row_for_anything_ambiguous():
+    from svtplay_arr.discovery import confident_rows
+
+    sweep = await _sweep(
+        [{"id": 1, "tvdbId": 7, "title": "Solsidan"}],
+        {"Solsidan": [_hit("Solsidan", "s1"), _hit("solsidan", "s2")]},
+    )
+
+    assert confident_rows(sweep) == []
+
+
+async def test_the_cli_report_names_every_undecided_series_and_its_candidates():
+    from svtplay_arr.discovery import format_report
+
+    sweep = await _sweep(
+        [
+            {"id": 1, "tvdbId": 7, "title": "Vem vet mest?"},
+            {"id": 2, "tvdbId": 8, "title": "Not On SVT"},
+        ],
+        {"Vem vet mest?": [_hit("Vem vet mest? Junior", "j1")]},
+    )
+
+    report = format_report(sweep)
+
+    assert "Vem vet mest?" in report and "j1" in report and "junior" in report
+    assert "NO SVT MATCH" in report and "Not On SVT" in report
+
+
+async def test_the_cli_report_says_when_the_cap_bit():
+    from svtplay_arr.discovery import format_report
+
+    sweep = await _sweep(
+        [{"id": i, "tvdbId": 1000 + i, "title": f"Show {i}"} for i in range(5)],
+        {},
+        cap=2,
+    )
+
+    report = format_report(sweep)
+    assert "NOT searched" in report and "3" in report
+
+
+async def test_the_cli_report_names_a_failed_search_separately_from_no_match():
+    from svtplay_arr.discovery import format_report
+
+    sonarr = FakeSonarr([{"id": 1, "tvdbId": 7, "title": "Broken"}])
+    svt = FakeSvt({}, error_for={"Broken"})
+    sweep = await sweep_for_mappings(sonarr, svt, mapped_tvdb_ids=set())
+
+    report = format_report(sweep)
+    # "SVT had nothing for this" and "SVT could not be asked" are different
+    # facts and must not be reported as the same one.
+    assert "SEARCH FAILED" in report
+    assert "NO SVT MATCH" not in report
+
+
+def test_the_console_script_points_at_a_callable_that_exists():
+    import tomllib
+
+    from svtplay_arr import discovery
+
+    with open("pyproject.toml", "rb") as handle:
+        scripts = tomllib.load(handle)["project"]["scripts"]
+    assert scripts["svtplay-arr-suggest-mappings"] == "svtplay_arr.discovery:main"
+    assert callable(discovery.main)
+
+
+def test_the_old_first_hit_wins_helper_is_gone():
+    # Two implementations of one idea drifting apart is this codebase's
+    # most persistent defect. suggest_mappings was rewritten out of
+    # existence rather than fixed in parallel; nothing may quietly restore
+    # a second, laxer matcher beside the gate.
+    import svtplay_arr.mappings as mappings_mod
+
+    assert not hasattr(mappings_mod, "suggest_mappings")
+    assert not hasattr(mappings_mod, "main")
