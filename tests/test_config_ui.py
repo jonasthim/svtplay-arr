@@ -3867,3 +3867,30 @@ def test_every_confident_row_is_written_in_a_single_write(
 
     assert len(writes) == 1
     assert len(MappingTable.load(maps).all()) == 4  # the fixture row plus three
+
+
+def test_only_what_the_gate_approved_is_written_alongside_it(tmp_path: Path):
+    # The route must write the gate's output and nothing else. A sweep that
+    # produces both a confident match and an ambiguous one is the case where
+    # a loosened route could quietly slip the ambiguous one into the same
+    # batch -- the confident row makes the write happen, and the extra row
+    # rides along inside it.
+    svt = SweepSvt({
+        "Confident Show": [SvtSearchHit("c1", "Confident Show", "TvSeries")],
+        OTHER: [
+            SvtSearchHit("a1", OTHER, "TvSeries"),
+            SvtSearchHit("a2", OTHER.upper(), "TvSeries"),
+        ],
+    })
+    sonarr = FakeSonarr([
+        {"id": 8, "tvdbId": 888, "title": "Confident Show"},
+        {"id": 9, "tvdbId": 999, "title": OTHER},
+    ])
+    client, maps = _sweep_client(tmp_path, svt, sonarr)
+
+    _discover(client, maps)
+
+    table = MappingTable.load(maps)
+    assert table.for_tvdb(888) is not None    # the gate approved this one
+    assert table.for_tvdb(999) is None        # and refused this one
+    assert {m.tvdb_id for m in table.all()} == {288649, 888}
