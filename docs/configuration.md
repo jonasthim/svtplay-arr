@@ -391,10 +391,13 @@ Each unmapped series is searched for under its own Sonarr title **and** the
 `alternateTitles` Sonarr carries — TVDB usually keeps the original-language
 title there, which for a Swedish show is very often exactly SVT's name.
 Queries are deduplicated (`Solsidan` and `Solsidan (2019)` are one search),
-capped per series, and scene release forms among the alternates
-(`Gift.vid.forsta.ogonkastet`) are dropped rather than searched for — SVT's
-search is a title search and will not match one, so spending a query on it
-also costs the useful alternate below it its turn. Every programme returned is a candidate; the few most
+capped per series, and unambiguous scene release names among the alternates
+(`Solsidan.S15`, `Solsidan.2019.1080p.WEB`) are dropped rather than searched
+for — SVT's search is a title search and will not match one, so spending a
+query on it also costs the useful alternate below it its turn. Only alternates
+carrying an actual scene marker — a season tag, a release year, a resolution, a
+source or language tag — are dropped, so real titles like `S.H.I.E.L.D.` and
+`9.1.1` are still searched for. Every programme returned is a candidate; the few most
 promising are the ones actually checked, with a name identical to one of the
 series' titles ranked first — not because that makes it right, but because if
 two programmes share a name it is those two whose episodes most need
@@ -431,18 +434,28 @@ A row is written without you confirming it only when **all** of these hold:
    second is listed under *Already claimed by another series*, one click from
    being accepted deliberately if that is what you want.
 
-**Short runs.** A series SVT has only just started publishing cannot reach
-three, and refusing it forever would be the old rule's failure in a new shape.
-So when the run is short **on both sides** — fewer than 3 episodes available on
-SVT to compare, *and* fewer than 3 aired in Sonarr — *all* of them must
-correspond and there must be at least **2**. Never one: a single shared air
-date at episode 1 is a coincidence any weekly show produces.
+**Short runs.** A series that can never reach three — a two-part documentary —
+would otherwise be refused forever, which would be the old rule's failure in a
+new shape. So when the run is short **on both sides** — fewer than 3 episodes
+available on SVT to compare, *and* fewer than 3 episodes with air dates in
+Sonarr — *all* of them must correspond and there must be at least **2**. Never
+one: a single shared air date at episode 1 is a coincidence any weekly show
+produces.
 
 Both sides, because SVT's side alone was not a safe test. A returning
 15-season series whose candidate happens to list only two episodes has a
 denominator of two, which would drop it into the weak branch and write it on
 exactly the coincidence the floor of three exists to refuse — while the
 *correct* eight-episode programme for that same series had to clear three.
+
+Sonarr's side counts episodes that *have a date*, not episodes that have aired
+by today, because **nothing in this decision reads the system clock**. A clock
+running behind under-counts what has aired and would reopen the hole above, and
+a container starting before NTP settles is an ordinary event. The practical
+consequence: Sonarr schedules a whole season the day it is announced, so a
+brand-new show is auto-mapped once its **third** episode is published rather
+than its second. That is a delay of one week, not a refusal — and you can
+always map it by hand in the meantime.
 
 **No evidence is not confidence.** A series Sonarr knows about that has not
 aired, or that SVT has not published, gives nothing to compare — so it is

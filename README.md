@@ -169,11 +169,12 @@ same name produces none. The title is only the search query.
 
 A row is saved without you confirming it only when exactly one candidate
 corroborates, on at least **3** uniquely-matching episodes, and every other
-candidate it checked corroborates on **zero**. A run that is short on *both*
-sides — SVT has only just started publishing it and Sonarr has aired fewer than
-three — falls back to "all of the episodes available to compare, and at least
-**2**", never one, which is a coincidence any weekly show produces. A series
-with nothing aired to compare is no evidence, so it is never written.
+candidate it checked corroborates on **zero**. A series that can never reach
+three — a two-part documentary, short on *both* sides — falls back to "all of
+the episodes available to compare, and at least **2**", never one, which is a
+coincidence any weekly show produces. A series with nothing aired to compare is
+no evidence, so it is never written. None of this consults the system clock: the
+answer is a function of the two episode lists alone.
 And no two series may be mapped to one SVT programme, so an original and its
 year-tagged reboot cannot both claim it.
 

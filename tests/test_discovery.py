@@ -209,15 +209,15 @@ def test_corroboration_honours_the_configured_tolerance(tolerance, drift, expect
 # --- the gate --------------------------------------------------------
 
 
-def _checked(name, matched, comparable, svt_id=None, error=None, aired=None):
-    # `aired` defaults to `comparable`, i.e. a series whose history is
-    # exactly as long as what SVT offers -- the neutral case. Tests that
+def _checked(name, matched, comparable, svt_id=None, error=None, dated=None):
+    # `dated` defaults to `comparable`, i.e. a series Sonarr knows exactly
+    # as many episodes of as SVT offers -- the neutral case. Tests that
     # care about the long-Sonarr-run hole say so explicitly.
     return Candidate(
         svt_id=svt_id or name, name=name, slug=name.lower(),
         evidence=Evidence(
             matched=matched, comparable=comparable,
-            aired=comparable if aired is None else aired, error=error,
+            dated=comparable if dated is None else dated, error=error,
         ),
     )
 
@@ -253,7 +253,7 @@ def test_one_matching_episode_is_never_enough():
 
 
 def test_the_short_run_fallback_accepts_a_complete_short_run():
-    assert corroborated_match([_checked("A", 2, 2, aired=2)]) is not None
+    assert corroborated_match([_checked("A", 2, 2, dated=2)]) is not None
     assert SHORT_RUN_MIN_EPISODES == 2
 
 
@@ -271,30 +271,30 @@ def test_a_long_running_series_can_never_reach_the_short_run_fallback():
     short run has a small denominator by construction, so the weak path
     was preferentially available to the wrong answer.
     """
-    assert corroborated_match([_checked("A", 2, 2, aired=120)]) is None
+    assert corroborated_match([_checked("A", 2, 2, dated=120)]) is None
     # And it is not the SVT side that saves it -- the same two episodes
-    # against a series with no history behind them are still accepted.
-    assert corroborated_match([_checked("A", 2, 2, aired=2)]) is not None
+    # against a series Sonarr knows only two of are still accepted.
+    assert corroborated_match([_checked("A", 2, 2, dated=2)]) is not None
 
 
 def test_the_strict_floor_applies_as_soon_as_either_side_is_long_enough():
     # Sonarr long, SVT short: strict.
-    assert corroborated_match([_checked("A", 2, 2, aired=ACCEPT_MIN_EPISODES)]) is None
+    assert corroborated_match([_checked("A", 2, 2, dated=ACCEPT_MIN_EPISODES)]) is None
     # Sonarr short, SVT long: strict too -- a candidate listing plenty of
     # episodes has supplied plenty of chances to disagree.
-    assert corroborated_match([_checked("A", 2, 8, aired=2)]) is None
+    assert corroborated_match([_checked("A", 2, 8, dated=2)]) is None
     # Both short: the fallback, which is the only case it is for.
     assert corroborated_match([
-        _checked("A", 2, 2, aired=ACCEPT_MIN_EPISODES - 1)
+        _checked("A", 2, 2, dated=ACCEPT_MIN_EPISODES - 1)
     ]) is not None
 
 
 def test_the_evidence_names_sonarrs_side_when_that_is_what_refused_it():
     # "1 of 2 matched; at least 3 are needed" reads as a contradiction
-    # until you know the threshold comes from the series having aired 120.
-    note = Evidence(matched=2, comparable=2, aired=120).describe()
+    # until you know the threshold comes from Sonarr listing 120 episodes.
+    note = Evidence(matched=2, comparable=2, dated=120).describe()
     assert "2 of 2 episodes matched" in note
-    assert "aired 120 episodes" in note
+    assert "lists 120 dated episodes" in note
 
 
 def test_the_short_run_fallback_refuses_a_lone_agreement():
@@ -420,8 +420,18 @@ class FakeSvt:
             async def __aenter__(self):
                 svt.in_flight += 1
                 svt.peak_in_flight = max(svt.peak_in_flight, svt.in_flight)
-                if svt.delay:
-                    await asyncio.sleep(svt.delay)
+                # Unconditional, and load-bearing. A coroutine with no real
+                # `await` inside never yields to the event loop, so a fake
+                # that only slept when a test opted into `delay` made the
+                # whole sweep run sequentially -- and any concurrency- or
+                # budget-shaped test written without `delay` passed against
+                # the very defect it was written for. That trap caught the
+                # first version of
+                # `test_the_budget_finishes_series_rather_than_starving_all_of_them`,
+                # so the yield point is now structural rather than opt-in.
+                # `delay` remains, for tests that need requests to overlap
+                # for a measurable time rather than merely interleave.
+                await asyncio.sleep(svt.delay)
 
             async def __aexit__(self, *exc):
                 svt.in_flight -= 1
@@ -562,29 +572,60 @@ async def test_a_returning_series_is_not_written_on_two_agreeing_episodes():
 
     assert sweep.confident == ()
     (p,) = sweep.needs_decision
-    assert "aired 20 episodes" in p.candidates[0].note()
+    assert "lists 20 dated episodes" in p.candidates[0].note()
 
 
-async def test_the_short_run_fallback_writes_a_complete_two_episode_run():
-    # SVT has published two episodes of a new season; the rest are
-    # upcoming, and Sonarr has aired exactly those two. Refusing this
-    # forever is the old gate's failure wearing a new hat, so
-    # all-of-a-short-run is accepted -- but never one.
-    svt = _weekly(2, start=JUST_STARTED) + [
-        _svt_ep(3, JUST_STARTED + timedelta(days=14), available=False),
-    ]
+async def test_the_short_run_fallback_writes_a_genuinely_two_episode_series():
+    # A two-part documentary: Sonarr knows two episodes and there will
+    # never be a third. This is the case the fallback exists for -- "never
+    # reaches three" is the problem it solves.
     sweep = await _sweep(
         [{"id": 1, "tvdbId": 7, "title": "Solsidan"}],
         {"Solsidan": [_hit("Solsidan", "s1")]},
-        episodes={"solsidan": svt},
-        sonarr_episodes={1: _sonarr_weekly(6, start=JUST_STARTED)},
+        episodes={"solsidan": _weekly(2, start=JUST_STARTED)},
+        sonarr_episodes={1: _sonarr_weekly(2, start=JUST_STARTED)},
     )
 
     (written,) = sweep.confident
     assert (written.evidence.matched, written.evidence.comparable) == (2, 2)
     # Short on Sonarr's side too, which is what makes the weak path
     # legitimately available here.
-    assert written.evidence.aired == 2
+    assert written.evidence.dated == 2
+
+
+async def test_a_new_season_waits_for_its_third_episode_rather_than_forever():
+    """The price of taking the clock out of the gate, pinned deliberately.
+
+    Sonarr schedules a whole season the day it is announced, so a
+    brand-new show has six dated episodes from the start even though SVT
+    has published two. Counting dated episodes rather than aired ones
+    therefore keeps it out of the short-run fallback.
+
+    That is a delay, not a refusal: once SVT publishes the third episode
+    the strict floor is reachable and the row is written on its own
+    evidence. "Forever" is what the fallback exists to prevent; "one more
+    week, or map it by hand now" is this project's ordinary trade, and it
+    buys a gate that cannot be moved by a container's clock.
+    """
+    sonarr_run = _sonarr_weekly(6, start=JUST_STARTED)
+
+    two_published = await _sweep(
+        [{"id": 1, "tvdbId": 7, "title": "Solsidan"}],
+        {"Solsidan": [_hit("Solsidan", "s1")]},
+        episodes={"solsidan": _weekly(2, start=JUST_STARTED) + [
+            _svt_ep(3, JUST_STARTED + timedelta(days=14), available=False),
+        ]},
+        sonarr_episodes={1: sonarr_run},
+    )
+    assert two_published.confident == ()
+
+    three_published = await _sweep(
+        [{"id": 1, "tvdbId": 7, "title": "Solsidan"}],
+        {"Solsidan": [_hit("Solsidan", "s1")]},
+        episodes={"solsidan": _weekly(3, start=JUST_STARTED)},
+        sonarr_episodes={1: sonarr_run},
+    )
+    assert [m.tvdb_id for m in three_published.confident] == [7]
 
 
 async def test_the_short_run_fallback_refuses_when_one_of_two_disagrees():
@@ -768,15 +809,15 @@ async def test_repeated_alternate_titles_cost_one_search():
 
 async def test_scene_release_names_do_not_burn_a_query():
     # Sonarr's alternateTitles are largely scene names. SVT's search is a
-    # title search and will never match a dotted form, so each one spent is
-    # a request to an unofficial API with no possible outcome *and* a turn
-    # the useful alternate below it does not get -- the per-series query
-    # budget is only three.
+    # title search and will never match one, so each one spent is a request
+    # to an unofficial API with no possible outcome *and* a turn the useful
+    # alternate below it does not get -- the per-series query budget is
+    # only three.
     sonarr = FakeSonarr([{
         "id": 1, "tvdbId": 7, "title": "Solsidan",
         "alternateTitles": [
             {"title": "Solsidan.S15"},
-            {"title": "Gift.vid.forsta.ogonkastet"},
+            {"title": "Solsidan.2019.1080p.WEB.SWEDiSH"},
             {"title": "Sunny Side"},
         ],
     }])
@@ -787,18 +828,42 @@ async def test_scene_release_names_do_not_burn_a_query():
     assert svt.queries == ["Solsidan", "Sunny Side"]
 
 
-async def test_a_real_title_containing_a_dot_is_not_mistaken_for_a_scene_name():
-    # The filter is narrow on purpose: whitespace anywhere, or a single
-    # token, means it is a title rather than a release name.
-    sonarr = FakeSonarr([{
-        "id": 1, "tvdbId": 7, "title": "Solsidan",
-        "alternateTitles": [{"title": "Dr. Sannolik"}, {"title": "Solsidan2"}],
-    }])
-    svt = FakeSvt({})
+@pytest.mark.parametrize("title", [
+    "S.H.I.E.L.D.",      # an acronym, dotted, no spaces
+    "C.S.I.",
+    "A.D.",
+    "9.1.1",             # digits, dotted, no spaces
+    "11.22.63",
+    "Dr. Sannolik",      # a dot, but also a space
+    "Solsidan2",         # one token
+    "Gift.vid.forsta.ogonkastet",   # dotted, but carries no scene marker
+])
+def test_a_real_title_is_never_mistaken_for_a_scene_name(title):
+    """"Dotted and no spaces" was too greedy, and this is the list it ate.
 
-    await sweep_for_mappings(sonarr, svt, existing_mappings=(), tolerance_days=1)
+    Requiring an actual scene marker -- a season tag, a release year, a
+    resolution, a source or language tag -- is what separates
+    `Solsidan.S15` from `S.H.I.E.L.D.`. It also means a bare dotted form
+    with no marker is now searched for rather than dropped, which costs
+    one wasted query; dropping `S.H.I.E.L.D.` would cost a mapping, and
+    between those two the cheap error is the one to prefer.
+    """
+    from svtplay_arr.discovery import _is_scene_name
 
-    assert svt.queries == ["Solsidan", "Dr. Sannolik", "Solsidan2"]
+    assert not _is_scene_name(title)
+
+
+@pytest.mark.parametrize("title", [
+    "Solsidan.S15",
+    "Solsidan.S15E03",
+    "Solsidan.2019",
+    "Show.S01E02.1080p.WEB.SWEDiSH",
+    "Marvels.Agents.of.S.H.I.E.L.D.2013",
+])
+def test_an_actual_scene_name_is_recognised(title):
+    from svtplay_arr.discovery import _is_scene_name
+
+    assert _is_scene_name(title)
 
 
 async def test_sonarrs_own_title_is_never_filtered_as_a_scene_name():
@@ -1189,12 +1254,6 @@ async def test_the_budget_finishes_series_rather_than_starving_all_of_them():
         svt = FakeSvt(
             {f"Show {i}": [_hit(f"Show {i}", f"s{i}")] for i in range(10)},
             episodes={f"show-{i}": _weekly(8) for i in range(10)},
-            # Load-bearing. Without it the fake never awaits anything real,
-            # so every coroutine runs start to finish before the next is
-            # scheduled and the sweep is accidentally sequential -- which
-            # is to say, this test would pass against the very defect it
-            # exists to catch.
-            delay=0.001,
         )
 
         sweep = await sweep_for_mappings(
@@ -1230,7 +1289,6 @@ async def test_a_run_that_fits_its_budget_writes_every_series():
     svt = FakeSvt(
         {f"Show {i}": [_hit(f"Show {i}", f"s{i}")] for i in range(10)},
         episodes={f"show-{i}": _weekly(8) for i in range(10)},
-        delay=0.001,
     )
 
     sweep = await sweep_for_mappings(
@@ -1285,6 +1343,26 @@ async def test_a_series_the_budget_cut_off_mid_check_is_never_written():
     assert sweep.confident == ()
     assert len(sweep.out_of_budget) == 1
     assert sweep.budget_exhausted is True
+
+
+async def test_the_fake_actually_interleaves_without_being_asked_to():
+    # Guards the guard. Every concurrency- and budget-shaped test in this
+    # file is only meaningful if `FakeSvt` yields to the event loop, and
+    # the yield used to be opt-in via `delay`. If this fails, those tests
+    # have not started passing -- they have stopped being tests.
+    sonarr = FakeSonarr(
+        [{"id": i, "tvdbId": 1000 + i, "title": f"Show {i}"} for i in range(4)],
+    )
+    svt = FakeSvt({})            # no delay, deliberately
+
+    await sweep_for_mappings(
+        sonarr, svt, existing_mappings=(), tolerance_days=1, concurrency=2
+    )
+
+    assert svt.peak_in_flight == 2, (
+        "FakeSvt ran the sweep sequentially; concurrency tests built on it "
+        "cannot distinguish bounded work from unbounded work"
+    )
 
 
 async def test_concurrency_is_bounded():
@@ -1532,6 +1610,78 @@ def test_the_sweep_cannot_reach_the_matching_or_download_path():
         "svtplay_arr.naming",
     }
     assert not (imported & forbidden)
+
+
+async def test_the_gate_reads_no_clock_at_all():
+    """A safety gate must not be movable by a wrong system clock.
+
+    The earlier version counted Sonarr episodes with `air_date <= today`.
+    A clock running *behind* under-counts that, drops a long-running
+    series into the short-run branch and writes it -- reopening the exact
+    hole the Sonarr-side count was added to close. Measured on that
+    version: correct clock refused a 20-episode series matching two
+    episodes; a clock one year behind wrote it. A container that starts
+    before NTP settles is an ordinary event, and the cost here is a
+    permanent wrong filename.
+
+    So `corroborate` reads no clock. This test runs the C2 attack under a
+    clock a year behind and a year ahead and requires the same answer, and
+    the structural half below requires the module not to import a clock at
+    all -- which is what catches a future edit reintroducing one.
+    """
+    import datetime as datetime_mod
+
+    sonarr_run = _sonarr_weekly(20, start=FIRST - timedelta(days=100))
+    coincidence = [
+        _svt_ep(1, FIRST - timedelta(days=100)),
+        _svt_ep(2, FIRST - timedelta(days=93)),
+    ]
+
+    async def run():
+        return await _sweep(
+            [{"id": 1, "tvdbId": 7, "title": "Solsidan"}],
+            {"Solsidan": [_hit("Solsidan", "s1")]},
+            episodes={"solsidan": coincidence},
+            sonarr_episodes={1: sonarr_run},
+        )
+
+    real = await run()
+    assert real.confident == ()
+
+    for shift in (-365, 365):
+        class ShiftedDate(datetime_mod.date):
+            @classmethod
+            def today(cls):
+                return datetime_mod.date.today() + timedelta(days=shift)
+
+        original = datetime_mod.date
+        datetime_mod.date = ShiftedDate
+        try:
+            shifted = await run()
+        finally:
+            datetime_mod.date = original
+
+        assert shifted.confident == (), f"clock shifted {shift}d changed the gate"
+
+
+def test_no_clock_is_reachable_from_the_gate_at_all():
+    # The structural half of the test above. A behavioural test only
+    # covers the clock the fake happens to move; this covers the next
+    # person reaching for `date.today()` inside a matching decision.
+    import ast
+    from pathlib import Path
+
+    tree = ast.parse(Path("src/svtplay_arr/discovery.py").read_text("utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr in ("today", "now"):
+            raise AssertionError(
+                "discovery.py reads a clock; the gate's answer must be a "
+                "function of the two episode lists alone"
+            )
+        if isinstance(node, ast.ImportFrom) and node.module == "datetime":
+            raise AssertionError(
+                "discovery.py imports from datetime; the gate reads no clock"
+            )
 
 
 def test_the_default_tolerance_is_settings_own_and_not_a_second_copy():

@@ -64,13 +64,14 @@ again at ordinal 2 with nothing but the schedule in common. Three
 consecutive agreements of (available, date-within-tolerance, same ordinal)
 is not a schedule artefact.
 
-**The short-run fallback.** A series SVT has only just started publishing
-cannot reach three, and refusing it forever is the old gate's failure mode
-wearing a new hat. So when the run is short **on both sides** -- fewer than
-3 episodes available to compare, *and* fewer than 3 aired in Sonarr -- every
-one of them must corroborate and there must be at least
-`SHORT_RUN_MIN_EPISODES` (2). Never one: a single shared air date at ordinal
-1 is exactly the coincidence a weekly show produces.
+**The short-run fallback.** A series that can never reach three -- a
+two-part documentary -- would otherwise be refused forever, which is the
+old gate's failure mode wearing a new hat. So when the run is short **on
+both sides** -- fewer than 3 episodes available to compare, *and* fewer
+than 3 dated episodes in Sonarr -- every one of them must corroborate and
+there must be at least `SHORT_RUN_MIN_EPISODES` (2). Never one: a single
+shared air date at ordinal 1 is exactly the coincidence a weekly show
+produces.
 
 Both sides, and that is not belt-and-braces. Keyed on SVT's side alone, a
 15-season Sonarr series whose candidate happened to list two episodes had a
@@ -80,6 +81,10 @@ eight-episode programme for the same series had to clear 3. And because a
 wrong candidate with a genuinely short run has a small denominator by
 construction, the weak path was preferentially available to the wrong
 answer.
+
+Sonarr's side counts *dated* episodes, not episodes aired by today. This
+module reads no clock at all: see `Evidence` for why a wall-clock reading
+in a safety gate was itself the hole, and for what that costs.
 
 **No evidence is not confidence.** A series Sonarr knows about that has not
 aired, or that SVT has not published, yields nothing to compare -- so it is
@@ -120,7 +125,6 @@ import asyncio
 import logging
 import re
 from dataclasses import dataclass, replace
-from datetime import date
 
 from svtplay_arr.config import Settings
 from svtplay_arr.matching import episode_matches
@@ -174,18 +178,39 @@ _DEFAULT_TOLERANCE_DAYS = Settings.air_date_tolerance_days
 # of the title itself is untouched.
 _TRAILING_YEAR = re.compile(r"\s*\(\d{4}\)\s*$")
 
-# A scene release name: no whitespace at all, and two or more dot-separated
-# tokens -- `Gift.vid.forsta.ogonkastet`, `Solsidan.S15`. Sonarr's
-# `alternateTitles` are full of them, and they are worth filtering because
-# SVT's search is a title search: it will not match a dotted form, so the
-# query is a request to an unofficial API with no possible outcome. Each
-# one spent is also a query the *useful* alternate below it does not get,
-# since the per-series query budget is small.
+# A scene release name. Sonarr's `alternateTitles` are full of them, and
+# they are worth filtering because SVT's search is a title search: it will
+# not match a dotted release name, so the query is a request to an
+# unofficial API with no possible outcome. Each one spent is also a query
+# the *useful* alternate below it does not get, since the per-series query
+# budget is small.
 #
-# Deliberately narrow. A real title containing a dot but also a space
-# ("Dr. Sannolik") has whitespace and is kept; a single-word title has one
-# token and is kept. Only the unambiguous dotted form is dropped.
-_SCENE_NAME = re.compile(r"^\S+\.\S+$")
+# Two conditions, and the second is the one that matters. "Dotted and no
+# spaces" alone was the first attempt and it was too greedy: it ate
+# `S.H.I.E.L.D.`, `C.S.I.`, `A.D.`, `9.1.1` and `11.22.63`, which are real
+# titles a real person would search for. So an actual scene *marker* is
+# required as well -- a season tag, a four-digit year, a resolution, or a
+# source/language tag. `Gift.vid.forsta.ogonkastet` carries none of those
+# and is now searched for rather than dropped; that costs one wasted query,
+# where dropping `S.H.I.E.L.D.` costs a mapping. The error that is cheap to
+# make is the one to prefer.
+_SCENE_NO_SPACES = re.compile(r"^\S+\.\S+$")
+_SCENE_MARKER = re.compile(
+    r"(?:^|\.)(?:"
+    r"S\d{2}(?:E\d{2})?"          # S15, S15E03
+    r"|\d{4}"                     # a release year
+    r"|\d{3,4}p"                  # 720p, 1080p
+    r"|WEB(?:Rip|DL)?|HDTV|BluRay|DVDRip"
+    r"|SWEDiSH|NORDiC|MULTi"
+    r"|x26[45]|H26[45]|REPACK|PROPER|INTERNAL"
+    r")(?:\.|$)",
+    re.IGNORECASE,
+)
+
+
+def _is_scene_name(text: str) -> bool:
+    """Is this an alternate title no title search could ever match?"""
+    return bool(_SCENE_NO_SPACES.match(text)) and bool(_SCENE_MARKER.search(text))
 
 
 def normalise_title(name: str) -> str:
@@ -258,16 +283,36 @@ class Evidence:
     for. It is SVT-side on purpose -- what bounds the evidence is what SVT
     has actually published, not how many seasons TVDB knows about.
 
-    `aired` counts Sonarr's own episodes that have aired by now, and it
-    exists solely to gate the short-run fallback. `comparable` alone was
-    not enough, and the hole was not theoretical: a 15-season series whose
-    SVT candidate happens to list only two available episodes has
-    `comparable == 2`, which bypassed the floor of 3 entirely and wrote on
-    two agreeing episodes -- the *exact* coincidence that floor exists to
-    refuse. Worse, a wrong candidate with a genuinely short run has a
-    small denominator by construction, so the weak path was preferentially
-    available to the wrong answer while the correct 8-episode programme
-    had to clear 3.
+    `dated` counts Sonarr's own episodes that carry an air date at all,
+    and it exists solely to gate the short-run fallback. `comparable`
+    alone was not enough, and the hole was not theoretical: a 15-season
+    series whose SVT candidate happens to list only two available episodes
+    has `comparable == 2`, which bypassed the floor of 3 entirely and
+    wrote on two agreeing episodes -- the *exact* coincidence that floor
+    exists to refuse. Worse, a wrong candidate with a genuinely short run
+    has a small denominator by construction, so the weak path was
+    preferentially available to the wrong answer while the correct
+    8-episode programme had to clear 3.
+
+    `dated`, and not "how many have aired by today", because **a safety
+    gate must not consult the wall clock**. A clock running behind
+    under-counts what has aired and drops a long-running series back into
+    the weak branch -- reopening exactly the hole above. Measured on the
+    earlier `today`-based version: correct clock refused the case, a clock
+    one year behind *wrote* it. A container that starts before NTP settles
+    is an ordinary event, and the consequence here is a permanent wrong
+    filename.
+
+    Counting dated episodes instead is clock-free and, because
+    `dated >= aired` for every possible clock, **strictly tighter**: there
+    is no case this writes that the `today` version refused. What it costs
+    is that a brand-new season Sonarr has already scheduled in full has
+    eight dated episodes from the day it is announced, so it does not
+    reach the fallback and is auto-mapped once its third episode publishes
+    rather than its second. A genuinely short series -- a two-part
+    documentary, which can never reach three -- still does, and that is
+    the case the fallback exists for: "never" is the problem it solves,
+    not "one week later".
 
     `error` is set when the evidence could not be gathered (SVT's episode
     list was unreachable). That is doubt, not zero, and it is why
@@ -277,7 +322,7 @@ class Evidence:
 
     matched: int = 0
     comparable: int = 0
-    aired: int = 0
+    dated: int = 0
     error: str | None = None
 
     @property
@@ -300,7 +345,7 @@ class Evidence:
         # candidate happened to list only a couple of episodes.
         if (
             self.comparable >= ACCEPT_MIN_EPISODES
-            or self.aired >= ACCEPT_MIN_EPISODES
+            or self.dated >= ACCEPT_MIN_EPISODES
         ):
             return self.matched >= ACCEPT_MIN_EPISODES
         # The short run, and only a genuinely short run: a series that has
@@ -332,13 +377,13 @@ class Evidence:
         note = f"{self.matched} of {self.comparable} episode{plural} matched"
         if self.corroborates:
             return note
-        if self.aired >= ACCEPT_MIN_EPISODES:
+        if self.dated >= ACCEPT_MIN_EPISODES:
             # Naming Sonarr's side matters here: "1 of 2 matched, at least
             # 3 are needed" reads as a contradiction until you know the
-            # threshold comes from the series having aired 120 episodes.
+            # threshold comes from Sonarr listing 120 dated episodes.
             return (
-                f"{note}; this series has aired {self.aired} episodes, so at "
-                f"least {ACCEPT_MIN_EPISODES} must match"
+                f"{note}; Sonarr lists {self.dated} dated episodes for this "
+                f"series, so at least {ACCEPT_MIN_EPISODES} must match"
             )
         if self.comparable >= ACCEPT_MIN_EPISODES:
             return f"{note}; at least {ACCEPT_MIN_EPISODES} are needed"
@@ -386,7 +431,6 @@ def corroborate(
     svt_episodes: list[SvtEpisode],
     *,
     tolerance_days: int,
-    today: date | None = None,
 ) -> Evidence:
     """Count how far this SVT programme's episodes agree with this series'.
 
@@ -400,13 +444,12 @@ def corroborate(
     evidence for a programme it says nothing about; `Resolver._recent_for`
     excludes it for the same reason one level down.
 
-    `today` is injectable for tests and defaults to the real date, as
-    `Resolver.recent` does. It is used for one thing only -- counting how
-    many of Sonarr's episodes have actually aired, which gates the
-    short-run fallback -- and never for matching, so what an episode
-    *matches* stays independent of when the sweep happens to run.
+    Deliberately reads no clock. Every number it returns is a function of
+    the two episode lists alone, so the same inputs decide the same way
+    whenever the sweep runs and on whatever machine -- see `Evidence` for
+    why a wall-clock reading in here was a safety hole rather than a
+    detail.
     """
-    today = today or date.today()
     dated = [
         se
         for se in sonarr_episodes or ()
@@ -414,12 +457,6 @@ def corroborate(
         and se.season > 0
         and se.air_date is not None
     ]
-    # Deliberately "has aired", not "has a date". A brand-new series whose
-    # whole season is already scheduled has eight dated episodes and two
-    # aired ones, and it is the second number that says whether there is
-    # enough history for the strict floor to be fair -- which is exactly
-    # the case the short-run fallback exists for.
-    aired = sum(1 for se in dated if se.air_date <= today)
     listed = [
         e
         for e in svt_episodes or ()
@@ -456,7 +493,7 @@ def corroborate(
     matched = sum(1 for count in partners.values() if count == 1)
 
     return Evidence(
-        matched=matched, comparable=comparable, aired=aired
+        matched=matched, comparable=comparable, dated=len(dated)
     )
 
 
@@ -687,12 +724,15 @@ def _queries_for(title: str, alternates: list, limit: int) -> tuple[str, ...]:
 
     Deduplicated on the Sonarr-side normal form, so `Solsidan` and
     `Solsidan (2019)` cost one search rather than two, and the many
-    alternates that repeat a title verbatim cost nothing. Scene release
-    forms (`Gift.vid.forsta.ogonkastet`) are dropped rather than searched
-    for -- SVT's search is a title search and will not match one, so
-    spending a query on it costs the useful alternate below it its turn.
-    Capped, because a show can carry a dozen alternates and each one is a
-    request.
+    alternates that repeat a title verbatim cost nothing. Alternates that
+    are unambiguously scene release names (`Solsidan.S15`,
+    `Solsidan.2019.1080p.WEB`) are dropped rather than searched for -- SVT's
+    search is a title search and will not match one, so spending a query on
+    it costs the useful alternate below it its turn. Capped, because a show
+    can carry a dozen alternates and each one is a request.
+
+    "Unambiguously" is doing real work in that sentence: see `_is_scene_name`
+    for why a dotted form on its own is not enough to go on.
 
     Sonarr's own title is never filtered, only its alternates: if that is
     somehow a dotted form, it is still the best thing we have to ask for.
@@ -703,7 +743,7 @@ def _queries_for(title: str, alternates: list, limit: int) -> tuple[str, ...]:
         text = str(raw or "").strip()
         if not text:
             continue
-        if index and _SCENE_NAME.match(text):
+        if index and _is_scene_name(text):
             continue
         key = normalise_sonarr_title(text)
         if not key or key in seen:
