@@ -4073,6 +4073,39 @@ def test_hitting_the_request_budget_is_said_out_loud(tmp_path: Path, monkeypatch
     assert "Not checked this run" in r.text
 
 
+def test_a_series_cut_off_mid_check_still_shows_what_was_learned(
+    tmp_path: Path, monkeypatch
+):
+    # The run corroborated the first candidate and stopped before the
+    # second. Nothing is written -- an unchecked rival is not a refuted one
+    # -- but discarding the evidence it did gather would make the next run
+    # and the operator both start from nothing.
+    import svtplay_arr.api.config_ui as config_ui
+
+    svt = SweepSvt(
+        {OTHER: [
+            SvtSearchHit("vvm123", OTHER, "TvSeries"),
+            SvtSearchHit("vvm456", OTHER + " repris", "TvSeries"),
+        ]},
+        episodes_by_slug={
+            derive_slug(OTHER): _svt_run(),
+            derive_slug(OTHER + " repris"): _svt_run(),
+        },
+    )
+    sonarr = FakeSonarr([{"id": 9, "tvdbId": 999, "title": OTHER}],
+                        episodes={9: _sonarr_run(9)})
+    client, maps = _sweep_client(tmp_path, svt, sonarr)
+    monkeypatch.setattr(config_ui, "_SWEEP_REQUEST_BUDGET", 2)
+    monkeypatch.setattr(config_ui, "_SWEEP_CONCURRENCY", 1)
+
+    r = _discover(client, maps)
+
+    assert MappingTable.load(maps).for_tvdb(999) is None
+    assert "Not checked this run" in r.text
+    assert "8 of 8 episodes matched" in r.text     # the one it did read
+    assert "not checked" in r.text                 # and the one it did not
+
+
 def test_the_budget_warning_is_absent_when_the_budget_was_not_reached(
     tmp_path: Path
 ):

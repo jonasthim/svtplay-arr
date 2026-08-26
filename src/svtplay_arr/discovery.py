@@ -815,9 +815,11 @@ async def sweep_for_mappings(
 
         Search and corroboration are one coroutine per series rather than
         two batched phases, so the run's budget is spent series by series
-        in Sonarr's own order. When it runs out, what is left unfinished is
-        a suffix of the library -- which is what makes "run it again to
-        continue" true rather than a hope.
+        rather than exhausted on searches before a single candidate is
+        checked. With `concurrency` series in flight the exact cut-off
+        point is not strictly Sonarr's order, but what is left unfinished
+        is the tail of the library either way -- which is what makes "run
+        it again to continue" true rather than a hope.
         """
         hits: list = []
         failures: list[str] = []
@@ -984,15 +986,24 @@ def _decide(found: _Evaluated, claimed: dict) -> ConfidentMatch | Proposal:
     """
     target = found.target
 
+    # Candidates the run actually spent a request on, followed by the ones
+    # it ranked below the limit or never reached. Both are shown; only the
+    # first group is evidence, and each candidate says which it is.
+    checked = list(found.checked)
+    checked_ids = {c.svt_id for c in checked}
+    shown = tuple(checked) + tuple(
+        c for c in found.candidates if c.svt_id not in checked_ids
+    )
+
     if found.ran_out_of_budget:
         return _proposal(
             target, "budget_exhausted",
             (
                 "The run's SVT request budget ran out before this series "
-                "could be checked, so nothing is known about it. Run Find "
-                "mappings again to continue."
+                "could be checked all the way through, so it was not "
+                "written. Run Find mappings again to continue."
             ),
-            found.candidates,
+            shown,
         )
 
     if not found.candidates:
@@ -1032,15 +1043,6 @@ def _decide(found: _Evaluated, claimed: dict) -> ConfidentMatch | Proposal:
             ),
             found.candidates,
         )
-
-    # Candidates the run actually spent a request on, followed by the ones
-    # it ranked below the limit. Both are shown; only the first group is
-    # evidence, and each candidate says which it is.
-    checked = list(found.checked)
-    checked_ids = {c.svt_id for c in checked}
-    shown = tuple(checked) + tuple(
-        c for c in found.candidates if c.svt_id not in checked_ids
-    )
 
     if any(c.evidence is not None and c.evidence.error for c in checked):
         return _proposal(

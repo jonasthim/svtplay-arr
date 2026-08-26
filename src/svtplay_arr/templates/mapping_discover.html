@@ -259,6 +259,20 @@ nothing.</p>
     <div class="sweep-item">
       <p class="sweep-title">{{ p.series_title }}
         <span class="help">tvdbId {{ p.tvdb_id }}</span></p>
+      {# Whatever the run did manage to learn before it stopped, rather
+         than discarding it: a series cut off between two candidates has
+         real evidence for the first one, and hiding it would make the
+         next run start from nothing. #}
+      {% for c in p.candidates %}
+      <form method="post" action="/config/mappings" class="accept-form">
+        <input type="hidden" name="expected_mtime" value="{{ mappings_mtime }}">
+        <input type="hidden" name="q" value="{{ p.series_title }}">
+        <input type="hidden" name="svt" value="{{ c.svt_id }}|{{ c.slug }}">
+        <input type="hidden" name="sonarr" value="{{ p.tvdb_id }}">
+        <button type="submit">Use {{ c.name }}</button>
+        <span class="help">{{ c.svt_id }} / {{ c.slug }} &mdash; {{ c.note() }}</span>
+      </form>
+      {% endfor %}
     </div>
   {% endfor %}
   </div>
