@@ -24,10 +24,17 @@ the rule is the same rule.
      surfaced, never resolved by picking the first. This is `Resolver`'s
      `if len(candidates) != 1: return None`, verbatim in spirit.
 
-Normalisation (`normalise_title`) casefolds, collapses whitespace, and
-strips a trailing parenthesised year -- Sonarr's library titles carry
-TVDB's disambiguating year (`Solsidan (2019)`) where SVT's do not. It
-deliberately does **not** strip diacritics. Swedish titles are
+Normalisation is **asymmetric, and that is load-bearing**.
+`normalise_title` -- casefold and collapse whitespace, applied to both
+sides -- is all that either side shares. `normalise_sonarr_title` adds
+stripping one trailing parenthesised year, and is applied to the Sonarr
+title *only*, because carrying TVDB's disambiguating year (`Solsidan
+(2019)`) is a fact about Sonarr's data, not a statement that a year in a
+title is noise. Stripping it from SVT's name too made `Big Brother (2019)`
+and `Big Brother (2020)` compare equal -- collapsing the very distinction
+the year exists to express.
+
+Neither form strips diacritics. Swedish titles are
 distinguished by å/ä/ö, and folding them together would manufacture exact
 matches between genuinely different titles: the precise error this module
 exists to prevent. `derive_slug` in `svt/client.py` does fold them, and
@@ -38,6 +45,12 @@ not a decision to write a file.
 A Sonarr series whose TVDB title differs from SVT's Swedish title will not
 auto-match. That is the intended outcome, not a gap: it becomes a
 suggestion with one-click candidates.
+
+One check the gate structurally cannot make lives in `sweep_for_mappings`:
+two *different* Sonarr series can each match one SVT programme (an
+original and its year-tagged reboot both matching SVT's single untagged
+listing). Uniqueness in the gate is evaluated per Sonarr series, so only
+the code that sees the whole batch can catch it -- see `already_claimed`.
 """
 
 import asyncio
@@ -74,15 +87,60 @@ _CAP = 200
 _TRAILING_YEAR = re.compile(r"\s*\(\d{4}\)\s*$")
 
 
-def normalise_title(title: str) -> str:
-    """The comparison form of a series title. See the module docstring.
+def normalise_title(name: str) -> str:
+    """The comparison form applied to **both** sides. See the module docstring.
 
-    Casefold, collapse whitespace, strip one trailing parenthesised year.
+    Casefold and collapse whitespace. Nothing else: every further step
+    widens what compares equal, and widening is what writes wrong rows.
+
     Diacritics are preserved deliberately -- see the module docstring for
-    why folding them would be a bug and not a convenience.
+    why folding them would be a bug and not a convenience. A trailing
+    parenthesised year is preserved too, which is `normalise_sonarr_title`'s
+    entire subject.
     """
-    text = _TRAILING_YEAR.sub("", str(title or "").strip())
-    return " ".join(text.casefold().split())
+    return " ".join(str(name or "").strip().casefold().split())
+
+
+def normalise_sonarr_title(title: str) -> str:
+    """`normalise_title`, plus stripping one trailing parenthesised year.
+
+    Applied to the **Sonarr** side only, and that asymmetry is the whole
+    point. Sonarr's library titles carry TVDB's disambiguating year
+    (`Solsidan (2019)`) where SVT's programme names do not, so stripping it
+    is a fact about *Sonarr's* data -- not a general statement that a year
+    in a title is noise.
+
+    Stripping it from SVT's name as well is a bug, and was one: it made
+    `Big Brother (2019)` and `Big Brother (2020)` compare equal, collapsing
+    the very distinction TVDB adds the year to express. Two visibly
+    different titles must never compare equal here; the cost of believing
+    they are the same is a permanently wrong filename for every episode of
+    that show.
+
+    Note what this does *not* fix on its own: two Sonarr series differing
+    only by year both normalise to the same form here, so both can match a
+    single SVT programme. That is caught in `sweep_for_mappings`, where the
+    whole batch is visible -- see `already_claimed`.
+    """
+    return normalise_title(_TRAILING_YEAR.sub("", str(title or "").strip()))
+
+
+def _qualifies(hit: object) -> bool:
+    """Is this search hit a programme this module could ever map to?
+
+    The one filter, shared by `confident_match` and `_series_candidates`.
+    They had a copy each and the copies disagreed: the candidate list
+    refused a blank `svt_id`/`name` and the gate did not, so a malformed
+    hit could become a confident row and then make `add_mappings` refuse
+    the *entire* batch over it. Two filters that must agree are one
+    function, not two that happen to match today.
+    """
+    return (
+        isinstance(hit, SvtSearchHit)
+        and hit.typename in _SERIES_TYPENAMES
+        and bool(hit.svt_id)
+        and bool(hit.name)
+    )
 
 
 @dataclass(frozen=True)
@@ -134,6 +192,10 @@ class Proposal:
       `candidates` is empty; the operator needs the manual search.
     * `search_failed` -- the SVT search itself errored. Says nothing about
       whether a match exists; `reason` carries the failure.
+    * `already_claimed` -- the gate matched, but that SVT programme is
+      already mapped to another series (in the file, or earlier in this
+      same batch). `candidates` holds the one match, so a human can still
+      accept it deliberately.
     """
 
     tvdb_id: int
@@ -183,6 +245,10 @@ class Sweep:
     def search_failed(self) -> tuple[Proposal, ...]:
         return self._with("search_failed")
 
+    @property
+    def already_claimed(self) -> tuple[Proposal, ...]:
+        return self._with("already_claimed")
+
 
 def confident_match(
     series_title: str, hits: list[SvtSearchHit]
@@ -201,16 +267,16 @@ def confident_match(
     side: an empty normalised form would otherwise match any other empty
     one.
     """
-    wanted = normalise_title(series_title)
+    wanted = normalise_sonarr_title(series_title)
     if not wanted:
         return None
 
     qualifying: dict[str, SvtSearchHit] = {}
     for hit in hits or []:
-        if not isinstance(hit, SvtSearchHit):
+        if not _qualifies(hit):
             continue
-        if hit.typename not in _SERIES_TYPENAMES:
-            continue
+        # SVT's name goes through the *shared* form, never the Sonarr one:
+        # a year in an SVT programme name is part of the name.
         if normalise_title(hit.name) != wanted:
             continue
         qualifying.setdefault(hit.svt_id, hit)
@@ -229,11 +295,7 @@ def _series_candidates(hits: list[SvtSearchHit]) -> tuple[Candidate, ...]:
     """
     seen: dict[str, Candidate] = {}
     for hit in hits or []:
-        if not isinstance(hit, SvtSearchHit):
-            continue
-        if hit.typename not in _SERIES_TYPENAMES:
-            continue
-        if not hit.svt_id or not hit.name:
+        if not _qualifies(hit):
             continue
         seen.setdefault(hit.svt_id, Candidate.of(hit))
     return tuple(seen.values())
@@ -282,7 +344,7 @@ async def sweep_for_mappings(
     sonarr,
     svt,
     *,
-    mapped_tvdb_ids: set,
+    existing_mappings,
     concurrency: int = _CONCURRENCY,
     cap: int = _CAP,
 ) -> Sweep:
@@ -298,9 +360,20 @@ async def sweep_for_mappings(
     half-learned. A failure from one SVT search does not -- it becomes that
     series' `search_failed` proposal, because one unreachable search is no
     reason to discard every other result in the run.
+
+    `existing_mappings` is the current table (an iterable of
+    `models.Mapping`). Deliberately one argument rather than a set of tvdb
+    ids beside a set of SVT ids: both facts are derived from it here, so a
+    caller cannot supply one and forget the other. That is the shape of
+    defect this codebase keeps hitting, and the two checks it feeds -- skip
+    what is mapped, refuse to claim a programme twice -- are both
+    load-bearing.
     """
+    existing = list(existing_mappings or ())
     series = await sonarr.all_series()
-    targets, already_mapped, skipped = _targets(series, set(mapped_tvdb_ids or ()))
+    targets, already_mapped, skipped = _targets(
+        series, {m.tvdb_id for m in existing}
+    )
 
     searchable = targets[: max(cap, 0)]
     not_searched = len(targets) - len(searchable)
@@ -313,6 +386,20 @@ async def sweep_for_mappings(
 
     confident: list[ConfidentMatch] = []
     proposals: list[Proposal] = []
+    # Which SVT programme is spoken for, and by which series. Seeded from
+    # the file and extended as this batch fills up, so a collision is
+    # caught whether the rival row is already on disk or three results
+    # further down this same run.
+    #
+    # The gate cannot do this: uniqueness there is evaluated per Sonarr
+    # series, over SVT's answer for that one title, so it structurally
+    # cannot see a second series matching the same programme. Two tvdb ids
+    # on one slug means Sonarr asking for the reboot's S01E01 is answered
+    # with an episode of the original -- permanently, because
+    # renameEpisodes=False.
+    claimed: dict[str, str] = {
+        m.svt_series_id: m.series_title for m in existing if m.svt_series_id
+    }
     gate = asyncio.Semaphore(max(concurrency, 1))
 
     async def search(target: _Target):
@@ -338,7 +425,26 @@ async def sweep_for_mappings(
             continue
 
         best = confident_match(target.title, result)
+        if best is not None and best.svt_id in claimed:
+            # Surfaced, not written, and not refused outright either: a
+            # human may legitimately decide this is the row they want (the
+            # resolver tolerates two mappings sharing a slug), and the
+            # manual create route lets them say so.
+            proposals.append(Proposal(
+                tvdb_id=target.tvdb_id,
+                series_title=target.title,
+                outcome="already_claimed",
+                reason=(
+                    f"SVT programme {best.name!r} is already mapped to "
+                    f"{claimed[best.svt_id]!r}. Two series pointing at one "
+                    "SVT programme would answer a search for either with "
+                    "episodes of the same show, so this was not written."
+                ),
+                candidates=(Candidate.of(best),),
+            ))
+            continue
         if best is not None:
+            claimed[best.svt_id] = target.title
             confident.append(ConfidentMatch(
                 tvdb_id=target.tvdb_id,
                 # Sonarr's spelling, never SVT's. This is the permanent
@@ -445,6 +551,7 @@ def format_report(sweep: Sweep) -> str:
         f"{len(sweep.confident)} confident match(es) printed above; "
         f"{len(sweep.needs_decision)} need a decision, "
         f"{len(sweep.no_match)} had no SVT match, "
+        f"{len(sweep.already_claimed)} matched a programme already mapped, "
         f"{len(sweep.search_failed)} could not be searched. "
         f"{sweep.already_mapped} series were already mapped and not searched.",
     ]
@@ -470,6 +577,11 @@ def format_report(sweep: Sweep) -> str:
         lines.append(
             f"\nNO SVT MATCH      {proposal.series_title} "
             f"(tvdbId {proposal.tvdb_id})"
+        )
+    for proposal in sweep.already_claimed:
+        lines.append(
+            f"\nALREADY CLAIMED   {proposal.series_title} "
+            f"(tvdbId {proposal.tvdb_id})\n  {proposal.reason}"
         )
     for proposal in sweep.search_failed:
         lines.append(
@@ -510,9 +622,9 @@ def main() -> None:
     # A mappings file that will not parse is not a reason to re-search the
     # whole library, so it stops the run rather than being read as empty.
     try:
-        mapped = {m.tvdb_id for m in MappingTable.load(settings.mappings_file).all()}
+        existing = MappingTable.load(settings.mappings_file).all()
     except FileNotFoundError:
-        mapped = set()
+        existing = []
     except ValueError as exc:
         print(f"{settings.mappings_file} is invalid: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
@@ -522,7 +634,7 @@ def main() -> None:
             return await sweep_for_mappings(
                 SonarrClient(settings.sonarr_url, settings.sonarr_api_key, http),
                 SvtClient(http, settings.svt_ua),
-                mapped_tvdb_ids=mapped,
+                existing_mappings=existing,
             )
 
     sweep = asyncio.run(run())

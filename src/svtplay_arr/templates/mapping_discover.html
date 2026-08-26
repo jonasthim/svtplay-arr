@@ -14,6 +14,9 @@
       <li><strong>{{ written | length }}</strong> mapped automatically</li>
       <li><strong>{{ sweep.needs_decision | length }}</strong> need a decision</li>
       <li><strong>{{ sweep.no_match | length }}</strong> with no SVT match</li>
+      {% if sweep.already_claimed %}
+      <li><strong>{{ sweep.already_claimed | length }}</strong> already claimed</li>
+      {% endif %}
       {% if sweep.search_failed %}
       <li><strong>{{ sweep.search_failed | length }}</strong> could not be searched</li>
       {% endif %}
@@ -110,6 +113,37 @@ from SVT.</p>
         <input type="hidden" name="svt" value="{{ c.svt_id }}|{{ c.slug }}">
         <input type="hidden" name="sonarr" value="{{ p.tvdb_id }}">
         <button type="submit">Use {{ c.name }}</button>
+        <span class="help">{{ c.svt_id }} / {{ c.slug }}</span>
+      </form>
+      {% endfor %}
+    </div>
+  {% endfor %}
+  </div>
+</section>
+{% endif %}
+
+{% if sweep.already_claimed %}
+<h2>Already claimed by another series</h2>
+<p class="help">These matched an SVT programme that another series is already
+mapped to. Two mappings pointing at one SVT programme answer a search for
+either with episodes of the same show &mdash; and with Sonarr's renaming off
+that is permanent &mdash; so nothing was written. Usually one of the two
+Sonarr series is the one you actually want mapped: remove the other mapping
+first, or accept this deliberately below.</p>
+<section class="panel">
+  <div class="panel-inner">
+  {% for p in sweep.already_claimed %}
+    <div class="sweep-item">
+      <p class="sweep-title">{{ p.series_title }}
+        <span class="help">tvdbId {{ p.tvdb_id }}</span></p>
+      <p class="warn">{{ p.reason }}</p>
+      {% for c in p.candidates %}
+      <form method="post" action="/config/mappings" class="accept-form">
+        <input type="hidden" name="expected_mtime" value="{{ mappings_mtime }}">
+        <input type="hidden" name="q" value="{{ p.series_title }}">
+        <input type="hidden" name="svt" value="{{ c.svt_id }}|{{ c.slug }}">
+        <input type="hidden" name="sonarr" value="{{ p.tvdb_id }}">
+        <button type="submit">Map it here anyway</button>
         <span class="help">{{ c.svt_id }} / {{ c.slug }}</span>
       </form>
       {% endfor %}

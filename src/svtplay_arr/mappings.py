@@ -225,18 +225,28 @@ def add_mappings(
     `series_title`, and an optional `source` (see `models.SOURCE_AUTO`).
     `source` is written only when it is not the default, so a hand-confirmed
     row stays byte-identical to what this writer has always produced.
+
+    One rule applies to `source: auto` rows and not to confirmed ones: an
+    unconfirmed row may not claim an `svt_series_id` another row already
+    points at. See where that is enforced below for why the asymmetry is
+    deliberate.
     """
     prepared: list[dict] = []
     seen: dict[int, str] = {}
+    claimed_in_batch: dict[str, str] = {}
 
     rows = _rows(path)
     existing: dict[int, str] = {}
+    claimed: dict[str, str] = {}
     for row in rows:
         if not isinstance(row, dict):
             continue
         row_id = _coerce_tvdb_id(row.get("tvdb_id"))
         if row_id is not None:
             existing.setdefault(row_id, str(row.get("series_title")))
+        svt_id = row.get("svt_series_id")
+        if isinstance(svt_id, str) and svt_id:
+            claimed.setdefault(svt_id, str(row.get("series_title")))
 
     for new_row in new_rows:
         tvdb_id = _coerce_tvdb_id(new_row.get("tvdb_id"))
@@ -271,6 +281,30 @@ def add_mappings(
         # Only a non-default provenance is recorded. See models.SOURCE_AUTO.
         if isinstance(source, str) and source.strip() not in ("", SOURCE_MANUAL):
             prepared_row["source"] = source.strip()
+
+        # An *unconfirmed* row may not claim an SVT programme some other
+        # series already points at. Two mappings on one programme answer a
+        # search for either with episodes of the same show, and with
+        # renameEpisodes=False that is permanent -- too large a
+        # consequence to rest on a title comparison alone.
+        #
+        # Scoped to auto rows on purpose. The resolver tolerates two
+        # mappings sharing a slug (it dedupes by GUID), and a human who
+        # deliberately maps two TVDB ids to one programme has looked at
+        # it; taking that away would be a regression on the manual path
+        # for a hazard that only exists when nobody looked. `discovery`
+        # surfaces the collision before it ever reaches here, so this is
+        # the net under that, not the thing operators meet.
+        if prepared_row.get("source") == SOURCE_AUTO:
+            svt_id = values["svt_series_id"]
+            holder = claimed.get(svt_id) or claimed_in_batch.get(svt_id)
+            if holder is not None:
+                raise MappingError(
+                    f"SVT series {svt_id!r} is already mapped to {holder!r}; "
+                    "an automatically matched row may not claim it too"
+                )
+            claimed_in_batch[svt_id] = values["series_title"]
+
         prepared.append(prepared_row)
 
     if not prepared:

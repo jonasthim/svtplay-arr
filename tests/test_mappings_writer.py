@@ -408,3 +408,61 @@ def test_a_non_numeric_tvdb_id_is_refused_rather_than_written(tmp_path: Path):
     with pytest.raises(MappingError):
         add_mappings(p, [_rows(tvdb_id="not a number")], expected_mtime=None)
     assert not p.exists()
+
+
+# --- One SVT programme, one unconfirmed row ---
+#
+# Two mappings pointing at one SVT programme answer a search for either
+# with episodes of the same show, permanently. `discovery` surfaces that
+# before it reaches the writer; this is the net under it, and it is
+# scoped to rows nobody confirmed.
+
+
+def test_an_auto_row_may_not_claim_a_programme_already_mapped(tmp_path: Path):
+    p = tmp_path / "mappings.yaml"
+    _add(p)  # svt_series_id jpmQD3q, by hand
+    before = p.read_text(encoding="utf-8")
+    _, mtime = read_with_mtime(p)
+
+    with pytest.raises(MappingError) as exc:
+        add_mappings(p, [_rows(
+            tvdb_id=999, svt_series_id="jpmQD3q", source=SOURCE_AUTO,
+        )], expected_mtime=mtime)
+
+    assert "jpmQD3q" in str(exc.value) and TITLE in str(exc.value)
+    assert p.read_text(encoding="utf-8") == before
+
+
+def test_two_auto_rows_may_not_claim_one_programme_within_a_batch(tmp_path: Path):
+    p = tmp_path / "mappings.yaml"
+    with pytest.raises(MappingError):
+        add_mappings(p, [
+            _rows(tvdb_id=1, svt_series_id="shared", source=SOURCE_AUTO),
+            _rows(tvdb_id=2, svt_series_id="shared", series_title="Two",
+                  source=SOURCE_AUTO),
+        ], expected_mtime=None)
+    assert not p.exists()
+
+
+def test_a_confirmed_row_may_still_share_a_programme(tmp_path: Path):
+    # Unchanged on the manual path. The resolver tolerates two mappings
+    # sharing a slug, and a human who does this deliberately has looked at
+    # it -- the hazard only exists when nobody did.
+    p = tmp_path / "mappings.yaml"
+    _add(p)
+    _, mtime = read_with_mtime(p)
+    add_mapping(
+        p, tvdb_id=999, svt_series_id="jpmQD3q",
+        svt_slug="gift-vid-forsta-ogonkastet", series_title="Deliberate Twin",
+        expected_mtime=mtime,
+    )
+    assert {m.tvdb_id for m in MappingTable.load(p).all()} == {288649, 999}
+
+
+def test_an_auto_row_may_claim_a_programme_nothing_else_points_at(tmp_path: Path):
+    p = tmp_path / "mappings.yaml"
+    _add(p)
+    _, mtime = read_with_mtime(p)
+    add_mappings(p, [_rows(tvdb_id=999, svt_series_id="fresh", source=SOURCE_AUTO)],
+                 expected_mtime=mtime)
+    assert MappingTable.load(p).for_tvdb(999).source == SOURCE_AUTO

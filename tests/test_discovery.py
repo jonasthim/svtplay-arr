@@ -14,10 +14,11 @@ import pytest
 from svtplay_arr.discovery import (
     Candidate,
     confident_match,
+    normalise_sonarr_title,
     normalise_title,
     sweep_for_mappings,
 )
-from svtplay_arr.models import SvtSearchHit
+from svtplay_arr.models import Mapping, SvtSearchHit
 
 
 def _hit(name, svt_id="abc123", typename="TvSeries"):
@@ -33,13 +34,24 @@ def test_normalisation_casefolds_and_collapses_whitespace():
     )
 
 
-def test_normalisation_strips_a_trailing_parenthesised_year():
-    # Sonarr's library titles routinely carry TVDB's disambiguating year.
-    assert normalise_title("Solsidan (2019)") == "solsidan"
+def test_the_shared_form_never_strips_a_year():
+    # The comparison form applied to BOTH sides keeps the year, because
+    # dropping it from SVT's name is what would make TVDB's disambiguator
+    # meaningless -- see test_the_year_is_stripped_from_sonarr_only.
+    assert normalise_title("Solsidan (2019)") == "solsidan (2019)"
 
 
-def test_normalisation_keeps_a_year_that_is_not_trailing():
-    assert normalise_title("1917 (1917) och sedan") == "1917 (1917) och sedan"
+def test_the_sonarr_form_strips_one_trailing_parenthesised_year():
+    # Sonarr's library titles routinely carry TVDB's disambiguating year;
+    # SVT's programme names do not. Stripping it is a fact about Sonarr's
+    # data, so it is applied to Sonarr's title and only there.
+    assert normalise_sonarr_title("Solsidan (2019)") == "solsidan"
+
+
+def test_the_sonarr_form_keeps_a_year_that_is_not_trailing():
+    assert normalise_sonarr_title("1917 (1917) och sedan") == (
+        "1917 (1917) och sedan"
+    )
 
 
 def test_normalisation_does_not_fold_diacritics():
@@ -189,7 +201,7 @@ async def test_an_exact_unique_match_is_proposed_for_writing():
     sonarr = FakeSonarr([{"id": 1, "tvdbId": 288649, "title": "Solsidan"}])
     svt = FakeSvt({"Solsidan": [_hit("Solsidan", "s1")]})
 
-    sweep = await sweep_for_mappings(sonarr, svt, mapped_tvdb_ids=set())
+    sweep = await sweep_for_mappings(sonarr, svt, existing_mappings=())
 
     assert [m.tvdb_id for m in sweep.confident] == [288649]
     assert sweep.confident[0].svt_series_id == "s1"
@@ -206,7 +218,7 @@ async def test_the_series_title_comes_from_sonarr_not_from_svt():
         "Gift vid första ögonkastet": [_hit("GIFT VID FÖRSTA ÖGONKASTET", "g1")]
     })
 
-    sweep = await sweep_for_mappings(sonarr, svt, mapped_tvdb_ids=set())
+    sweep = await sweep_for_mappings(sonarr, svt, existing_mappings=())
 
     assert sweep.confident[0].series_title == "Gift vid första ögonkastet"
 
@@ -218,7 +230,9 @@ async def test_an_already_mapped_series_is_skipped_without_an_svt_call():
     ])
     svt = FakeSvt({"Vem vet mest?": [_hit("Vem vet mest?", "v1")]})
 
-    sweep = await sweep_for_mappings(sonarr, svt, mapped_tvdb_ids={288649})
+    sweep = await sweep_for_mappings(
+        sonarr, svt, existing_mappings=[_mapping(288649)]
+    )
 
     assert svt.queries == ["Vem vet mest?"]
     assert sweep.already_mapped == 1
@@ -228,7 +242,7 @@ async def test_several_candidates_are_surfaced_never_written():
     sonarr = FakeSonarr([{"id": 1, "tvdbId": 7, "title": "Solsidan"}])
     svt = FakeSvt({"Solsidan": [_hit("Solsidan", "s1"), _hit("solsidan", "s2")]})
 
-    sweep = await sweep_for_mappings(sonarr, svt, mapped_tvdb_ids=set())
+    sweep = await sweep_for_mappings(sonarr, svt, existing_mappings=())
 
     assert sweep.confident == ()
     (p,) = sweep.needs_decision
@@ -243,7 +257,7 @@ async def test_a_near_miss_is_surfaced_never_written():
     sonarr = FakeSonarr([{"id": 1, "tvdbId": 7, "title": "Vem vet mest?"}])
     svt = FakeSvt({"Vem vet mest?": [_hit("Vem vet mest? Junior", "j1")]})
 
-    sweep = await sweep_for_mappings(sonarr, svt, mapped_tvdb_ids=set())
+    sweep = await sweep_for_mappings(sonarr, svt, existing_mappings=())
 
     assert sweep.confident == ()
     (p,) = sweep.needs_decision
@@ -254,7 +268,7 @@ async def test_no_svt_hits_is_reported_not_written():
     sonarr = FakeSonarr([{"id": 1, "tvdbId": 7, "title": "Nonexistent Show"}])
     svt = FakeSvt({})
 
-    sweep = await sweep_for_mappings(sonarr, svt, mapped_tvdb_ids=set())
+    sweep = await sweep_for_mappings(sonarr, svt, existing_mappings=())
 
     assert sweep.confident == ()
     assert sweep.needs_decision == ()
@@ -269,7 +283,7 @@ async def test_one_failed_svt_search_does_not_abort_the_sweep():
     ])
     svt = FakeSvt({"Solsidan": [_hit("Solsidan", "s1")]}, error_for={"Broken"})
 
-    sweep = await sweep_for_mappings(sonarr, svt, mapped_tvdb_ids=set())
+    sweep = await sweep_for_mappings(sonarr, svt, existing_mappings=())
 
     assert [m.tvdb_id for m in sweep.confident] == [8]
     (p,) = sweep.search_failed
@@ -282,7 +296,7 @@ async def test_a_sonarr_outage_is_raised_before_anything_is_proposed():
     svt = FakeSvt({})
 
     with pytest.raises(RuntimeError):
-        await sweep_for_mappings(sonarr, svt, mapped_tvdb_ids=set())
+        await sweep_for_mappings(sonarr, svt, existing_mappings=())
 
     assert svt.queries == []
 
@@ -292,7 +306,7 @@ async def test_malformed_sonarr_records_are_skipped_without_an_svt_call():
                          {"id": 2, "tvdbId": 5, "title": ""}])
     svt = FakeSvt({})
 
-    sweep = await sweep_for_mappings(sonarr, svt, mapped_tvdb_ids=set())
+    sweep = await sweep_for_mappings(sonarr, svt, existing_mappings=())
 
     assert svt.queries == []
     assert sweep.confident == () and sweep.proposals == ()
@@ -304,7 +318,7 @@ async def test_the_search_cap_is_reported_rather_than_silently_truncating():
     ])
     svt = FakeSvt({})
 
-    sweep = await sweep_for_mappings(sonarr, svt, mapped_tvdb_ids=set(), cap=4)
+    sweep = await sweep_for_mappings(sonarr, svt, existing_mappings=(), cap=4)
 
     assert len(svt.queries) == 4
     assert sweep.searched == 4
@@ -316,7 +330,7 @@ async def test_the_search_cap_is_reported_rather_than_silently_truncating():
 async def test_an_unreached_cap_is_not_reported_as_capped():
     sonarr = FakeSonarr([{"id": 1, "tvdbId": 7, "title": "Solsidan"}])
     sweep = await sweep_for_mappings(
-        sonarr, FakeSvt({}), mapped_tvdb_ids=set(), cap=4
+        sonarr, FakeSvt({}), existing_mappings=(), cap=4
     )
     assert sweep.capped is False and sweep.not_searched == 0
 
@@ -329,7 +343,7 @@ async def test_concurrency_is_bounded():
     ])
     svt = FakeSvt({}, delay=0.005)
 
-    await sweep_for_mappings(sonarr, svt, mapped_tvdb_ids=set(), concurrency=3)
+    await sweep_for_mappings(sonarr, svt, existing_mappings=(), concurrency=3)
 
     assert svt.peak_in_flight <= 3
     assert len(svt.queries) == 20
@@ -345,7 +359,7 @@ async def test_the_sweep_never_asks_svt_for_an_episode_list():
     sonarr = FakeSonarr([{"id": 1, "tvdbId": 7, "title": "Solsidan"}])
     svt = EpisodeListIsForbidden({"Solsidan": [_hit("Solsidan", "s1")]})
 
-    sweep = await sweep_for_mappings(sonarr, svt, mapped_tvdb_ids=set())
+    sweep = await sweep_for_mappings(sonarr, svt, existing_mappings=())
 
     assert len(sweep.confident) == 1
 
@@ -363,9 +377,16 @@ def test_candidate_is_hashable_and_carries_what_a_write_needs():
 # writes nothing at all.
 
 
+def _mapping(tvdb_id, svt_series_id="claimed", series_title="Already Mapped"):
+    return Mapping(
+        tvdb_id=tvdb_id, svt_series_id=svt_series_id,
+        svt_slug="slug", series_title=series_title,
+    )
+
+
 async def _sweep(series, results, **kwargs):
     return await sweep_for_mappings(
-        FakeSonarr(series), FakeSvt(results), mapped_tvdb_ids=set(), **kwargs
+        FakeSonarr(series), FakeSvt(results), existing_mappings=(), **kwargs
     )
 
 
@@ -436,7 +457,7 @@ async def test_the_cli_report_names_a_failed_search_separately_from_no_match():
 
     sonarr = FakeSonarr([{"id": 1, "tvdbId": 7, "title": "Broken"}])
     svt = FakeSvt({}, error_for={"Broken"})
-    sweep = await sweep_for_mappings(sonarr, svt, mapped_tvdb_ids=set())
+    sweep = await sweep_for_mappings(sonarr, svt, existing_mappings=())
 
     report = format_report(sweep)
     # "SVT had nothing for this" and "SVT could not be asked" are different
@@ -491,3 +512,142 @@ def test_the_sweep_cannot_reach_the_matching_or_download_path():
         "svtplay_arr.naming",
     }
     assert not (imported & forbidden)
+
+
+# --- C1: the year is TVDB's disambiguator, not noise -----------------
+#
+# `_TRAILING_YEAR` was applied to both sides, which made the gate's
+# exact-equality collapse the very distinction TVDB adds the year to
+# express. Two visibly different titles compared equal, and the cost of
+# believing that lands as a permanent filename.
+
+
+def test_a_year_tagged_svt_name_is_not_a_match():
+    # Sonarr "Big Brother (2019)" against a sole SVT hit "Big Brother
+    # (2020)". These are different runs. Stripping the year from SVT's
+    # name too made this an exact match and wrote it.
+    assert confident_match("Big Brother (2019)", [
+        _hit("Big Brother (2020)", "bb2020"),
+    ]) is None
+
+
+def test_the_year_is_stripped_from_sonarr_only():
+    # The reverse direction, which is what makes the rule one-sided
+    # rather than merely narrower: SVT naming a programme with a year
+    # Sonarr does not carry is a difference, not a formatting quirk.
+    assert confident_match("Solsidan", [_hit("Solsidan (2019)", "s1")]) is None
+    # ...while the direction the rule exists for still matches.
+    assert confident_match("Solsidan (2019)", [_hit("Solsidan", "s1")]) is not None
+
+
+async def test_two_sonarr_series_differing_only_by_year_write_at_most_one_row():
+    # TVDB's actual convention: the original untagged, the reboot
+    # year-tagged. Both normalise to the same Sonarr-side form, so both
+    # match the single SVT programme -- and writing both would point two
+    # tvdb ids at one slug, so Sonarr's request for the reboot's S01E01
+    # would be answered with an episode of the original, permanently.
+    sweep = await _sweep(
+        [
+            {"id": 1, "tvdbId": 100, "title": "Vem vet mest?"},
+            {"id": 2, "tvdbId": 200, "title": "Vem vet mest? (2021)"},
+        ],
+        {
+            "Vem vet mest?": [_hit("Vem vet mest?", "vvm")],
+            "Vem vet mest? (2021)": [_hit("Vem vet mest?", "vvm")],
+        },
+    )
+
+    assert len(sweep.confident) <= 1
+    assert len({m.svt_series_id for m in sweep.confident}) == len(sweep.confident)
+
+
+# --- I2: one SVT programme, one mapping ------------------------------
+#
+# The gate evaluates uniqueness per Sonarr series, so it structurally
+# cannot see two series both matching one programme. That check belongs
+# where the batch is known.
+
+
+async def test_a_second_series_claiming_one_programme_is_surfaced_not_written():
+    sweep = await _sweep(
+        [
+            {"id": 1, "tvdbId": 100, "title": "Vem vet mest?"},
+            {"id": 2, "tvdbId": 200, "title": "Vem vet mest? (2021)"},
+        ],
+        {
+            "Vem vet mest?": [_hit("Vem vet mest?", "vvm")],
+            "Vem vet mest? (2021)": [_hit("Vem vet mest?", "vvm")],
+        },
+    )
+
+    assert [m.tvdb_id for m in sweep.confident] == [100]
+    (p,) = sweep.already_claimed
+    assert p.tvdb_id == 200
+    # Names the series it collides with, so the operator can tell which of
+    # the two is the one they actually want mapped.
+    assert "Vem vet mest?" in p.reason
+    # Still one click away, because a human may legitimately decide this
+    # is the row they want -- the writer permits it once confirmed.
+    assert [c.svt_id for c in p.candidates] == ["vvm"]
+
+
+async def test_a_programme_already_mapped_by_hand_is_not_claimed_again():
+    # The reported scenario: "Big Brother (2019)" mapped by hand, and a
+    # sweep later finds "Big Brother (2020)" matching the same SVT
+    # programme (SVT names it without a year, so the Sonarr-side strip
+    # makes it an exact match).
+    sonarr = FakeSonarr([{"id": 2, "tvdbId": 200, "title": "Big Brother (2020)"}])
+    svt = FakeSvt({"Big Brother (2020)": [_hit("Big Brother", "bb")]})
+
+    sweep = await sweep_for_mappings(
+        sonarr, svt,
+        existing_mappings=[_mapping(100, "bb", "Big Brother (2019)")],
+    )
+
+    assert sweep.confident == ()
+    (p,) = sweep.already_claimed
+    assert "Big Brother (2019)" in p.reason
+
+
+async def test_the_first_series_in_sonarrs_order_keeps_the_programme():
+    # Deterministic, so re-running the sweep cannot flip which of two
+    # series gets the row.
+    for _ in range(3):
+        sweep = await _sweep(
+            [
+                {"id": 1, "tvdbId": 100, "title": "Solsidan"},
+                {"id": 2, "tvdbId": 200, "title": "Solsidan (2019)"},
+            ],
+            {
+                "Solsidan": [_hit("Solsidan", "s1")],
+                "Solsidan (2019)": [_hit("Solsidan", "s1")],
+            },
+        )
+        assert [m.tvdb_id for m in sweep.confident] == [100]
+
+
+# --- M5: the two filters must agree ----------------------------------
+
+
+def test_a_blank_svt_id_is_never_confident():
+    # `_series_candidates` already refused this; `confident_match` did
+    # not, so a blank id could become a confident row and then make
+    # add_mappings refuse the entire batch over one malformed hit.
+    assert confident_match("Solsidan", [_hit("Solsidan", "")]) is None
+
+
+def test_the_gate_and_the_candidate_list_agree_on_what_qualifies():
+    # Two filters that should agree, pinned as agreeing. A hit either
+    # qualifies for both or for neither; anything else means one of them
+    # is quietly looser than the other.
+    from svtplay_arr.discovery import _series_candidates
+
+    for hit in (
+        _hit("Solsidan", "s1"),                            # fine
+        _hit("Solsidan", ""),                              # blank id
+        _hit("", "s1"),                                    # blank name
+        _hit("Solsidan", "s1", typename="Episode"),        # wrong type
+    ):
+        gated = confident_match("Solsidan", [hit]) is not None
+        listed = bool(_series_candidates([hit]))
+        assert gated == listed, f"{hit} qualifies for one filter but not the other"

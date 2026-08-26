@@ -987,7 +987,7 @@ def build_config_router(
             return _index(request, error=mtime_error)
 
         try:
-            mapped = {m.tvdb_id for m in MappingTable.load(mappings_path).all()}
+            existing = MappingTable.load(mappings_path).all()
         except Exception as exc:
             log.warning(
                 "mappings file %s is invalid; refusing to sweep over it",
@@ -1004,7 +1004,12 @@ def build_config_router(
         try:
             sweep = await sweep_for_mappings(
                 sonarr, svt,
-                mapped_tvdb_ids=mapped,
+                # The whole table, not a set of tvdb ids: the sweep
+                # derives both "already mapped, do not search" and
+                # "already claims that SVT programme" from it, and a
+                # caller must not be able to supply one and forget the
+                # other.
+                existing_mappings=existing,
                 concurrency=_SWEEP_CONCURRENCY,
                 cap=_SWEEP_CAP,
             )

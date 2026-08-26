@@ -3751,6 +3751,12 @@ def test_a_concurrent_modification_refuses_the_whole_batch(tmp_path: Path):
     assert r.status_code == 200
     assert _error_text(r.text)
     assert maps.read_text(encoding="utf-8") == before
+    # "the worst lie this page could tell": the write was refused, so the
+    # page must not report the batch as mapped. Mutating `written = ()` to
+    # `written = sweep.confident` left every other test green.
+    assert "Mapped automatically" not in r.text
+    assert "Found, but not saved" in r.text
+    assert OTHER in r.text          # still shown, still one click away
 
 
 def test_the_sweep_never_asks_svt_for_an_episode_list(tmp_path: Path):
@@ -3808,7 +3814,27 @@ def test_hitting_the_search_cap_is_said_out_loud(tmp_path: Path, monkeypatch):
     r = _discover(client, maps)
 
     assert len(svt.queries) == 2
-    assert "4" in r.text and "not searched" in r.text.lower()
+    # The old assertions here matched anything: "4" is in the inline
+    # stylesheet (14rem, .45rem) and "not searched" is in the summary line
+    # that renders on every sweep ("0 already mapped, not searched"), so
+    # deleting the warning outright left the suite green. Assert on the
+    # warning banner itself, and on the words only it says.
+    warning = re.search(r'<p class="warn">(.*?)</p>', r.text, re.S)
+    assert warning, f"no cap warning banner in:\n{r.text}"
+    said = " ".join(warning.group(1).split())
+    assert "per-run limit of 2" in said
+    assert "4 unmapped series were" in said
+    assert "Run Find mappings again" in said
+
+
+def test_the_cap_warning_is_absent_when_the_cap_was_not_reached(tmp_path: Path):
+    svt = SweepSvt({})
+    sonarr = FakeSonarr([{"id": 9, "tvdbId": 999, "title": OTHER}])
+    client, maps = _sweep_client(tmp_path, svt, sonarr)
+
+    r = _discover(client, maps)
+
+    assert "per-run limit" not in r.text
 
 
 def test_a_hand_accepted_suggestion_is_not_marked_auto(tmp_path: Path):
@@ -3886,12 +3912,22 @@ def test_only_what_the_gate_approved_is_written_alongside_it(tmp_path: Path):
     ])
     client, maps = _sweep_client(tmp_path, svt, sonarr)
 
-    _discover(client, maps)
+    r = _discover(client, maps)
 
     table = MappingTable.load(maps)
     assert table.for_tvdb(888) is not None    # the gate approved this one
     assert table.for_tvdb(999) is None        # and refused this one
     assert {m.tvdb_id for m in table.all()} == {288649, 888}
+    # Second, independent assertion: neither ambiguous candidate's id may
+    # appear in the file at all, however the row got there. One test
+    # standing between a loosened route and a wrong permanent filename is
+    # thin cover for the consequence.
+    written = maps.read_text(encoding="utf-8")
+    assert "a1" not in written and "a2" not in written
+    # ...and the page must not describe the refused one as mapped either.
+    mapped_section = r.text.split("<h2>Needs a decision</h2>")[0]
+    assert "Confident Show" in mapped_section
+    assert OTHER not in mapped_section
 
 
 # --- Provenance in the mappings table --------------------------------
@@ -4030,3 +4066,59 @@ def test_a_swept_row_shows_its_marker_on_the_very_next_page_load(tmp_path: Path)
     assert _BADGE in _series_cell(body, OTHER)
     # The fixture row was added by hand and must not have been relabelled.
     assert _BADGE not in _series_cell(body, TITLE)
+
+
+# --- C1/I2 through the real route ------------------------------------
+
+
+def test_two_sonarr_series_differing_only_by_year_write_one_row(tmp_path: Path):
+    # The reported end-to-end failure. Both Sonarr titles normalise to the
+    # same Sonarr-side form and both matched the one SVT programme, so both
+    # rows were written and marked auto. Sonarr then asked for the reboot's
+    # S01E01, the resolver followed the slug to the original show, and the
+    # file landed permanently under the reboot's name.
+    hits = [SvtSearchHit("vvm", "Vem vet mest?", "TvSeries")]
+    svt = SweepSvt({"Vem vet mest?": hits, "Vem vet mest? (2021)": hits})
+    sonarr = FakeSonarr([
+        {"id": 1, "tvdbId": 100, "title": "Vem vet mest?"},
+        {"id": 2, "tvdbId": 200, "title": "Vem vet mest? (2021)"},
+    ])
+    client, maps = _sweep_client(tmp_path, svt, sonarr)
+
+    r = _discover(client, maps)
+
+    written = [m for m in MappingTable.load(maps).all() if m.svt_series_id == "vvm"]
+    assert len(written) == 1
+    assert written[0].tvdb_id == 100
+    # And the one that lost is surfaced, not silently dropped.
+    assert "Already claimed" in r.text
+
+
+def test_a_year_tagged_svt_name_is_not_written(tmp_path: Path):
+    # Sonarr "Big Brother (2019)" against a sole SVT hit "Big Brother
+    # (2020)". Different runs, visibly different titles.
+    svt = SweepSvt({
+        "Big Brother (2019)": [SvtSearchHit("bb2020", "Big Brother (2020)", "TvSeries")]
+    })
+    sonarr = FakeSonarr([{"id": 1, "tvdbId": 100, "title": "Big Brother (2019)"}])
+    client, maps = _sweep_client(tmp_path, svt, sonarr)
+
+    r = _discover(client, maps)
+
+    assert MappingTable.load(maps).for_tvdb(100) is None
+    assert "Big Brother (2020)" in r.text     # offered, for a human to judge
+
+
+def test_a_sweep_will_not_claim_a_programme_mapped_by_hand(tmp_path: Path):
+    # The fixture row maps tvdb 288649 to svt jpmQD3q by hand. A sweep that
+    # matches the same programme for a different series must not append a
+    # second row to it.
+    svt = SweepSvt({OTHER: [SvtSearchHit("jpmQD3q", OTHER, "TvSeries")]})
+    sonarr = FakeSonarr([{"id": 9, "tvdbId": 999, "title": OTHER}])
+    client, maps = _sweep_client(tmp_path, svt, sonarr)
+
+    r = _discover(client, maps)
+
+    assert MappingTable.load(maps).for_tvdb(999) is None
+    assert "Already claimed" in r.text
+    assert TITLE in r.text                    # names who holds it
