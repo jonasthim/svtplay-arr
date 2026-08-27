@@ -244,13 +244,24 @@ resolver then refuses.
 
 ## The configuration page
 
-The service serves its own configuration page at `/config`. It opens on
-**Status** — the answer to "is it working" — with **Mappings** and
-**Settings** a click away in the nav bar. Mappings manages the mapping table
-(search SVT, pick a show, pick the matching Sonarr series, confirm);
-Settings edits the settings file. Mapping changes apply immediately; setting
-changes need a restart, and the page says so with a banner naming exactly
-which settings are pending.
+The service serves its own configuration page at `/config`, with four views
+behind a nav bar:
+
+- **Status** — the answer to "is it working": the worker, the mapping
+  table, the filesystem, the SVT check, and the most recent downloads. This
+  is what `/config` opens on.
+- **Mappings** — the mapping table (search SVT, pick a show, pick the
+  matching Sonarr series, confirm), plus *Find mappings*, which works out
+  what it can from your Sonarr library on its own. Each row shows what the
+  background SVT check last made of it, so a mapping that has stopped
+  resolving is visible on arrival.
+- **Activity** — what is downloading and what recently finished, with the
+  recorded reason beside anything that failed. This is where "why didn't
+  that episode arrive?" gets answered without an SSH session.
+- **Settings** — the settings file.
+
+Mapping changes apply immediately; setting changes need a restart, and the
+page says so with a banner naming exactly which settings are pending.
 
 **The page has no authentication of its own,** and it can rewrite the
 service's configuration and delete mappings. It expects to sit on a trusted

@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import os
+import sqlite3
 import time
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -1171,3 +1172,127 @@ def test_the_mappings_view_never_calls_svt_to_render_that_state(
         c.get("/config")
 
     assert seen == []
+
+
+def _set_created_at(tmp_path: Path, nzo_id: str, when: str) -> None:
+    """Backdate a job, bypassing JobStore.
+
+    The schema's own default is `datetime('now')`, i.e. UTC at *second*
+    resolution -- so several jobs created in one test land on the same
+    timestamp and `ORDER BY created_at` has nothing to order them by. Any
+    test about ordering has to set the column itself or it is asserting on
+    whatever sqlite happened to return.
+    """
+    conn = sqlite3.connect(tmp_path / "jobs.db")
+    conn.execute("UPDATE jobs SET created_at = ? WHERE nzo_id = ?", (when, nzo_id))
+    conn.commit()
+    conn.close()
+
+
+def _finished(store, tmp_path: Path, stem: str, day: int, fail: str | None = None):
+    job = store.create("svt", stem, "WEBDL-1080p", 1)
+    if fail is None:
+        store.complete(job.nzo_id, "/tmp/x.mkv")
+    else:
+        store.fail(job.nzo_id, fail)
+    _set_created_at(tmp_path, job.nzo_id, f"2026-08-{day:02d} 10:00:00")
+    return job
+
+
+def test_the_activity_view_lists_the_newest_finished_job_first(tmp_path: Path):
+    # The store returns rows oldest first, which is what Sonarr's queue
+    # wants and the opposite of what a human reading a log wants. Dropping
+    # the reversal leaves a page that looks perfectly plausible and is in
+    # the wrong order.
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as c:
+        store = app.state.job_store
+        _finished(store, tmp_path, "Oldest - S01E01", 10)
+        _finished(store, tmp_path, "Middle - S01E02", 15)
+        _finished(store, tmp_path, "Newest - S01E03", 20)
+
+        body = c.get("/config/activity").text
+
+    assert body.index("Newest - S01E03") < body.index("Middle - S01E02")
+    assert body.index("Middle - S01E02") < body.index("Oldest - S01E01")
+
+
+def test_todays_failure_is_not_pushed_off_the_page_by_older_successes(
+    tmp_path: Path,
+):
+    # The concrete scenario the ordering exists for: a library that has
+    # been running a while has more finished jobs than one page shows. If
+    # the oldest survive the cut, today's failed grab is off the page
+    # entirely -- on the one view whose stated purpose is "why didn't that
+    # episode arrive?".
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as c:
+        store = app.state.job_store
+        for i in range(60):
+            _finished(store, tmp_path, f"Old {i:02d} - S01E01", 10)
+        _finished(store, tmp_path, "Missing - S02E04", 26,
+                  fail="svtplay-dl exited 1: no streams found")
+
+        body = c.get("/config/activity").text
+
+    assert "Missing - S02E04" in body
+    assert "svtplay-dl exited 1: no streams found" in body
+
+
+def test_the_activity_view_is_bounded_however_long_the_history_is(
+    tmp_path: Path,
+):
+    # Sonarr deletes history entries as it imports, so a healthy install
+    # stays well under this. A broken one will not, and the cap is what
+    # keeps one page render bounded.
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as c:
+        store = app.state.job_store
+        for i in range(60):
+            _finished(store, tmp_path, f"Episode {i:02d}", 10 + (i % 20))
+
+        body = c.get("/config/activity").text
+
+    assert body.count('<li class="job">') == 50, (
+        "the finished-job list is not bounded at the documented limit"
+    )
+
+
+def test_health_does_not_read_the_store_on_the_event_loop(tmp_path: Path):
+    # The same argument the config page's status strip makes, and it
+    # applies here at least as strongly: /health is polled on a schedule
+    # by a monitor rather than loaded by hand, and it reads the same
+    # JobStore -- one sqlite3.Connection behind a blocking lock -- that
+    # the download worker writes job progress through. Reading it inline
+    # from an async route stalls the loop the worker runs on for as long
+    # as the worker holds that lock.
+    #
+    # Asked of asyncio rather than of thread identity: inside an
+    # asyncio.to_thread worker there is no running loop, and there is
+    # nowhere else this could be called from where that is true.
+    where = []
+
+    def _all_active(self):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            where.append("off the loop")
+        else:
+            where.append("on the loop")
+        return []
+
+    with TestClient(create_app(_settings(tmp_path))) as c:
+        # Patched after startup so the worker's own use of the store is
+        # not what this observes.
+        from svtplay_arr.store import JobStore
+
+        original = JobStore.all_active
+        JobStore.all_active = _all_active
+        try:
+            resp = c.get("/health")
+        finally:
+            JobStore.all_active = original
+
+    assert resp.status_code == 200
+    assert where, "/health never read the store"
+    assert set(where) == {"off the loop"}, where

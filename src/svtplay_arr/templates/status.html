@@ -76,7 +76,27 @@
   <p><strong>{{ mappings | length }}</strong>
     series {{ 'is' if mappings | length == 1 else 'are' }} offered to
     Sonarr.</p>
-  {% if failing %}
+  {% if mapping_states_unavailable %}
+  {#- An empty `failing` has two causes and only one of them is good news.
+      When the check's own state could not be read there is nothing to
+      count, and the bare line above then reads as "and none of them are
+      broken" -- while the Mappings view, one click away, says the state
+      could not be read for every row. Two surfaces, one fact, disagreeing
+      is the defect this page is built to avoid, and a flag that is passed
+      in and never branched on is that defect already written, waiting for
+      the next edit to expose it.
+
+      No branch for `mapping_states` being None without this flag: nothing
+      was asked there, because that deployment has no canary wired in at
+      all -- the strip above is absent for the same reason, so nothing on
+      the page claims anything about SVT either way. Not being told is
+      different from being told the answer is unavailable. #}
+  <p class="warn">The background SVT check's state could not be read, so
+    nothing here can say whether any of these mappings have stopped
+    resolving. This is not a statement that they are all fine. Check
+    svtplay-arr's log, and use <strong>Check</strong> under
+    <a href="/config/mappings">Mappings</a> to test a row now.</p>
+  {% elif failing %}
   <p class="warn"><strong>{{ failing | length }} of them</strong>
     {{ 'is' if failing | length == 1 else 'are' }} not resolving on SVT:
     {% for f in failing %}{{ f.series_title }}{{ ', ' if not loop.last }}{% endfor %}.

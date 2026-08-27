@@ -140,11 +140,13 @@ def _error_text(html: str) -> str:
     return m.group(1)
 
 
-def _client(tmp_path: Path, svt=None, sonarr=None) -> TestClient:
+def _client(tmp_path: Path, svt=None, sonarr=None, **providers) -> TestClient:
     cfg, maps = _paths(tmp_path)
     app = FastAPI()
     app.include_router(
-        build_config_router(cfg, maps, svt or FakeSvt(), sonarr or FakeSonarr())
+        build_config_router(
+            cfg, maps, svt or FakeSvt(), sonarr or FakeSonarr(), **providers
+        )
     )
     return TestClient(app)
 
@@ -1639,6 +1641,27 @@ def test_deleting_with_a_corrupted_expected_mtime_is_refused(tmp_path: Path):
     assert MappingTable.load(maps).for_tvdb(288649) is not None
 
 
+def test_deleting_with_a_stale_expected_mtime_is_refused(tmp_path: Path):
+    # The sibling of the corrupted-token test above, and the one write
+    # route that never had it: a *well-formed but out-of-date* token means
+    # the file changed under the operator between the render and the
+    # click, and the delete must be refused rather than applied to a table
+    # they were not looking at. Mutating `expected_mtime=expected` to
+    # `None` in the delete route left every other test green.
+    cfg, maps = _paths(tmp_path)
+    stale = maps.stat().st_mtime - 60
+    app = FastAPI()
+    app.include_router(build_config_router(cfg, maps, FakeSvt(), FakeSonarr()))
+
+    r = TestClient(app).post(
+        "/config/mappings/288649/delete", data={"expected_mtime": str(stale)}
+    )
+
+    assert r.status_code == 200
+    assert "changed since this form was opened" in _error_text(r.text)
+    assert MappingTable.load(maps).for_tvdb(288649) is not None
+
+
 def test_creating_strips_whitespace_from_the_radio_encoded_svt_value(
     tmp_path: Path
 ):
@@ -3129,6 +3152,86 @@ def test_the_mapping_cells_label_themselves_for_the_stacked_layout(
         assert label in headers, (
             f"cell label {label!r} matches no column heading {headers}"
         )
+
+
+# ---- The new views on a phone -----------------------------------------
+#
+# The mappings table needs the narrow media query because a table cannot
+# stack on its own, and `test_the_narrow_layout_targets_elements_the_page
+# _actually_renders` walks every selector inside it. The nav bar and the
+# Activity list deliberately contribute nothing to that query -- they are
+# built out of wrapping flex rows and a plain list, which need no
+# breakpoint at all -- and the cost of that choice is that nothing above
+# was asserting they survive a phone either. Each declaration below was
+# removable with the whole suite green.
+
+
+def test_the_nav_wraps_instead_of_overflowing_a_narrow_viewport(
+    tmp_path: Path,
+):
+    # Four links in a non-wrapping flex row push the last one off the
+    # side of a phone, where there is no horizontal scroll to reach it --
+    # and the last one is Settings. A wrapping row costs a second line
+    # instead.
+    decls = _declarations(_wide_stylesheet(), ".nav-inner")
+
+    assert "flex-wrap: wrap" in decls, decls
+    # ...and the class is genuinely what the nav renders, so this cannot
+    # pass by styling something that no longer exists.
+    assert 'class="nav-inner"' in _client(tmp_path).get("/config").text
+
+
+def test_a_job_stem_wraps_rather_than_widening_the_page(tmp_path: Path):
+    # A filename stem is one unbroken 60-character token -- series, season,
+    # episode, quality -- with no space to break at. Without this it sets
+    # the width of the whole page on a phone and every other view scrolls
+    # sideways with it.
+    decls = _declarations(_wide_stylesheet(), ".job-stem")
+
+    assert "overflow-wrap: anywhere" in decls, decls
+
+
+def test_a_job_error_wraps_too(tmp_path: Path):
+    # Same reasoning, and it matters more here: a failure message can
+    # carry a URL or a slug with no break opportunity in it, and this is
+    # the line the operator opened the page to read.
+    decls = _declarations(_wide_stylesheet(), ".job-why")
+
+    assert "overflow-wrap: anywhere" in decls, decls
+
+
+def test_a_jobs_meta_row_wraps_instead_of_squeezing(tmp_path: Path):
+    # State, quality, size, progress and timestamp on one line is more
+    # than a phone fits; without wrapping they compress into a column of
+    # single characters.
+    decls = _declarations(_wide_stylesheet(), ".job-meta")
+
+    assert "flex-wrap: wrap" in decls, decls
+
+
+def test_the_activity_view_renders_nothing_that_needs_a_breakpoint(
+    tmp_path: Path,
+):
+    # Why Activity contributes no rules to the narrow media query: it is a
+    # list, not a table, so there is nothing to stack. If it ever grows a
+    # table it needs the same stacking treatment the mappings table has,
+    # and this is what will say so.
+    body = _client(
+        tmp_path,
+        activity_provider=lambda: {
+            "active": [],
+            "history": [{
+                "nzo_id": "SVTPLAY-1", "stem": "Show - S01E01 - WEBDL-1080p",
+                "quality": "WEBDL-1080p", "status": "Failed",
+                "size_bytes": 1, "downloaded_bytes": 0,
+                "storage_path": None, "fail_message": "boom",
+                "created_at": "2026-08-27 10:00:00",
+            }],
+        },
+    ).get("/config/activity").text
+
+    assert '<ul class="jobs">' in body
+    assert "<table" not in body
 
 
 # ---- Page structure ---------------------------------------------------

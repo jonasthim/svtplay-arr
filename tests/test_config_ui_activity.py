@@ -330,3 +330,22 @@ def test_the_status_view_puts_a_failure_in_front_of_a_success(tmp_path: Path):
 
     assert "Broken - S01E01" in body
     assert "svtplay-dl exited 1" in body
+
+
+# --- The Status summary's own None-in-None-out invariant ---------------
+
+
+def test_recent_jobs_passes_an_unreadable_store_through_as_unreadable():
+    # `_recent_jobs` is the Status view's bounded summary, and its
+    # docstring promises None in, None out. Returning [] instead is
+    # currently harmless only because status.html gates on `activity`
+    # first -- which makes it a trap armed for whoever edits that gate.
+    # The distinction is the same one the whole view turns on, so it is
+    # pinned where it is made rather than where it happens to be caught.
+    from svtplay_arr.api.config_ui import _recent_jobs
+
+    assert _recent_jobs(None) is None
+    assert _recent_jobs("not a store read") is None
+    # ...and a store that answered with nothing is an empty list, which is
+    # a different thing entirely.
+    assert _recent_jobs({"active": [], "history": []}) == []

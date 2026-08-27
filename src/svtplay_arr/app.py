@@ -407,7 +407,18 @@ def create_app(settings: Settings) -> FastAPI:
 
     @app.get("/health")
     async def health():
-        return compute_health()
+        # `to_thread`, for the reason the config page's status strip gives
+        # at length: `compute_health` reads `store.all_active()`, and this
+        # route is a coroutine, so calling it inline runs a blocking sqlite
+        # read on the event loop -- the loop the download worker runs on,
+        # behind the very lock the worker takes to write job progress. The
+        # argument is stronger here than on the page: this endpoint is
+        # polled on a schedule by a monitor rather than loaded by hand.
+        #
+        # The response is unchanged, which is the contract that matters:
+        # `compute_health` still produces it, and nothing about its shape
+        # or its values depends on which thread ran it.
+        return await asyncio.to_thread(compute_health)
 
     return app
 

@@ -1,7 +1,8 @@
 """The configuration page.
 
-Four server-rendered views behind a nav bar -- Status, Mappings and
-Settings, listed in `VIEWS` -- with Status served from `/config` itself.
+Four server-rendered views behind a nav bar -- Status, Mappings, Activity
+and Settings, listed in `VIEWS` -- with Status served from `/config`
+itself.
 That URL is documented, deployed, and the published SSO resource points at
 it; the restructure changed which view answers there, never whether one
 does. There is no client-side routing and no build step: every link is an

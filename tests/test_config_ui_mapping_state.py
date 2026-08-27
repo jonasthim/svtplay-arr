@@ -429,3 +429,73 @@ def test_a_state_row_without_the_age_fields_still_renders(tmp_path: Path):
 
     assert r.status_code == 200
     assert "unknown length of time" in _text(_row(r.text))
+
+
+# --- The Status view must not read an unreadable check as "all fine" ---
+
+
+def test_the_status_view_says_the_check_state_could_not_be_read(
+    tmp_path: Path,
+):
+    # The Status view counts failing rows out of the canary's per-mapping
+    # state. When that read *failed* there are no rows to count, and a bare
+    # "2 series are offered to Sonarr" then reads as "and none of them are
+    # broken" -- while /config/mappings, one click away, says the state
+    # could not be read for every row. Two surfaces, one fact, disagreeing
+    # is what the rest of this page is built to avoid.
+    def _boom():
+        raise RuntimeError("the canary is on fire")
+
+    cfg, maps = _paths(tmp_path)
+    app = FastAPI()
+    app.include_router(
+        build_config_router(
+            cfg, maps, FakeSvt(), FakeSonarr(), mapping_state_provider=_boom
+        )
+    )
+    r = TestClient(app).get("/config")
+    body = _text(r.text)
+
+    assert r.status_code == 200
+    assert "could not be read" in body
+
+
+def test_the_status_view_hedges_the_same_way_the_mappings_view_does(
+    tmp_path: Path,
+):
+    # ...and it is the *same* fact, so the two pages have to agree about
+    # it. Asserted from both ends rather than pinning one page's wording,
+    # because the defect this replaces was precisely a disagreement.
+    def _boom():
+        raise RuntimeError("the canary is on fire")
+
+    cfg, maps = _paths(tmp_path)
+    app = FastAPI()
+    app.include_router(
+        build_config_router(
+            cfg, maps, FakeSvt(), FakeSonarr(), mapping_state_provider=_boom
+        )
+    )
+    client = TestClient(app)
+
+    assert "could not be read" in _text(client.get("/config").text)
+    assert "could not be read" in _text(client.get("/config/mappings").text)
+
+
+def test_the_status_view_does_not_hedge_when_the_state_reads_fine(
+    tmp_path: Path,
+):
+    # The other half: a canary that answered and found nothing wrong must
+    # not be hedged over, or the hedge stops meaning anything.
+    body = _text(_client(tmp_path, states=[_state(ok=True)]).get("/config").text)
+
+    assert "could not be read" not in body
+
+
+def test_no_state_provider_is_not_reported_as_a_failed_read(tmp_path: Path):
+    # Nothing was asked, which is not the same as something that could not
+    # be answered -- and in a deployment with no state provider there is no
+    # canary at all, so the page makes no claim about SVT anywhere on it.
+    body = _text(_client(tmp_path, states=None).get("/config").text)
+
+    assert "could not be read" not in body
