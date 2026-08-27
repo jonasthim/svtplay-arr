@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% import "_age.html" as age with context %}
 {% block content %}
 <h2>Mappings</h2>
 {# What svtplay-arr offers to Sonarr: one row per series, tying Sonarr's
@@ -42,6 +43,10 @@
      The canary collected this on its own slow loop; rendering it costs no
      SVT request, and the Check button below is still the only thing on
      this page that calls SVT. #}
+  {# `.get` for the age fields below, not attribute access: this is a
+     provider's dict, and a row that predates the ages must degrade to
+     "an unknown length of time" rather than raise into a 500 on the one
+     page an operator opens when something is already wrong. #}
   {% set state = (mapping_states or {}).get(m.tvdb_id) %}
   <tr class="mapping-row" data-filter-text="{{ filter_text }}">
     {# Provenance sits beside the title rather than in a column of its
@@ -84,13 +89,19 @@
       <span class="status-chip notice">Resolves</span>
       <span class="help">{{ state.episode_count if state.episode_count is not none else '?' }}
         episode{{ '' if state.episode_count == 1 else 's' }}
-        {%- if state.last_checked %}, {{ state.last_checked }}{% endif %}</span>
+        {%- if state.last_checked %}, checked
+        {{ age.ago(state.get('last_checked_age_s'), instant=state.last_checked) }}{% endif %}</span>
       {%- else %}
       <span class="status-chip error">Failing</span>
-      <span class="help">{% if state.last_error %}{{ state.last_error }}{% else %}The
+      <span class="help">{% if state.last_error %}{{ state.last_error }}{#-
+        The canary's error strings do not end in a full stop, and the
+        sentence after this one does; without a separator the two run
+        together as "(404 not found) Last resolved". -#}
+        {{- '' if state.last_error.endswith(('.', '!', '?')) else '.' }}{% else %}The
         background check recorded no reason; use Check for the current
         result.{% endif %}
-        {%- if state.last_success %} Last resolved {{ state.last_success }}.
+        {%- if state.last_success %} Last resolved
+        {{ age.ago(state.get('last_success_age_s'), instant=state.last_success) }}.
         {%- else %} Has not resolved since svtplay-arr started.{% endif %}</span>
       {%- endif %}
     </td>

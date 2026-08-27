@@ -491,6 +491,7 @@
     </div>
   </nav>
   <main class="page">
+  {%- import "_age.html" as age with context %}
   {# The one place these facts are rendered; the dict is /health's own
      response, produced by the single compute_health() call app.py hands
      both /health and this page -- see build_config_router's status_provider
@@ -551,9 +552,8 @@
       SVT: status unavailable
       {%- elif svt.state == 'stale' %}
       SVT: CHECK STALLED &mdash; no check has completed for
-      {{ (svt.last_checked_age_s / 60) | round | int if svt.last_checked_age_s
+      {{ age.ago(svt.last_checked_age_s, plain=true) if svt.last_checked_age_s
          is not none else 'the whole time this service has been up' }}
-      {{- ' min' if svt.last_checked_age_s is not none }}
       {%- elif svt.state == 'svt' %}
       SVT: FAILING &mdash; none of {{ checked }} mapping{{ '' if checked == 1 else 's' }}
       resolved
@@ -568,7 +568,7 @@
       SVT: ok &mdash; {{ checked }} mapping{{ '' if checked == 1 else 's' }},
       {{ svt.episodes_seen }} episodes
       {%- if svt.last_success_age_s is not none %},
-      confirmed {{ (svt.last_success_age_s / 60) | round | int }} min ago
+      confirmed {{ age.ago(svt.last_success_age_s) }}
       {%- endif %}
       {%- endif %}
     </span>
@@ -607,7 +607,7 @@
     parser, not at any one show &mdash; nothing will be grabbed until it is
     fixed.
     {%- if svt.last_success_age_s is not none %}
-    SVT last worked {{ (svt.last_success_age_s / 60) | round | int }} minutes ago.
+    SVT last worked {{ age.ago(svt.last_success_age_s) }}.
     {%- else %}
     SVT has not been confirmed working since this service started.
     {%- endif %}

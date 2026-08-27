@@ -604,3 +604,83 @@ def test_unavailable_status_is_degraded_and_not_ok():
     assert s["degraded"] is True
     assert s["needs_attention"] is True
     assert s["last_checked"] is None
+
+
+# --- Ages, computed here and nowhere else ------------------------------
+
+
+async def test_per_mapping_reports_ages_beside_its_instants():
+    # "When did this last work" is a question in the present tense. An ISO
+    # instant answers it only after the reader holds the current time in
+    # their head, works out the timezone and subtracts -- every glance at
+    # the table. The instants stay for precision; the ages are what gets
+    # rendered.
+    clock = Clock()
+    svt = FakeSvt(results={"show-1": _episodes(2)})
+    c = _canary([_mapping(1)], svt, clock=clock)
+    await c.run_once()
+
+    (row,) = c.per_mapping()
+    assert row["last_checked_age_s"] == 0.0
+    assert row["last_success_age_s"] == 0.0
+
+    clock.advance(3600)
+    (row,) = c.per_mapping()
+    assert row["last_checked_age_s"] == 3600.0
+    assert row["last_success_age_s"] == 3600.0
+    # ...and the instants are still there for the cases that want them.
+    assert row["last_checked"] == _T0.isoformat()
+
+
+async def test_a_never_checked_mapping_has_no_age_rather_than_a_zero():
+    # Zero would render as "just now", which is the reassuring reading of
+    # a row nothing is known about -- the same collapse `ok` is tri-state
+    # to avoid.
+    c = _canary([_mapping(1)], FakeSvt())
+
+    (row,) = c.per_mapping()
+    assert row["last_checked_age_s"] is None
+    assert row["last_success_age_s"] is None
+
+
+async def test_the_per_mapping_age_agrees_with_the_status_ages():
+    # The mappings table and the status strip sit one click apart and
+    # describe overlapping moments. Both ages come from `_age_s` off the
+    # same clock, so they cannot drift; two separate computations would.
+    clock = Clock()
+    svt = FakeSvt(results={"show-1": _episodes(2)})
+    c = _canary([_mapping(1)], svt, clock=clock)
+    await c.run_once()
+    clock.advance(1234)
+
+    (row,) = c.per_mapping()
+    status = c.status()
+
+    assert row["last_success_age_s"] == status["last_success_age_s"] == 1234.0
+    assert row["last_checked_age_s"] == status["last_checked_age_s"] == 1234.0
+
+
+async def test_an_error_carries_an_age_too():
+    clock = Clock()
+    svt = FakeSvt(default=SvtApiError("gone", status_code=404))
+    c = _canary([_mapping(1)], svt, clock=clock)
+    await c.run_once()
+    clock.advance(60)
+
+    (row,) = c.per_mapping()
+    assert row["last_error_age_s"] == 60.0
+    assert row["last_error_at"] == _T0.isoformat()
+
+
+async def test_a_clock_step_backwards_never_produces_a_negative_age():
+    # Rendered, a negative age reads as "-3 minutes ago". Clamped in
+    # `_age_s`, which is the one place ages are computed -- so this holds
+    # for the per-mapping rows without a second guard.
+    clock = Clock()
+    svt = FakeSvt(results={"show-1": _episodes(1)})
+    c = _canary([_mapping(1)], svt, clock=clock)
+    await c.run_once()
+    clock.advance(-600)
+
+    (row,) = c.per_mapping()
+    assert row["last_checked_age_s"] == 0.0

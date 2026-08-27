@@ -582,7 +582,14 @@ POST /config/mappings/discover          sweep Sonarr for unmapped series
 
 **Mappings** carries each row's own SVT check state, read off
 `SvtCanary.per_mapping()` — when it was last checked, when it last
-succeeded, how many episodes were seen, and the last error. A dead mapping
+succeeded, how many episodes were seen, and the last error. Timestamps
+render as ages ("checked 20 min ago"), not as instants: the question is
+asked in the present tense, and an ISO string makes the reader do timezone
+arithmetic to answer it. The canary computes every age in seconds with the
+same `_age_s` that `status()` uses, and `templates/_age.html` turns one
+into a phrase in exactly one place — so the strip and the table, one click
+apart, cannot describe the same moment differently. The exact instant hangs
+off a `title`. A dead mapping
 is therefore visible on arrival rather than something you go looking for
 with the Check button, and Check becomes a re-check. Rendering it costs no
 SVT request: the canary collected it on its own slow loop, and Check

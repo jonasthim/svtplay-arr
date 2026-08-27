@@ -1,0 +1,46 @@
+{# How long ago something happened, in words.
+
+   The one place this page decides what an age looks like. The status
+   strip and the mappings table both ask a question in the present tense
+   -- "when did we last confirm SVT works", "when did this row last
+   resolve" -- and an ISO instant answers it only after the reader holds
+   the current time in their head, works out the timezone and subtracts.
+   On a phone it also costs the most width of anything in the row.
+
+   One macro rather than the arithmetic repeated at each call site,
+   because the strip and the table sit one click apart: two copies would
+   drift on rounding first and wording second, and a page that says "4
+   hours" in one place and "240 min" in the other about the same moment is
+   worse than either alone. One macro rather than three that call each
+   other, too -- a macro in an imported template cannot see its siblings,
+   so the flags below are what keeps this a single definition.
+
+   The *number* is not computed here. `SvtCanary` produces every age in
+   seconds off its own clock -- `status()` and `per_mapping()` both use
+   `_age_s` -- and this only turns one into a phrase.
+
+   `plain` drops the direction, for a sentence that supplies its own ("no
+   check has completed for ___"). `instant` hangs the exact timestamp off
+   a `title`, for the cases where precision genuinely helps: the age is
+   the answer, the instant is the footnote, and nothing depends on a hover
+   that a phone cannot perform. #}
+{%- macro ago(seconds, plain=false, instant=none) -%}
+{%- if instant %}<span title="{{ instant }}">{% endif -%}
+{%- if seconds is none -%}
+an unknown length of time
+{%- elif seconds < 60 -%}
+{{ 'less than a minute' if plain else 'just now' }}
+{%- else -%}
+{%- if seconds < 5400 -%}
+{{ (seconds / 60) | round | int }} min
+{%- elif seconds < 172800 -%}
+{%- set hours = (seconds / 3600) | round | int -%}
+{{ hours }} hour{{ '' if hours == 1 else 's' }}
+{%- else -%}
+{%- set days = (seconds / 86400) | round | int -%}
+{{ days }} day{{ '' if days == 1 else 's' }}
+{%- endif -%}
+{{- '' if plain else ' ago' -}}
+{%- endif -%}
+{%- if instant %}</span>{% endif -%}
+{%- endmacro -%}

@@ -69,10 +69,13 @@ def _state(**over) -> dict:
         "svt_slug": "gift-vid-forsta-ogonkastet",
         "ok": True,
         "last_checked": "2026-08-26T18:00:00+00:00",
+        "last_checked_age_s": 720.0,
         "last_success": "2026-08-26T18:00:00+00:00",
+        "last_success_age_s": 720.0,
         "episode_count": 12,
         "last_error": None,
         "last_error_at": None,
+        "last_error_age_s": None,
     }
     row.update(over)
     return row
@@ -123,6 +126,7 @@ def test_a_failing_mapping_is_visible_without_pressing_check(tmp_path: Path):
             last_error="SVT has nothing at slug 'gift-vid-forsta-ogonkastet' "
                        "(404 not found) -- the show may have ended",
             episode_count=None,
+            last_success=None, last_success_age_s=None,
         )],
         svt=svt,
     ).get("/config/mappings").text
@@ -179,10 +183,11 @@ def test_a_mapping_that_worked_before_it_broke_says_when(tmp_path: Path):
         _client(tmp_path, states=[_state(
             ok=False, last_error="SVT timed out",
             last_success="2026-08-26T09:15:00+00:00",
+            last_success_age_s=32_400.0,
         )]).get("/config/mappings").text
     ))
 
-    assert "2026-08-26T09:15:00+00:00" in row
+    assert "9 hours ago" in row
 
 
 # --- Unknown state is never rendered as healthy -----------------------
@@ -311,3 +316,116 @@ def test_rendering_a_view_never_calls_svt(tmp_path: Path, path: str):
     _client(tmp_path, states=[_state(ok=False, last_error="x")], svt=svt).get(path)
 
     assert svt.list_episodes_calls == []
+
+
+# --- Ages, not instants -----------------------------------------------
+
+
+def _sample_health(svt: dict) -> dict:
+    return {
+        "status": "ok", "same_filesystem": True, "worker_alive": True,
+        "active_jobs": 0, "mappings": 1, "mappings_ever_loaded": True,
+        "mappings_degraded": False, "svt": svt,
+    }
+
+
+def _sample_svt(**over) -> dict:
+    svt = {
+        "state": "ok", "degraded": False, "needs_attention": False,
+        "alive": True, "checked": 1, "failing": 0, "episodes_seen": 12,
+        "last_checked": "2026-08-26T18:00:00+00:00",
+        "last_checked_age_s": 720.0,
+        "last_success": "2026-08-26T18:00:00+00:00",
+        "last_success_age_s": 720.0,
+        "last_error": None, "last_error_at": None,
+        "failing_series": [], "failing_series_truncated": False,
+    }
+    svt.update(over)
+    return svt
+
+
+def test_the_column_says_how_long_ago_not_when(tmp_path: Path):
+    # An ISO instant makes the reader hold the current time in their head,
+    # work out the timezone and subtract -- every glance, on a phone,
+    # where it also costs the most width in the row. The strip has always
+    # rendered an age; the table used to render the instant, one click
+    # apart on the same page.
+    row = _row(
+        _client(tmp_path, states=[_state(ok=True, last_checked_age_s=1_200.0)])
+        .get("/config/mappings").text
+    )
+
+    assert "20 min ago" in _text(row)
+    # The instant is still reachable where precision helps, but it is not
+    # what the column reads as.
+    assert 'title="2026-08-26T18:00:00+00:00"' in row
+    assert ">2026-08-26T18:00:00+00:00<" not in row
+
+
+def test_a_long_dead_mapping_is_not_measured_in_minutes(tmp_path: Path):
+    # The canary's per-mapping state survives for as long as the process
+    # does, so "last resolved" can be days old. Rendering that as
+    # "4320 min ago" is arithmetic homework, not an answer.
+    row = _text(_row(
+        _client(tmp_path, states=[_state(
+            ok=False, last_error="SVT timed out",
+            last_checked_age_s=60.0,
+            last_success="2026-08-24T09:00:00+00:00",
+            last_success_age_s=259_200.0,
+        )]).get("/config/mappings").text
+    ))
+
+    assert "3 days ago" in row
+
+
+@pytest.mark.parametrize(
+    "seconds,phrase",
+    [
+        (5.0, "just now"),
+        (1_200.0, "20 min ago"),
+        (14_400.0, "4 hours ago"),
+        (259_200.0, "3 days ago"),
+    ],
+)
+def test_the_table_and_the_strip_say_the_same_thing_about_one_moment(
+    tmp_path: Path, seconds: float, phrase: str
+):
+    # The strip and this column are one click apart and describe
+    # overlapping moments. Two copies of the arithmetic would drift on
+    # rounding first and wording second -- "4 hours" beside "240 min"
+    # about the same instant is worse than either alone. One formatter,
+    # asserted from both ends.
+    cfg, maps = _paths(tmp_path)
+    app = FastAPI()
+    app.include_router(
+        build_config_router(
+            cfg, maps, FakeSvt(), FakeSonarr(),
+            status_provider=lambda: _sample_health(
+                _sample_svt(last_success_age_s=seconds)
+            ),
+            mapping_state_provider=lambda: [_state(
+                ok=False, last_error="SVT timed out",
+                last_success="2026-08-26T18:00:00+00:00",
+                last_success_age_s=seconds,
+            )],
+        )
+    )
+    body = TestClient(app).get("/config/mappings").text
+    strip = _text(body[body.index('class="status-strip"'):body.index("</div>", body.index('class="status-strip"'))])
+
+    assert f"confirmed {phrase}" in strip, strip
+    assert f"Last resolved {phrase}" in _text(_row(body))
+
+
+def test_a_state_row_without_the_age_fields_still_renders(tmp_path: Path):
+    # The provider is a seam: a row from before the ages existed must
+    # degrade to saying so, not raise into a 500 on the one page an
+    # operator opens when something is already wrong.
+    stale = _state(ok=True)
+    del stale["last_checked_age_s"]
+    del stale["last_success_age_s"]
+
+    r = _client(tmp_path, states=[stale]).get("/config/mappings")
+
+    assert r.status_code == 200
+    assert "unknown length of time" in _text(_row(r.text))

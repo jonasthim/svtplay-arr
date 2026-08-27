@@ -200,17 +200,36 @@ class MappingHealth:
     last_error: str | None = None
     last_error_at: datetime | None = None
 
-    def as_dict(self) -> dict:
+    def as_dict(self, now: datetime) -> dict:
+        """This row's state, with both an instant and an age per timestamp.
+
+        The ages are the reason `now` is a parameter rather than read in
+        here. "When did this last work" is asked in the present tense, and
+        an ISO instant makes the reader hold the current time in their
+        head, work out the timezone and subtract -- every glance. The
+        rendered surfaces show the age; the instant stays alongside it for
+        the cases where the exact moment matters (the mappings table hangs
+        it off a `title`).
+
+        Computed with the same `_age_s` `status()` uses, off the same
+        clock, so the mappings table and the status strip cannot disagree
+        about how old the same moment is. Formatting the number into words
+        is the templates' business and is likewise done in exactly one
+        place -- see `_age.html`.
+        """
         return {
             "tvdb_id": self.tvdb_id,
             "series_title": self.series_title,
             "svt_slug": self.svt_slug,
             "ok": self.ok,
             "last_checked": _iso(self.last_checked),
+            "last_checked_age_s": _age_s(self.last_checked, now),
             "last_success": _iso(self.last_success),
+            "last_success_age_s": _age_s(self.last_success, now),
             "episode_count": self.episode_count,
             "last_error": self.last_error,
             "last_error_at": _iso(self.last_error_at),
+            "last_error_age_s": _age_s(self.last_error_at, now),
         }
 
 
@@ -393,6 +412,11 @@ class SvtCanary:
         working, and when did we last confirm it". This is what a
         per-mapping view reads.
 
+        Each timestamp comes with an age in seconds beside it, computed
+        here rather than by whatever renders this, and by the same `_age_s`
+        `status()` uses. That is what stops the mappings table and the
+        strip drifting apart on what "20 minutes ago" means.
+
         Mappings the canary has not reached yet appear here with `ok: None`
         rather than being absent. A row missing from this list would be read
         as "nothing to report about it", which is the same reassuring
@@ -400,6 +424,9 @@ class SvtCanary:
         provider is guarded for the usual reason: a report must not be able
         to raise.
         """
+        # One clock read for the whole report, so two rows checked in the
+        # same round cannot come back with ages a few milliseconds apart.
+        now = self._now()
         known = dict(self._health)
         try:
             for mapping in self._mappings_provider() or []:
@@ -416,7 +443,7 @@ class SvtCanary:
                 "SVT canary could not read the mappings while reporting",
                 exc_info=True,
             )
-        return [h.as_dict() for h in sorted(known.values(), key=_by_tvdb)]
+        return [h.as_dict(now) for h in sorted(known.values(), key=_by_tvdb)]
 
     # --- Running ----------------------------------------------------------
 

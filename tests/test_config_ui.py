@@ -3586,7 +3586,13 @@ def test_a_stalled_canary_says_so(tmp_path: Path):
     )
     strip = _strip_of(body)
     assert "SVT: CHECK STALLED" in strip
-    assert "240 min" in strip
+    # Four hours, not "240 min". The age formatter is shared with the
+    # mappings table now (see templates/_age.html), and it scales -- a
+    # per-mapping row that last resolved three days ago would otherwise
+    # have read "4320 min". The strip gets the same wording so the two
+    # surfaces, one click apart, cannot describe the same moment
+    # differently.
+    assert "4 hours" in strip
 
 
 def test_no_mappings_is_neither_a_success_nor_a_failure(tmp_path: Path):
