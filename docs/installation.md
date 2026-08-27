@@ -117,15 +117,10 @@ does not need root:
 bash install.sh --dry-run
 ```
 
-There is a one-liner, if you have already read the script or trust the source:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/jonasthim/svtplay-arr/main/install.sh | sudo bash
-```
-
-It is deliberately not the headline. Piping a URL into a root shell is exactly
-the thing this script refuses to do to *you* — see "How uv is installed"
-below.
+There is deliberately no `curl … | sudo bash` line here. Piping a URL into a
+root shell is exactly what this script refuses to do to *you* when it installs
+uv — see "How uv is installed" below — and it would be incoherent to argue
+that on one line and ask for it on the next. Download it, read it, run it.
 
 ### What it does
 
@@ -175,16 +170,39 @@ than a rebuild.
 | Option | What it does |
 | --- | --- |
 | `--dry-run` | Print every action, change nothing. Does not need root. |
-| `--ref REF` | Install a branch, tag or commit other than `main`. |
-| `--prefix DIR` | Install somewhere other than `/opt/svtplay-arr`. |
-| `--config-dir DIR` | Configuration somewhere other than `/etc/svtplay-arr`. |
+| `--ref REF` | Install a specific branch, tag or commit. The default is the newest `vN.N.N` tag — see "Which version you get". |
+| `--prefix DIR` | Install somewhere other than `/opt/svtplay-arr`. Must be a directory of svtplay-arr's own; see below. |
+| `--config-dir DIR` | Configuration somewhere other than `/etc/svtplay-arr`. Same rule. |
 | `--unit-dir DIR` | Unit directory other than `/etc/systemd/system`. |
 | `--health-timeout N` | How long to wait for `/health` (default 90s). |
 | `--keep N` | Old releases to keep for rollback (default 3). Each carries its own virtualenv, so this costs disk; `--keep 2` leaves one rollback target. |
 | `--help` | The full list. |
 
-Running it twice is safe. The second run finds the same commit already built
-and active and stops after re-checking `/health`.
+Running it twice is safe. The second run finds the same commit already built,
+active and *running*, and stops after re-checking `/health`. "Running" is
+checked rather than assumed: a run interrupted between activating a release
+and restarting the service leaves the two disagreeing, and the next run
+finishes the job instead of declaring victory.
+
+`--prefix` and `--config-dir` are the two flags to be careful with, and the
+script is careful with them for you. It chmods and recursively chowns those
+directories to `svtplay:media`, as root, so it **refuses** a shared system
+directory (`/`, `/etc`, `/opt`, `/usr`, `/var`, `/home` and the like) and
+refuses to adopt a directory that already exists, is not empty, and does not
+look like an svtplay-arr installation. `--prefix /opt` would otherwise hand
+every other application under `/opt` to the service account without a word.
+`--repo` accepts `https://` and `file:///` only, because some git URLs are
+commands.
+
+### Which version you get
+
+With no `--ref`, the installer targets the **newest `vN.N.N` tag** in the
+repository, not the tip of `main`. A fresh install has nothing to roll back
+to, so it should not be the thing that discovers a bad commit; upgrades follow
+the same rule, which is what keeps "run the same command again" meaningful.
+
+`--ref main` installs the development branch if you want it, and
+`--ref v1.2.3` pins an exact release.
 
 ### How uv is installed
 
@@ -230,6 +248,15 @@ A freshly installed service comes up **degraded**, and that is expected:
 `config.yaml` still holds the example's `/downloads/incomplete` and
 `/downloads/completed`, which do not exist yet on your host. Step 4 is what
 fixes it.
+
+The installer knows the difference and says so. On the run that seeds
+`config.yaml` it reports `same_filesystem: false` as expected and tells you
+what to do; **any other time** — an upgrade, or an install onto configuration
+you already had — it raises the full warning, because then it means your
+directories really are on two filesystems. That distinction is the whole
+point: a warning that fires on every first install is a warning nobody reads
+by their third one, and this is the one warning that stands between you and a
+permanently corrupt library entry.
 
 ## Step 4: configure it
 
@@ -430,11 +457,14 @@ sudo bash install.sh
 It finds the existing installation and upgrades it. What that means in
 practice:
 
-- **Your configuration is never touched.** `config.yaml` and `mappings.yaml`
-  are written only when they do not exist, and the script verifies at the end
-  of every upgrade that the files it found are byte-for-byte the files it
-  left. An installer that clobbers config is the worst thing this script could
-  do, so it is not left to anyone's memory.
+- **Your configuration is never rewritten.** `config.yaml` and
+  `mappings.yaml` are written only when they do not exist, and the script
+  hashes both before it starts and again at the end of every upgrade, refusing
+  to finish quietly if either changed. An installer that clobbers config is
+  the worst thing this script could do, so it is not left to anyone's memory.
+  (It does reassert the *directory's* `0750` mode and the files' ownership on
+  every run — metadata, not content. If you have deliberately loosened either,
+  it will be tightened again.)
 - **The new release is built somewhere else.** It goes into a new
   `releases/<commit>/` directory with its own `.venv`; the running release is
   not modified. If dependencies do not resolve, the upgrade is abandoned
@@ -447,6 +477,8 @@ practice:
   running, not down.
 - It reports the version before and after, and keeps the last three releases
   so a manual rollback is also just a symlink flip.
+- It will **not** delete the release the service is currently running from,
+  even if that release looks incomplete to it. It stops and says so instead.
 
 An upgrade of a service that was **already** degraded — a mount is down, say —
 is not rolled back. Rolling back would not fix the mount and would throw away
@@ -465,6 +497,9 @@ To pin a version, or to move back:
 ```sh
 sudo bash install.sh --ref v1.2.3
 ```
+
+Re-download `install.sh` from time to time; it is the part that is not
+versioned with the release you install.
 
 ## Doing it by hand
 

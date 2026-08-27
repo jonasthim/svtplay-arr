@@ -290,7 +290,13 @@ changes nothing (and does not need root).
 
 **The same command upgrades.** It builds the new release beside the running
 one, flips a symlink, and rolls itself back if the service does not come back
-healthy. It never touches `config.yaml` or `mappings.yaml`.
+healthy. It never rewrites `config.yaml` or `mappings.yaml`, and checks at the
+end that it did not — though it does reassert their directory's mode and
+ownership on every run.
+
+With no `--ref` it installs the newest `vN.N.N` tag rather than the tip of
+`main`, so a fresh install — which has nothing to roll back to — never lands
+on an in-flight commit.
 
 Then open `http://<host>:9800/config`, fill in Sonarr's URL and API key, add a
 mapping, and follow [docs/installation.md](docs/installation.md) to add the
