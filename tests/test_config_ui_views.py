@@ -351,3 +351,29 @@ def test_the_pending_restart_banner_is_on_every_view(tmp_path: Path):
 
     for _key, _label, path in VIEWS:
         assert '<p class="pending">' in client.get(path).text, path
+
+
+@pytest.mark.parametrize(
+    "path,method,data",
+    [
+        ("/config/mappings/new", "get", None),
+        ("/config/mappings/search", "post", {"q": "gift"}),
+        ("/config/mappings/discover", "post", {"expected_mtime": ""}),
+    ],
+)
+def test_every_mapping_sub_page_leads_back_to_the_table(
+    tmp_path: Path, path: str, method: str, data
+):
+    # These pages were written when /config *was* the mappings table, so
+    # their way out pointed there. It is now the Status view, and an
+    # operator who cancels an Add or finishes a sweep wants the table they
+    # came from rather than the landing page.
+    client = _client(tmp_path)
+    r = client.get(path) if method == "get" else client.post(path, data=data)
+    body = r.text
+    escape = re.sub(r'<nav class="nav".*?</nav>', "", body, flags=re.S)
+
+    assert r.status_code == 200
+    assert 'href="/config/mappings"' in escape, (
+        f"{path} has no way back to the mappings table outside the nav"
+    )
