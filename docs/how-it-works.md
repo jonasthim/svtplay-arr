@@ -569,6 +569,7 @@ Routes:
 ```
 GET  /config                            Status: is it working?
 GET  /config/mappings                   Mappings: the table, add/remove, sweep
+GET  /config/activity                   Activity: the queue and the history
 GET  /config/settings                   Settings: the form
 POST /config/settings                   save settings
 GET  /config/mappings/new               "which show?" form
@@ -578,6 +579,16 @@ POST /config/mappings/{tvdb_id}/delete  remove one
 POST /config/mappings/{tvdb_id}/check   live-check one mapping's slug
 POST /config/mappings/discover          sweep Sonarr for unmapped series
 ```
+
+**Activity** is the job store, which nothing in the UI read until now: when
+a grab failed, the only record of why was `journalctl`. It shows what is in
+flight and what recently finished, with a failed job's recorded reason on
+the page. A store that cannot be read renders as a store that cannot be
+read — never as an empty list, which would tell an operator whose database
+is broken that nothing has ever gone wrong. Both the health read and the
+activity read go through `asyncio.to_thread`: every config route is `async
+def` (see below), so a plain call would run a blocking sqlite read on the
+event loop the download worker also runs on.
 
 `POST /config/mappings/discover` is the Find mappings sweep. It parses
 `expected_mtime`, loads mappings.yaml (refusing to sweep at all if it will not

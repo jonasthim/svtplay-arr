@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% import "_jobs.html" as jobs %}
+{% block content %}
+{# What is in flight, and what recently happened. The job store has held
+   this since the SAB endpoints were written; the UI never showed it, so
+   until now a failed grab's only record was journalctl on the host.
+
+   Read-only, and it computes nothing: `activity` is the store's own rows,
+   handed over by app.py's provider. This view decides how to lay them out
+   and nothing else. #}
+<h2>Activity</h2>
+
+{{ jobs.store_unavailable(activity, activity_unavailable) }}
+
+{% if activity %}
+<section class="panel">
+  <div class="panel-head">In flight</div>
+  <div class="panel-inner">
+  {% if activity.active %}
+  {{ jobs.job_list(activity.active, failed_status) }}
+  {% else %}
+  <p class="help">Nothing is downloading right now.</p>
+  {% endif %}
+  </div>
+</section>
+
+<section class="panel">
+  <div class="panel-head">Recently finished</div>
+  <div class="panel-inner">
+  {% if activity.history %}
+  {{ jobs.job_list(activity.history, failed_status) }}
+  <p class="help">The most recent {{ activity.history | length }}
+    {{ 'entry' if activity.history | length == 1 else 'entries' }}. Sonarr
+    removes entries from here once it has imported or given up on them, so
+    a short list is normal.</p>
+  {% else %}
+  {# A fresh install genuinely has nothing here, and that is not a fault.
+     It is also not the same page as an unreadable store -- see the macro
+     above, which renders instead of this whenever the store could not be
+     read at all. #}
+  <p class="help">Nothing has been downloaded yet. Episodes appear here
+    once Sonarr searches, finds one of your mapped series in svtplay-arr's
+    feed and sends it back to be grabbed &mdash; successes and failures
+    alike, with whatever was recorded about a failure.</p>
+  {% endif %}
+  </div>
+</section>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,66 @@
+{# Shared by the Activity view and the Status view's summary of it.
+
+   One definition, because the alternative -- laying the same job rows out
+   twice -- is how two surfaces end up describing the same store
+   differently, which is the defect this project has hit more often than
+   any other. Both callers pass the same dicts, straight from the job
+   store, and neither derives anything about them.
+
+   `failed` is JobStatus.FAILED's own value, handed in by config_ui rather
+   than spelled here, so the template holds no second copy of a string the
+   SAB endpoints depend on. #}
+
+{% macro store_unavailable(activity, activity_unavailable) %}
+{#- Three states, not two, and the two failing ones must never render as
+    the empty one. "No failures" and "cannot read failures" are different
+    answers; showing an unreadable store as an empty list tells an
+    operator whose database is broken that nothing has ever gone wrong. -#}
+{% if activity_unavailable %}
+<p class="warn">The job database could not be read, so nothing here can tell
+  you what is downloading or what recently happened. This is not the same as
+  nothing having happened &mdash; a failed grab would be invisible here.
+  Check svtplay-arr's log.</p>
+{% elif activity is none %}
+<p class="warn">Download activity is not available on this page, which was
+  built without access to the job database. Nothing here says whether
+  anything has been downloaded.</p>
+{% endif %}
+{% endmacro %}
+
+{% macro job_list(jobs, failed) %}
+<ul class="jobs">
+  {%- for j in jobs %}
+  {%- set is_failed = j.status == failed %}
+  <li class="job">
+    {#- The filename stem, which is what the operator is looking for: it
+        is the name the episode would have had in the library. #}
+    <p class="job-stem">{{ j.stem }}</p>
+    <p class="job-meta">
+      {#- The state as a word, always. Colour backs it up; it never
+          carries it, here as everywhere else on this page. #}
+      <span class="status-chip{{ ' error' if is_failed else '' }}">{{ j.status }}</span>
+      {%- if j.quality %} <span class="help">{{ j.quality }}</span>{% endif %}
+      {%- if j.size_bytes %}
+      <span class="help">{{ (j.size_bytes / 1048576) | round | int }} MB</span>
+      {%- if j.downloaded_bytes is not none and j.downloaded_bytes < j.size_bytes %}
+      <span class="help">{{ (j.downloaded_bytes * 100 // j.size_bytes) }}%</span>
+      {%- endif %}
+      {%- endif %}
+      {%- if j.created_at %}
+      {#- The store writes sqlite's datetime('now'), so this is UTC and
+          said to be, rather than rendered as a bare timestamp the reader
+          has to guess the zone of. #}
+      <span class="help">{{ j.created_at }} UTC</span>
+      {%- endif %}
+    </p>
+    {%- if is_failed %}
+    {#- The whole reason this view exists. Before it, the only record of
+        this string was journalctl on the host. #}
+    <p class="error job-why">{% if j.fail_message %}{{ j.fail_message }}{% else %}svtplay-arr
+      recorded no reason for this failure. Look in its log around
+      {{ j.created_at or 'the time it was queued' }} for what happened.{% endif %}</p>
+    {%- endif %}
+  </li>
+  {%- endfor %}
+</ul>
+{% endmacro %}

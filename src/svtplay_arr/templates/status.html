@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% import "_jobs.html" as jobs %}
 {% block content %}
 {# The landing view, and deliberately so: an operator opens this page to
    ask "is it working" far more often than to change a setting, and a
@@ -15,6 +16,33 @@
    worker is worth knowing about wherever you happen to be. What this view
    adds is the detail behind them and the next thing to look at. #}
 <h2>Status</h2>
+
+<section class="panel">
+  <div class="panel-head">Downloads</div>
+  <div class="panel-inner">
+  {{ jobs.store_unavailable(activity, activity_unavailable) }}
+  {% if activity %}
+  {% if activity.active %}
+  {{ jobs.job_list(activity.active, failed_status) }}
+  {% else %}
+  <p class="help">Nothing is downloading right now.</p>
+  {% endif %}
+  {% if recent %}
+  {# Deliberately not simply "the most recent five": a failure that
+     happened before five later successes is exactly the row this page is
+     opened for, and a straight recency cut is what would hide it. See
+     _status_view in config_ui.py, which does the ordering. #}
+  <h3>Recently finished</h3>
+  {{ jobs.job_list(recent, failed_status) }}
+  {% elif not activity.active %}
+  <p class="help">Nothing has been downloaded yet. Episodes appear here once
+    Sonarr finds one of your mapped series in svtplay-arr's feed and sends
+    it back to be grabbed.</p>
+  {% endif %}
+  {% endif %}
+  <p><a href="/config/activity">All activity</a></p>
+  </div>
+</section>
 
 <section class="panel">
   <div class="panel-head">Mappings</div>

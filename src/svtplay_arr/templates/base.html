@@ -347,6 +347,36 @@
     .auto-note .auto-badge { margin-left: 0; }
     #mapping-filter { margin: 0 0 .75rem; }
 
+    /* ---- Activity ---------------------------------------------------
+       The job store's rows, on the Activity view and in the Status
+       view's summary of it. A list rather than a table: every row is one
+       long filename stem plus a few short facts, which a fixed table
+       layout would either truncate on a phone or pad out on a desktop --
+       and a list needs no stacked-cell rules to survive the narrow
+       breakpoint at all.
+
+       The state is a `.status-chip`, the same element the status strip
+       uses, so a failed job takes its colour from the tokens already
+       contrast-checked in tests/test_config_ui_theme.py rather than
+       introducing a second red. Only its geometry is overridden here --
+       never its colour -- for the same reason the strip overrides it. */
+    .jobs { list-style: none; margin: 0; padding: 0; }
+    .job { padding: .55rem 0; border-bottom: 1px solid var(--border); }
+    .job:last-child { border-bottom: 0; padding-bottom: 0; }
+    .job:first-child { padding-top: 0; }
+    .job-stem { margin: 0; font-size: .875rem; font-weight: 600;
+                overflow-wrap: anywhere; }
+    .job-meta { display: flex; flex-wrap: wrap; align-items: center;
+                gap: .35rem .6rem; margin: .25rem 0 0; }
+    .job-meta .help { margin: 0; }
+    .jobs .status-chip { padding: .1rem .45rem; margin: 0; font-size: .75rem; }
+    /* The reason a grab failed, which is the whole point of the view. It
+       keeps the .error banner's colours and glyph -- this is the one
+       thing on the row worth interrupting for -- at row rather than page
+       scale. */
+    .job-why { margin: .35rem 0 0; padding: .35rem .55rem;
+               font-size: .8125rem; overflow-wrap: anywhere; }
+
     /* ---- Find mappings ----------------------------------------------
        The sweep's own controls and its result page. `.panel-actions` now
        carries a form beside a link, so it lays them out on one baseline

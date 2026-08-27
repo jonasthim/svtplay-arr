@@ -88,3 +88,8 @@ class Job:
     downloaded_bytes: int
     storage_path: str | None
     fail_message: str | None
+    # sqlite's `datetime('now')`: UTC, second resolution, as a string.
+    # Defaulted so nothing that builds a Job without one breaks, and
+    # nullable because a row written before the column had a default
+    # legitimately has none.
+    created_at: str | None = None

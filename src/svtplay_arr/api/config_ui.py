@@ -55,7 +55,7 @@ from svtplay_arr.mappings import (
     add_mappings,
     remove_mapping,
 )
-from svtplay_arr.models import SOURCE_AUTO
+from svtplay_arr.models import SOURCE_AUTO, JobStatus
 from svtplay_arr.svt.client import SvtApiError, derive_slug
 from svtplay_arr.yamlio import ConcurrentModification, read_with_mtime
 
@@ -95,8 +95,19 @@ _SWEEP_REQUEST_BUDGET = 600
 VIEWS = (
     ("status", "Status", "/config"),
     ("mappings", "Mappings", "/config/mappings"),
+    ("activity", "Activity", "/config/activity"),
     ("settings", "Settings", "/config/settings"),
 )
+
+# How many finished jobs the Status view's summary shows. The job store
+# keeps history until Sonarr deletes it, so the landing view shows a
+# bounded summary and the Activity view has the rest.
+_STATUS_RECENT_LIMIT = 5
+
+# The store's own spelling of a failed job, read off the enum the SAB
+# endpoints depend on rather than written out again here. The templates
+# are handed this value; they hold no copy of the string.
+_FAILED = JobStatus.FAILED.value
 
 _CHECK_CSS_CLASS = {
     "found": "notice",
@@ -350,9 +361,30 @@ def _changed_setting_fields(existing: dict, submitted: dict[str, str]) -> list:
     return changed
 
 
+def _recent_jobs(activity, limit: int = _STATUS_RECENT_LIMIT) -> list | None:
+    """The Status view's bounded summary of finished jobs.
+
+    Failures first, then everything else, each in the order the provider
+    gave. Deliberately *not* simply "the most recent N": a failed grab
+    that happened before five later successes is precisely the row an
+    operator opens the landing view to find, and a straight recency cut is
+    what would hide it behind them. The full list, in order, is one click
+    away on the Activity view.
+
+    `None` in, `None` out -- an unreadable store must stay distinguishable
+    from a store with nothing in it all the way to the template.
+    """
+    if not isinstance(activity, dict):
+        return None
+    history = activity.get("history") or []
+    failed = [j for j in history if j.get("status") == _FAILED]
+    rest = [j for j in history if j.get("status") != _FAILED]
+    return (failed + rest)[:limit]
+
+
 def build_config_router(
     config_path: Path, mappings_path: Path, svt, sonarr, booted=None,
-    status_provider=None,
+    status_provider=None, activity_provider=None,
 ) -> APIRouter:
     """`booted` is the `Settings` the service actually started with.
 
@@ -495,6 +527,37 @@ def build_config_router(
             return {"health": None, "status_unavailable": True}
         return {"health": health, "status_unavailable": False}
 
+    async def _activity_context() -> dict:
+        """What the job store currently holds, or why it could not be read.
+
+        Three states, and the templates branch on all three, because
+        collapsing any two of them is the specific defect this view exists
+        to avoid:
+
+        * a dict -- the store answered. Empty lists inside it genuinely
+          mean nothing is in flight and nothing has finished.
+        * `activity_unavailable` -- the read raised. Nothing is known.
+          Rendering this as "nothing has happened" would tell an operator
+          whose store is broken that no download has ever failed.
+        * neither -- no provider was wired in at all (every router built
+          without one, as most tests do). Also not "nothing happened".
+
+        `to_thread` for the same reason as `_status_strip_context`, and
+        more so: this is the larger of the two reads, and it is a second
+        one on every render of the pages that show it.
+        """
+        if activity_provider is None:
+            return {"activity": None, "activity_unavailable": False}
+        try:
+            activity = await asyncio.to_thread(activity_provider)
+        except Exception:
+            log.exception(
+                "activity_provider failed; rendering the page with activity "
+                "reported as unreadable rather than as empty"
+            )
+            return {"activity": None, "activity_unavailable": True}
+        return {"activity": activity, "activity_unavailable": False}
+
     def _load_mappings() -> tuple[list, bool, str | None]:
         """The mapping rows, and whether the file could be read at all.
 
@@ -581,6 +644,7 @@ def build_config_router(
         if load_error:
             errors.append(load_error)
         chrome = await _chrome("status", errors, notice)
+        activity = await _activity_context()
         return _TEMPLATES.TemplateResponse(
             request,
             "status.html",
@@ -588,8 +652,20 @@ def build_config_router(
                 "mappings": mappings,
                 "mappings_unavailable": mappings_unavailable,
                 "mappings_ever_loaded": _mappings_ever_loaded(chrome.get("health")),
+                "recent": _recent_jobs(activity["activity"]),
+                "failed_status": _FAILED,
+                **activity,
                 **chrome,
             },
+        )
+
+    async def _activity_view(request: Request, error=None, notice=None):
+        chrome = await _chrome("activity", [error] if error else [], notice)
+        activity = await _activity_context()
+        return _TEMPLATES.TemplateResponse(
+            request,
+            "activity.html",
+            {"failed_status": _FAILED, **activity, **chrome},
         )
 
     async def _mappings_view(
@@ -727,6 +803,10 @@ def build_config_router(
     @router.get("/mappings", response_class=HTMLResponse)
     async def mappings_page(request: Request):
         return await _mappings_view(request)
+
+    @router.get("/activity", response_class=HTMLResponse)
+    async def activity_page(request: Request):
+        return await _activity_view(request)
 
     # Same path as the POST that writes it, so the form posts to where it
     # is served from and every existing `POST /config/settings` -- the

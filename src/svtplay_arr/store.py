@@ -221,6 +221,23 @@ class JobStore:
             if j.status in (JobStatus.COMPLETED, JobStatus.FAILED)
         ]
 
+    def all_jobs(self) -> list[Job]:
+        """Every row, oldest first, whatever its status.
+
+        For a caller that needs the queue *and* the history in one render
+        -- the config page's Activity view -- and would otherwise take this
+        connection's lock twice for two full reads of the same table, on
+        the same lock the download worker writes job progress through.
+        Partitioning one read in Python costs nothing at this size and is
+        one fewer thing between a page load and a download.
+
+        Raises `JobStoreError` like every other read here, and that is
+        load-bearing rather than incidental: "nothing has failed" and
+        "the store cannot be read" are different answers, and only a
+        caller handed a failure can tell them apart.
+        """
+        return self._all()
+
     def _all(self) -> list[Job]:
         # Deliberately filters in Python rather than via SQL `WHERE status IN
         # (...)`: an unrecognised status literal would silently match none of
@@ -257,4 +274,9 @@ def _row_to_job(row: sqlite3.Row) -> Job:
         downloaded_bytes=row["downloaded_bytes"],
         storage_path=row["storage_path"],
         fail_message=row["fail_message"],
+        # Written by the schema's own default and, until the config page
+        # grew an Activity view, never read by anything. A list of stems
+        # with no times against them does not answer "why didn't that
+        # episode arrive?".
+        created_at=row["created_at"],
     )

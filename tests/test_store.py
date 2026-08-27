@@ -1,3 +1,4 @@
+import re
 import sqlite3
 import subprocess
 import sys
@@ -291,3 +292,69 @@ def test_a_closed_store_leaves_no_unclosed_database_warning(tmp_path: Path):
     )
     assert proc.returncode == 0, proc.stderr
     assert "ResourceWarning" not in proc.stderr, proc.stderr
+
+
+# --- What the Activity view reads -------------------------------------
+
+
+def test_all_jobs_returns_every_row_whatever_its_status(tmp_path: Path):
+    # The config page's Activity view needs the queue and the history in
+    # the same render. Asking for them separately would mean two full
+    # table reads per page view, each taking the connection lock the
+    # download worker also writes through; this is the one read they are
+    # both partitioned out of.
+    s = _store(tmp_path)
+    queued = s.create("a", "stem-a", "WEBDL-1080p", 1)
+    done = s.create("b", "stem-b", "WEBDL-1080p", 2)
+    failed = s.create("c", "stem-c", "WEBDL-1080p", 3)
+    s.complete(done.nzo_id, "/tmp/stem-b.mkv")
+    s.fail(failed.nzo_id, "svtplay-dl exited 1")
+
+    got = {j.nzo_id: j.status for j in s.all_jobs()}
+
+    assert got == {
+        queued.nzo_id: JobStatus.QUEUED,
+        done.nzo_id: JobStatus.COMPLETED,
+        failed.nzo_id: JobStatus.FAILED,
+    }
+
+
+def test_all_jobs_agrees_with_the_endpoint_specific_listings(tmp_path: Path):
+    # Partitioning one read must produce exactly what the two existing
+    # listings produce, or the Activity view and Sonarr's queue would
+    # disagree about the same store.
+    s = _store(tmp_path)
+    s.create("a", "stem-a", "WEBDL-1080p", 1)
+    done = s.create("b", "stem-b", "WEBDL-1080p", 2)
+    s.complete(done.nzo_id, "/tmp/stem-b.mkv")
+
+    every = s.all_jobs()
+    active = [j for j in every if j.status in (JobStatus.QUEUED, JobStatus.DOWNLOADING)]
+    history = [j for j in every if j.status in (JobStatus.COMPLETED, JobStatus.FAILED)]
+
+    assert active == s.all_active()
+    assert history == s.history()
+
+
+def test_all_jobs_raises_rather_than_hiding_a_read_failure(tmp_path: Path):
+    # The whole point of the Activity view's error handling is that "no
+    # failures" and "cannot read failures" are different answers. That
+    # distinction can only be made one level up if this raises rather than
+    # returning an empty list.
+    s = _store(tmp_path)
+    s.close()
+
+    with pytest.raises(JobStoreError):
+        s.all_jobs()
+
+
+def test_a_job_records_when_it_was_created(tmp_path: Path):
+    # "Why didn't that episode arrive?" is not answerable by a list of
+    # stems with no times against them. The column has always existed;
+    # nothing read it.
+    s = _store(tmp_path)
+    job = s.create("a", "stem-a", "WEBDL-1080p", 1)
+
+    assert job.created_at
+    # sqlite's datetime('now'), i.e. UTC, second resolution.
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", job.created_at)

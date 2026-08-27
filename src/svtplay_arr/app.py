@@ -39,6 +39,7 @@ from svtplay_arr.canary import SvtCanary, unavailable_status
 from svtplay_arr.config import Settings
 from svtplay_arr.downloader import SvtplayDlDownloader
 from svtplay_arr.mappings import ReloadingMappingTable
+from svtplay_arr.models import Job, JobStatus
 from svtplay_arr.resolver import Resolver
 from svtplay_arr.sonarr import SonarrClient
 from svtplay_arr.store import JobStore, JobStoreError
@@ -50,6 +51,32 @@ log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 _DEFAULT_CONFIG_PATH = "/etc/svtplay-arr/config.yaml"
+
+# How many finished jobs the config page's Activity view is handed. The
+# store keeps history until Sonarr deletes it, so this bounds one page
+# render rather than the table.
+_ACTIVITY_HISTORY_LIMIT = 50
+
+
+def _job_dict(job: Job) -> dict:
+    """One job as the config page reads it.
+
+    A plain dict rather than the `Job` dataclass, so the config UI module
+    never imports the store's own types -- the same seam `compute_health`
+    keeps for `/health`'s dict. Every field is copied verbatim; nothing
+    here decides how any of it is displayed.
+    """
+    return {
+        "nzo_id": job.nzo_id,
+        "stem": job.stem,
+        "quality": job.quality,
+        "status": job.status.value,
+        "size_bytes": job.size_bytes,
+        "downloaded_bytes": job.downloaded_bytes,
+        "storage_path": job.storage_path,
+        "fail_message": job.fail_message,
+        "created_at": job.created_at,
+    }
 
 
 def create_app(settings: Settings) -> FastAPI:
@@ -207,6 +234,46 @@ def create_app(settings: Settings) -> FastAPI:
             "mappings_degraded": mappings["degraded"],
         }
 
+    def compute_activity() -> dict:
+        """What the job store holds, for the config page's Activity view.
+
+        The seam is the same one `status_provider` uses and exists for the
+        same reason: the config UI module is handed a bare callable and a
+        plain dict, so it never imports `JobStore` and a change there
+        cannot reach the download pipeline.
+
+        **This is deliberately allowed to raise.** Every other reporting
+        path in this file swallows a store failure and degrades, because
+        `/health` must answer and Sonarr must not see a 500. Here the
+        opposite is right: "nothing has failed" and "the failures cannot be
+        read" are different answers, and the page can only tell them apart
+        if the failure arrives as one. `config_ui` catches it and renders
+        the store as unreadable; an empty list would have rendered as a
+        quiet, wrong "nothing happened".
+
+        One read of the table, not two: `all_active()` and `history()` each
+        take the connection's lock for a full scan, and that is the lock
+        the download worker writes progress through. `all_jobs()` is read
+        once and partitioned here.
+
+        History is newest first -- the store returns oldest first, which is
+        what Sonarr's queue wants and the opposite of what a human reading
+        a log wants -- and bounded, since the store keeps history until
+        Sonarr deletes it.
+        """
+        jobs = store.all_jobs()
+        active = [
+            _job_dict(j)
+            for j in jobs
+            if j.status in (JobStatus.QUEUED, JobStatus.DOWNLOADING)
+        ]
+        history = [
+            _job_dict(j)
+            for j in reversed(jobs)
+            if j.status in (JobStatus.COMPLETED, JobStatus.FAILED)
+        ]
+        return {"active": active, "history": history[:_ACTIVITY_HISTORY_LIMIT]}
+
     async def _stop(task: asyncio.Task, what: str) -> None:
         """Cancel a background task and await it, whatever state it is in.
 
@@ -323,6 +390,11 @@ def create_app(settings: Settings) -> FastAPI:
             # docstring above for why this is the *only* place that
             # computes these facts.
             status_provider=compute_health,
+            # The job store's own rows. Unlike compute_health, this is
+            # allowed to raise: see its docstring for why a store that
+            # cannot be read must not arrive at the page as a store with
+            # nothing in it.
+            activity_provider=compute_activity,
         )
     )
 

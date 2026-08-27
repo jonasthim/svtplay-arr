@@ -1054,3 +1054,64 @@ def test_health_never_exposes_the_api_key_through_the_canary(tmp_path: Path):
     s = _settings(tmp_path)
     with TestClient(create_app(s)) as c:
         assert s.sonarr_api_key not in c.get("/health").text
+
+
+# --- The Activity view reads the app's own job store -------------------
+
+
+def test_the_activity_view_shows_a_job_from_the_services_own_store(
+    tmp_path: Path,
+):
+    # The whole seam, end to end: a row written through the store the
+    # worker uses reaches the config page. Every other test of this view
+    # hands the router a fake provider, so this is the one that would fail
+    # if `compute_activity` were wired to the wrong store, or to none.
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as c:
+        job = app.state.job_store.create("svt-1", "Stem - S01E01", "WEBDL-1080p", 10)
+        app.state.job_store.fail(job.nzo_id, "svtplay-dl exited 1")
+
+        body = c.get("/config/activity").text
+
+    assert "Stem - S01E01" in body
+    assert "svtplay-dl exited 1" in body
+
+
+def test_the_activity_view_reports_an_unreadable_store_as_unreadable(
+    tmp_path: Path, monkeypatch
+):
+    # The distinction the whole view turns on. Unlike /health -- which
+    # swallows a store failure and reports `active_jobs: null` because
+    # Sonarr may be polling it -- this must not degrade to an empty list:
+    # "nothing has failed" and "the failures cannot be read" are different
+    # answers, and only one of them is true here.
+    def _boom(self):
+        raise JobStoreError("db is on fire")
+
+    monkeypatch.setattr("svtplay_arr.store.JobStore.all_jobs", _boom)
+
+    with TestClient(create_app(_settings(tmp_path))) as c:
+        resp = c.get("/config/activity")
+
+    assert resp.status_code == 200
+    assert "could not be read" in resp.text
+    assert "Nothing has been downloaded yet" not in resp.text
+
+
+def test_the_activity_view_does_not_change_healths_contract(tmp_path: Path):
+    # /health is Sonarr-facing infrastructure; some setups poll it. The
+    # Activity view reads the same store through a separate provider and
+    # must add nothing to, and remove nothing from, this response.
+    with TestClient(create_app(_settings(tmp_path))) as c:
+        body = c.get("/health").json()
+
+    assert set(body) == {
+        "status", "same_filesystem", "worker_alive", "active_jobs", "svt",
+        "mappings", "mappings_ever_loaded", "mappings_degraded",
+    }
+
+
+def test_the_activity_view_never_exposes_the_api_key(tmp_path: Path):
+    s = _settings(tmp_path)
+    with TestClient(create_app(s)) as c:
+        assert s.sonarr_api_key not in c.get("/config/activity").text
