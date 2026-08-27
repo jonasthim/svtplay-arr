@@ -196,7 +196,7 @@ below 1 are refused on save because they would stop the service booting.
 
 ## Settings not on the configuration page
 
-These three are read from `config.yaml` but are deliberately not offered on the
+These four are read from `config.yaml` but are deliberately not offered on the
 form. They are still ordinary settings; edit the file and restart.
 
 #### `mappings_file`
@@ -228,6 +228,23 @@ SVT call fail — silently, from the operator's point of view — and it exists 
 an escape hatch in case SVT ever stops accepting the default, not as a knob
 anyone should be turning. Leave it out of your config file unless you have a
 specific reason.
+
+#### `svt_canary_interval_minutes`
+
+**Default: `60`.**
+
+How often the SVT canary re-checks your mappings — see
+[Is SVT still working?](#is-svt-still-working) below.
+
+It is not on the configuration page for the same reason `svt_ua` is not: it is
+an escape hatch, not a knob. Turning it *up* is how you reduce load on SVT's
+unofficial API if you are on a metered or rate-limited connection. Turning it
+down buys nothing — the failures it detects last until a human fixes them, so
+checking more often only means finding out the same thing more times.
+
+It is floored at one minute when the service starts, because `0` in a
+hand-edited file would otherwise become a loop firing at SVT as fast as it can
+answer.
 
 ## There is no listen host or port setting
 
@@ -527,6 +544,89 @@ decision goes to stderr, so `> rows.yaml` cannot sweep the undecided part into
 a file.
 
 ---
+
+## Is SVT still working?
+
+This service is built to refuse on doubt and return nothing. That is why your
+library is safe — and it is also what makes a failure and a quiet week look
+identical from the outside.
+
+If SVT changes its page format, the parser finds no episodes, the resolver
+returns nothing, the feed goes empty, and Sonarr grabs nothing. Every other
+field on `/health` keeps saying `ok`, because every other field is about *this*
+process: the worker, the job store, the mappings table, the filesystem. None of
+them has ever known whether SVT is there. The page parser is a pattern scan
+over an undocumented API, so it breaking is a *when*, not an *if*.
+
+The canary closes that gap. Roughly once an hour it re-checks **the mappings
+you actually have** — not a hardcoded show, because a hardcoded show ends, gets
+re-slugged, and then reports a failure that is about the fixture rather than
+the service. Checking your own rows answers "do my mappings still work" as a
+side effect.
+
+It reads and never writes. The only call it makes is the same read-only episode
+listing the resolver already makes, and it never touches `mappings.yaml`,
+`config.yaml`, the job store, or Sonarr.
+
+### A page that answers with no episodes counts as a failure
+
+This is the point of the whole thing. When SVT's format changes the request
+still succeeds — HTTP 200, a real page — and there is simply nothing in it the
+parser recognises. Counting that as "SVT answered, so we are fine" would report
+`ok` through precisely the outage the check exists to catch.
+
+### The two failure shapes
+
+They need different actions, so they are reported differently:
+
+| `svt.state` | What it means | What to do |
+| --- | --- | --- |
+| `ok` | Every mapping resolved. | Nothing. |
+| `svt` | **None** of them did. | This is SVT or the parser, not any one show. Nothing will be grabbed until it is fixed. |
+| `series` | Some did, some did not. | Those shows ended, were re-slugged, or moved. `failing_series` names them; fix one row each. |
+| `no_mappings` | Nothing to check. | Nothing — a fresh install legitimately has no mappings. |
+| `unknown` | No check has completed since the service started. | Wait. It is deliberately not reported as `ok`. |
+| `stale` | No check has completed for three intervals. | Something is wrong with the check itself; look in the log. |
+| `unavailable` | The check's own state could not be read. | Look in the log. |
+
+`svt.alive` is separate, and is reported the same way `worker_alive` is: a
+monitoring task that quietly stopped monitoring must not look like one that is
+working. `false` means nothing is checking SVT at all — restart the service.
+
+`svt`, `series` and `stale`, and `alive: false`, each set `/health`'s top-level
+`status` to `"degraded"` and show up on the configuration page's status strip.
+`unknown` does not: for the first interval after a restart nothing is known to
+be *wrong*, and a check that reported degraded on every boot is one you would
+learn to ignore. It becomes `stale` if it never resolves, so it cannot sit
+quietly forever.
+
+### What it reports
+
+Alongside `state` and `alive`: `checked` and `failing` (the counts that
+separate the two shapes), `episodes_seen`, `last_checked` and `last_success`
+with their ages in seconds, `last_error` with `last_error_at`, and
+`failing_series` — up to five failing rows by name and slug, with
+`failing_series_truncated` when there are more.
+
+`last_success` survives a later failure on purpose. "SVT worked an hour ago and
+is failing now" and "SVT has never been confirmed working since this service
+started" call for different reactions.
+
+### It is in memory, and resets on restart
+
+What this answers is "is SVT answering *now*", which a restart genuinely
+invalidates: a success recorded by the process that died proves nothing about
+the one that replaced it. So after a restart the state is `unknown` until the
+first check completes — stated explicitly rather than implied by a blank field.
+
+### Load on SVT
+
+With N mappings and the default hourly interval that is N requests per hour.
+They are staggered a couple of seconds apart and at most two are ever in flight
+at once, so a large library never arrives as a burst; each request has its own
+timeout, so a slow or hanging SVT costs one check and can neither stall the
+loop nor affect downloads. See `svt_canary_interval_minutes` above to slow it
+down further.
 
 ## How saves through the configuration page behave
 

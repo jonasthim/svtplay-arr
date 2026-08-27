@@ -35,6 +35,7 @@ from fastapi import FastAPI
 from svtplay_arr.api.config_ui import build_config_router
 from svtplay_arr.api.newznab import build_newznab_router
 from svtplay_arr.api.sab import build_sab_router
+from svtplay_arr.canary import SvtCanary, unavailable_status
 from svtplay_arr.config import Settings
 from svtplay_arr.downloader import SvtplayDlDownloader
 from svtplay_arr.mappings import ReloadingMappingTable
@@ -80,13 +81,30 @@ def create_app(settings: Settings) -> FastAPI:
         settings.completed_dir,
         settings.max_concurrent_downloads,
     )
+    # The one thing in this service that knows whether SVT is still there.
+    # Handed `mapping_table.all` -- the live table the resolver serves from,
+    # not a second copy -- so it checks exactly the rows the feed offers,
+    # and picks up a mapping added through the config page on its next round
+    # with no restart. It calls `SvtClient.list_episodes` and nothing else;
+    # see canary.py for why it is the operator's own mappings rather than a
+    # hardcoded show, and why zero episodes counts as a failure.
+    #
+    # The interval is floored at a minute: config.yaml is hand-editable, and
+    # `svt_canary_interval_minutes: 0` would otherwise become a loop firing
+    # at SVT's unofficial API as fast as it can answer.
+    canary = SvtCanary(
+        mapping_table.all,
+        svt_client,
+        interval_s=max(1, settings.svt_canary_interval_minutes) * 60.0,
+    )
 
-    # Set by the lifespan below once the worker task is created, and read by
-    # /health via `nonlocal`. A plain module-level variable would leak state
-    # across the multiple apps a single test session creates; a closure over
-    # a local keeps each create_app() call's health check scoped to its own
-    # worker.
+    # Set by the lifespan below once the background tasks are created, and
+    # read by /health via `nonlocal`. Plain module-level variables would leak
+    # state across the multiple apps a single test session creates; closures
+    # over locals keep each create_app() call's health check scoped to its
+    # own worker and its own canary.
     worker_task: asyncio.Task | None = None
+    canary_task: asyncio.Task | None = None
 
     def compute_health() -> dict:
         """The one computation behind both `/health` and the config page's
@@ -131,10 +149,31 @@ def create_app(settings: Settings) -> FastAPI:
             log.exception("/health: could not read the mapping table's status")
             mappings = {"ever_loaded": False, "degraded": True, "count": None}
 
+        # The one thing here that is about the world outside this process.
+        # Everything above reports on the service itself, which is exactly
+        # why an SVT format change could empty the feed while every field
+        # above stayed green -- see canary.py. `alive` is folded in on the
+        # same precedent as `worker_alive`: a monitoring task that silently
+        # stopped monitoring must not look like one that is working, or the
+        # canary becomes a second silence rather than the end of the first.
+        try:
+            svt = canary.status()
+        except Exception:
+            log.exception("/health: could not read the SVT canary's status")
+            svt = unavailable_status()
+        svt["alive"] = canary_task is not None and not canary_task.done()
+        if not svt["alive"]:
+            svt["degraded"] = True
+
         same_fs = settings.dirs_share_filesystem()
         status = (
             "ok"
-            if (same_fs and worker_alive and not mappings["degraded"])
+            if (
+                same_fs
+                and worker_alive
+                and not mappings["degraded"]
+                and not svt["degraded"]
+            )
             else "degraded"
         )
         return {
@@ -142,6 +181,11 @@ def create_app(settings: Settings) -> FastAPI:
             "same_filesystem": same_fs,
             "worker_alive": worker_alive,
             "active_jobs": active_jobs,
+            # Is SVT still there, does the parser still work, and do the
+            # operator's own mappings still resolve? Added, never folded
+            # into an existing field: Sonarr health-check setups may poll
+            # this endpoint, so every key above keeps its name and type.
+            "svt": svt,
             # How many series the feed is currently offering. Zero is not
             # itself reported as degraded -- a fresh install legitimately
             # has no mappings yet -- but it is the number to look at when
@@ -154,9 +198,28 @@ def create_app(settings: Settings) -> FastAPI:
             "mappings_degraded": mappings["degraded"],
         }
 
+    async def _stop(task: asyncio.Task, what: str) -> None:
+        """Cancel a background task and await it, whatever state it is in.
+
+        Shared by the worker and the canary so their shutdowns cannot drift.
+        A task may already have died from an unrelated exception before
+        shutdown began (see /health's `worker_alive` and `svt.alive` checks
+        above) -- cancel() is then a no-op and awaiting it re-raises that
+        original failure. It was already logged where it happened; shutdown
+        must still proceed and close the HTTP client regardless.
+        """
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.exception("%s task had already failed at shutdown", what)
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        nonlocal worker_task
+        nonlocal worker_task, canary_task
+        tasks: list[tuple[asyncio.Task, str]] = []
         try:
             # Must run before any job is dispatched: this is what removes
             # anything a crash left behind in incomplete/ so a stale partial
@@ -166,31 +229,31 @@ def create_app(settings: Settings) -> FastAPI:
             # problem) can still escape here -- this must not leak `http`
             # unclosed if it does.
             worker.sweep_incomplete()
-            task = asyncio.create_task(worker.run_forever())
-            worker_task = task
+            worker_task = asyncio.create_task(worker.run_forever())
+            tasks.append((worker_task, "worker"))
+            # Started after the worker and stopped alongside it. It drives
+            # the same `http` client the routes do, so it must be cancelled
+            # and awaited before that client is closed below -- otherwise a
+            # round in flight at shutdown would raise into a closed client.
+            canary_task = asyncio.create_task(canary.run_forever())
+            tasks.append((canary_task, "SVT canary"))
+            app.state.svt_canary_task = canary_task
         except Exception:
             # Both of these were opened by create_app, before this lifespan
             # was entered, so nothing else will ever release them if startup
-            # dies here.
+            # dies here. Anything already started is stopped first, so a
+            # failure part-way through startup cannot leave a task running
+            # against resources this is about to close.
+            for task, what in tasks:
+                await _stop(task, what)
             await http.aclose()
             store.close()
             raise
         try:
             yield
         finally:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                # The task may already have died from an unrelated exception
-                # before shutdown even began (see /health's worker_alive
-                # check above) -- cancel() is then a no-op and awaiting it
-                # re-raises that original failure. It was already logged
-                # from inside run_forever's own crash; shutdown must still
-                # proceed and close the HTTP client below regardless.
-                log.exception("worker task had already failed at shutdown")
+            for task, what in tasks:
+                await _stop(task, what)
             await http.aclose()
             # Last, and deliberately after the worker task has been both
             # cancelled and awaited above: the worker writes job progress
@@ -219,6 +282,13 @@ def create_app(settings: Settings) -> FastAPI:
     # shutdown, and that is only observable from outside if the very store
     # the app uses is reachable.
     app.state.job_store = store
+    # Exposed so a test can drive one round of the *app's own* canary --
+    # the same object /health reports on, not a second one built for the
+    # occasion -- rather than waiting out its startup delay and then an
+    # hour. `app.state.svt_canary_task` is set by the lifespan above, and is
+    # what makes "the canary task died" observable from outside.
+    app.state.svt_canary = canary
+    app.state.svt_canary_task = None
     # The mapping table is passed alongside the resolver (which reads the
     # same instance) because the Newznab module needs `series_title` for
     # its `q` filter and must not reach into the resolver's internals.

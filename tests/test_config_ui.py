@@ -3410,9 +3410,188 @@ def _sample_health(**overrides) -> dict:
         "mappings": 3,
         "mappings_ever_loaded": True,
         "mappings_degraded": False,
+        "svt": _sample_svt(),
     }
     base.update(overrides)
     return base
+
+
+def _sample_svt(**overrides) -> dict:
+    """The canary half of that dict (see app.compute_health / canary.py)."""
+    base = {
+        "state": "ok",
+        "degraded": False,
+        "alive": True,
+        "checked": 3,
+        "failing": 0,
+        "episodes_seen": 41,
+        "last_checked": "2026-08-27T09:00:00+00:00",
+        "last_success": "2026-08-27T09:00:00+00:00",
+        "last_checked_age_s": 720.0,
+        "last_success_age_s": 720.0,
+        "last_error": None,
+        "last_error_at": None,
+        "failing_series": [],
+        "failing_series_truncated": False,
+    }
+    base.update(overrides)
+    return base
+
+
+def _strip_of(body: str) -> str:
+    start = body.index('class="status-strip"')
+    return " ".join(body[start: body.index("</div>", start)].split())
+
+
+def _canary_page(tmp_path: Path, **svt) -> str:
+    cfg, maps = _paths(tmp_path)
+    app = FastAPI()
+    app.include_router(
+        build_config_router(
+            cfg, maps, FakeSvt(), FakeSonarr(),
+            status_provider=lambda: _sample_health(svt=_sample_svt(**svt)),
+        )
+    )
+    return TestClient(app).get("/config").text
+
+
+# --- The SVT canary on the strip -------------------------------------------
+#
+# The strip's headline question is "is SVT working, and when did we last
+# confirm it". These are about rendering only: the states themselves come
+# from canary.py and the wiring from test_app.py.
+
+
+def test_a_working_canary_reads_as_ok_with_when_it_was_confirmed(tmp_path: Path):
+    strip = _strip_of(_canary_page(tmp_path))
+    assert "SVT: ok" in strip
+    assert "3 mappings" in strip
+    assert "41 episodes" in strip
+    assert "confirmed 12 min ago" in strip
+    assert "status-chip error" not in strip
+
+
+def test_a_never_checked_canary_does_not_read_as_ok(tmp_path: Path):
+    # The defect this whole feature removes, rebuilt one level up: a strip
+    # that rendered an unchecked canary as "ok" would put the reassuring
+    # word in front of the operator for a service that has confirmed
+    # nothing at all.
+    body = _canary_page(
+        tmp_path, state="unknown", checked=0, failing=0, episodes_seen=0,
+        last_checked=None, last_success=None,
+        last_checked_age_s=None, last_success_age_s=None,
+    )
+    strip = _strip_of(body)
+    assert "SVT: not checked yet since restart" in strip
+    assert "SVT: ok" not in strip
+    assert "status-chip warn" in strip
+
+
+def test_every_mapping_failing_reads_as_urgent_and_names_the_cause(
+    tmp_path: Path,
+):
+    body = _canary_page(
+        tmp_path, state="svt", degraded=True, checked=3, failing=3,
+        episodes_seen=0, last_error="SVT answered but no episodes could be parsed",
+        failing_series=[
+            {"tvdb_id": 1, "series_title": "A", "svt_slug": "a", "error": "x"},
+        ],
+    )
+    strip = _strip_of(body)
+    assert "SVT: FAILING" in strip
+    assert "none of 3 mappings" in strip
+    assert "status-chip error" in strip
+    # ...and the actionable half, which is what separates "something is
+    # wrong" from "here is what it is and what it means".
+    assert "None of your 3 mappings" in body
+    assert "not at any one show" in body
+    assert "nothing will be grabbed" in body
+
+
+def test_one_mapping_failing_reads_as_that_show_not_as_an_outage(tmp_path: Path):
+    body = _canary_page(
+        tmp_path, state="series", degraded=True, checked=3, failing=1,
+        failing_series=[
+            {"tvdb_id": 7, "series_title": "Ended Show", "svt_slug": "ended-show",
+             "error": "404"},
+        ],
+    )
+    strip = _strip_of(body)
+    assert "SVT: 1 of 3 mappings" in strip
+    assert "status-chip error" in strip
+    assert "SVT: FAILING" not in strip
+    assert "Ended Show (ended-show)" in body
+    assert "re-slugged" in body
+    # The urgent shape's claim must not appear here: it would send the
+    # operator looking for an outage that is not happening.
+    assert "None of your" not in body
+
+
+def test_a_long_failure_list_is_truncated_with_a_count(tmp_path: Path):
+    body = _canary_page(
+        tmp_path, state="series", degraded=True, checked=20, failing=9,
+        failing_series=[
+            {"tvdb_id": i, "series_title": f"S{i}", "svt_slug": f"s{i}",
+             "error": "404"}
+            for i in range(5)
+        ],
+        failing_series_truncated=True,
+    )
+    assert "and 4 more" in " ".join(body.split())
+
+
+def test_a_dead_canary_task_reads_as_nothing_is_checking(tmp_path: Path):
+    body = _canary_page(
+        tmp_path, state="unknown", degraded=True, alive=False,
+        checked=0, failing=0, last_checked=None, last_success=None,
+        last_checked_age_s=None, last_success_age_s=None,
+    )
+    strip = _strip_of(body)
+    assert "SVT: NOT BEING CHECKED" in strip
+    assert "status-chip error" in strip
+    assert "Nothing is checking SVT any more" in body
+
+
+def test_a_stalled_canary_says_so(tmp_path: Path):
+    body = _canary_page(
+        tmp_path, state="stale", degraded=True, checked=3, failing=0,
+        last_checked_age_s=14400.0, last_success_age_s=14400.0,
+    )
+    strip = _strip_of(body)
+    assert "SVT: CHECK STALLED" in strip
+    assert "240 min" in strip
+
+
+def test_no_mappings_is_neither_a_success_nor_a_failure(tmp_path: Path):
+    # A fresh install legitimately has nothing to check. Rendering that as
+    # "ok" would claim SVT was confirmed working when nothing asked it.
+    body = _canary_page(
+        tmp_path, state="no_mappings", checked=0, failing=0, episodes_seen=0,
+        last_success=None, last_success_age_s=None,
+    )
+    strip = _strip_of(body)
+    assert "SVT: no mappings to check" in strip
+    assert "SVT: ok" not in strip
+    assert "status-chip error" not in strip
+
+
+def test_a_status_dict_without_a_canary_still_renders_the_rest(tmp_path: Path):
+    # Every other test in this file builds a router without a canary at all;
+    # the strip must degrade to omitting the chip rather than failing the
+    # page, which is what any dict predating this field would produce.
+    cfg, maps = _paths(tmp_path)
+    app = FastAPI()
+    health = _sample_health()
+    del health["svt"]
+    app.include_router(
+        build_config_router(
+            cfg, maps, FakeSvt(), FakeSonarr(), status_provider=lambda: health,
+        )
+    )
+    body = TestClient(app).get("/config").text
+    strip = _strip_of(body)
+    assert "Worker: alive" in strip
+    assert "SVT:" not in strip
 
 
 def test_no_status_provider_renders_no_status_strip(tmp_path: Path):

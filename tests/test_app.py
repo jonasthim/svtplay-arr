@@ -1,6 +1,8 @@
+import asyncio
+import hashlib
 import os
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
@@ -9,7 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 from svtplay_arr.app import create_app
 from svtplay_arr.config import ConfigError, Settings
-from svtplay_arr.models import Release
+from svtplay_arr.models import Release, SvtEpisode
 from svtplay_arr.store import JobStoreError
 
 
@@ -663,3 +665,336 @@ def test_a_text_query_reaches_the_live_mapping_table(tmp_path: Path, monkeypatch
     assert ET.fromstring(miss).findall(".//item") == []
     # And the feed Sonarr's indexer test fires is untouched by any of this.
     assert len(ET.fromstring(bare).findall(".//item")) == 1
+
+
+# --- The SVT canary --------------------------------------------------------
+#
+# The one silence this service could not detect was its own. Everything
+# /health knew about was *this* process -- the worker, the store, the
+# mapping table, the filesystem -- so an SVT format change left the parser
+# returning [], the feed empty, Sonarr grabbing nothing, and /health saying
+# "ok" throughout. These tests are about the wiring: one computation behind
+# both surfaces, and a canary whose own death is visible.
+
+
+def _mappings_file(tmp_path: Path, *rows: tuple[int, str, str]) -> None:
+    body = "series:\n"
+    for tvdb_id, slug, title in rows:
+        body += (
+            f"  - tvdb_id: {tvdb_id}\n"
+            f"    svt_series_id: svt{tvdb_id}\n"
+            f"    svt_slug: {slug}\n"
+            f"    series_title: {title}\n"
+        )
+    (tmp_path / "mappings.yaml").write_text(body, encoding="utf-8")
+
+
+def _episode(i: int) -> SvtEpisode:
+    return SvtEpisode(
+        svt_id=f"e{i}", title=f"{i}. Avsnitt", url=f"/video/e{i}/s/avsnitt-{i}",
+        ordinal=i, published=date(2026, 8, 20), available=True, duration_s=1800,
+    )
+
+
+def _svt_returns(monkeypatch, per_slug: dict) -> list[str]:
+    """Point the app's real SvtClient at canned episode lists.
+
+    Patched on the class create_app actually constructs, so the canary is
+    exercised through the same client `Resolver` uses rather than through a
+    stand-in wired up for the test. Returns the list every requested slug
+    is appended to. A slug with no entry parses to zero episodes, which is
+    what an SVT format change looks like from here.
+    """
+    seen: list[str] = []
+
+    async def _list_episodes(self, slug):
+        seen.append(slug)
+        outcome = per_slug.get(slug, [])
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(
+        "svtplay_arr.svt.client.SvtClient.list_episodes", _list_episodes
+    )
+    return seen
+
+
+def _run_a_canary_round(app) -> None:
+    """Drive one round of the app's own canary, synchronously.
+
+    The canary otherwise settles for its startup delay and then sleeps an
+    hour, so a test that wants to see a round has to ask for one. This is
+    the app's real canary -- the same object `/health` reports on -- not a
+    second instance built for the test, which is the only way these tests
+    can say anything about the wiring.
+    """
+    asyncio.run(app.state.svt_canary.run_once())
+
+
+def test_health_carries_the_canary_and_never_calls_an_unknown_healthy(
+    tmp_path: Path,
+):
+    # A fresh process has checked nothing. Reporting that as "ok" would
+    # rebuild the exact defect this feature removes, one level up.
+    with TestClient(create_app(_settings(tmp_path))) as c:
+        svt = c.get("/health").json()["svt"]
+    assert svt["state"] == "unknown"
+    assert svt["state"] != "ok"
+    assert svt["last_checked"] is None
+    assert svt["last_success"] is None
+    assert svt["alive"] is True
+
+
+def test_an_unchecked_canary_does_not_cry_wolf(tmp_path: Path):
+    # It must not read as healthy, but it must not make every restart
+    # report a degraded service either -- a check that is degraded for the
+    # first hour of every boot is one operators learn to ignore.
+    with TestClient(create_app(_settings(tmp_path))) as c:
+        body = c.get("/health").json()
+    assert body["svt"]["degraded"] is False
+    assert body["status"] == "ok"
+
+
+def test_healths_existing_fields_are_unchanged_by_the_canary(tmp_path: Path):
+    # Sonarr health-check setups may poll /health. The canary is additive:
+    # nothing existing may be removed, renamed or retyped.
+    with TestClient(create_app(_settings(tmp_path))) as c:
+        body = c.get("/health").json()
+    assert body["status"] == "ok"
+    assert body["same_filesystem"] is True
+    assert body["worker_alive"] is True
+    assert body["active_jobs"] == 0
+    assert body["mappings"] == 0
+    assert body["mappings_ever_loaded"] is False
+    assert body["mappings_degraded"] is False
+
+
+def test_health_flags_a_dead_canary_task(tmp_path: Path, monkeypatch):
+    # Same precedent as worker_alive: a background task that silently
+    # stopped doing its job must not look like one that is doing it. A dead
+    # canary would otherwise sit at "unknown" forever -- the one way this
+    # feature could reintroduce the silence it exists to remove.
+    async def _dies_immediately(self):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(
+        "svtplay_arr.canary.SvtCanary.run_forever", _dies_immediately
+    )
+
+    with TestClient(create_app(_settings(tmp_path))) as c:
+        deadline = time.monotonic() + 2.0
+        body = c.get("/health").json()
+        while body["svt"]["alive"] and time.monotonic() < deadline:
+            time.sleep(0.02)
+            body = c.get("/health").json()
+
+        assert body["svt"]["alive"] is False
+        assert body["svt"]["degraded"] is True
+        assert body["status"] == "degraded"
+
+        page = c.get("/config").text
+        assert "SVT: NOT BEING CHECKED" in page
+        assert 'class="status-chip error"' in page
+
+
+def test_the_canary_checks_the_operators_own_mappings(tmp_path: Path, monkeypatch):
+    # Not a hardcoded show: a hardcoded slug is a fixture that rots -- the
+    # show ends, SVT retires the URL, and the canary reports a failure about
+    # the fixture rather than the service. Checking the operator's real rows
+    # answers "do my mappings still work" as a side effect.
+    _mappings_file(
+        tmp_path,
+        (1, "gift-vid-forsta-ogonkastet", "Gift vid första ögonkastet"),
+        (2, "morgonstudion", "Morgonstudion"),
+    )
+    seen = _svt_returns(
+        monkeypatch,
+        {
+            "gift-vid-forsta-ogonkastet": [_episode(1), _episode(2)],
+            "morgonstudion": [_episode(1), _episode(2)],
+        },
+    )
+
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as c:
+        _run_a_canary_round(app)
+        svt = c.get("/health").json()["svt"]
+
+    assert sorted(seen) == ["gift-vid-forsta-ogonkastet", "morgonstudion"]
+    assert svt["state"] == "ok"
+    assert svt["checked"] == 2
+    assert svt["failing"] == 0
+    assert svt["episodes_seen"] == 4
+    assert svt["last_success"] is not None
+
+
+def test_every_mapping_failing_reads_as_svt_or_the_parser(
+    tmp_path: Path, monkeypatch,
+):
+    # The urgent shape: nothing will be grabbed until it is fixed, and the
+    # operator can do nothing about the cause but must know immediately.
+    # Every slug here returns a page that parses to zero episodes, which is
+    # exactly what an SVT format change looks like from this side.
+    _mappings_file(tmp_path, (1, "a-show", "A Show"), (2, "b-show", "B Show"))
+    _svt_returns(monkeypatch, {})
+
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as c:
+        _run_a_canary_round(app)
+        body = c.get("/health").json()
+        page = c.get("/config").text
+
+    assert body["svt"]["state"] == "svt"
+    assert body["svt"]["checked"] == 2
+    assert body["svt"]["failing"] == 2
+    assert body["status"] == "degraded"
+    assert "SVT: FAILING" in page
+    assert 'class="status-chip error"' in page
+
+
+def test_one_mapping_failing_reads_as_that_show(tmp_path: Path, monkeypatch):
+    # The other shape, and it needs a different action: this show ended, was
+    # re-slugged, or moved, and the operator fixes it by editing one row. So
+    # the row has to be nameable from the report -- a single boolean cannot
+    # tell these two apart, which is the whole reason this reports counts.
+    _mappings_file(tmp_path, (1, "a-show", "A Show"), (2, "b-show", "B Show"))
+    _svt_returns(monkeypatch, {"a-show": [_episode(1)]})
+
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as c:
+        _run_a_canary_round(app)
+        body = c.get("/health").json()
+        page = c.get("/config").text
+
+    assert body["svt"]["state"] == "series"
+    assert body["svt"]["checked"] == 2
+    assert body["svt"]["failing"] == 1
+    assert [f["tvdb_id"] for f in body["svt"]["failing_series"]] == [2]
+    assert body["status"] == "degraded"
+    # Scoped to the canary's own banner, not the page: the mappings table
+    # below prints every series title, so an unscoped search for "B Show"
+    # would pass with nothing about the canary rendered at all.
+    banner = _canary_banner(page)
+    assert "B Show" in banner
+    assert "b-show" in banner
+    assert "1 of 2 mappings" in banner
+    # The urgent shape's wording must not appear for a single failing show:
+    # it would send the operator looking for an outage that is not there.
+    assert "SVT: FAILING" not in page
+
+
+def test_the_config_page_and_health_agree_about_the_canary(
+    tmp_path: Path, monkeypatch,
+):
+    # One computation, two surfaces. Two places deriving one fact and
+    # drifting apart is this codebase's most common defect class, and a
+    # status strip disagreeing with /health would be worse than no strip --
+    # the operator trusts the one in front of them.
+    _mappings_file(tmp_path, (1, "a-show", "A Show"))
+    _svt_returns(monkeypatch, {})
+
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as c:
+        _run_a_canary_round(app)
+        body = c.get("/health").json()
+        page = c.get("/config").text
+
+    assert body["svt"]["state"] == "svt"
+    assert body["status"] == "degraded"
+    assert "Service: degraded" in page
+    assert "SVT: FAILING" in page
+    # The count the page prints is the count /health computed, not a second
+    # tally taken while rendering.
+    assert f"{body['svt']['checked']} mapping" in page
+
+
+def test_a_canary_round_that_raises_leaves_the_service_healthy(
+    tmp_path: Path, monkeypatch,
+):
+    # The canary failing must never degrade the service: an exception in it
+    # cannot kill the loop, the worker, or a request.
+    async def _boom(self):
+        raise RuntimeError("canary is on fire")
+
+    monkeypatch.setattr("svtplay_arr.canary.SvtCanary.run_once", _boom)
+
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as c:
+        asyncio.run(app.state.svt_canary.run_once_guarded())
+        body = c.get("/health").json()
+        assert body["worker_alive"] is True
+        assert body["svt"]["alive"] is True
+        assert body["status"] == "ok"
+        assert c.get("/config").status_code == 200
+
+
+def test_health_never_500s_on_a_broken_canary(tmp_path: Path, monkeypatch):
+    # Same rule as the mapping table's own guard: /health is monitoring
+    # infrastructure and must not be able to fail the thing it monitors.
+    def _boom(self):
+        raise RuntimeError("canary state is on fire")
+
+    monkeypatch.setattr("svtplay_arr.canary.SvtCanary.status", _boom)
+
+    with TestClient(create_app(_settings(tmp_path))) as c:
+        resp = c.get("/health")
+        assert resp.status_code == 200
+        assert resp.json()["svt"]["state"] == "unavailable"
+        assert resp.json()["svt"]["degraded"] is True
+        assert resp.json()["status"] == "degraded"
+        assert c.get("/config").status_code == 200
+
+
+def test_the_canary_never_writes_anything(tmp_path: Path, monkeypatch):
+    # Read-only observation. It may not call the resolver's write paths or
+    # the mapping writer, and nothing on disk may move because it ran.
+    _mappings_file(tmp_path, (1, "a-show", "A Show"))
+    _svt_returns(monkeypatch, {"a-show": [_episode(1)]})
+
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as c:
+        before = _tree_digest(tmp_path)
+        _run_a_canary_round(app)
+        _run_a_canary_round(app)
+        assert _tree_digest(tmp_path) == before
+        assert c.get("/health").json()["active_jobs"] == 0
+        assert app.state.job_store.all_active() == []
+
+
+def _canary_banner(page: str) -> str:
+    """The canary's own banner, isolated from the rest of the page.
+
+    The mappings table renders every series title, so an assertion made
+    against the whole page can pass while the canary rendered nothing at
+    all. The banner is the first `<p class="error">` after the status
+    strip, which is where base.html puts it.
+    """
+    strip_end = page.index('class="status-strip"')
+    strip_end = page.index("</div>", strip_end)
+    start = page.index('<p class="error">', strip_end)
+    return " ".join(page[start: page.index("</p>", start)].split())
+
+
+def _tree_digest(root: Path) -> dict:
+    return {
+        str(p): (p.stat().st_mtime, hashlib.sha256(p.read_bytes()).hexdigest())
+        for p in sorted(root.rglob("*"))
+        if p.is_file()
+    }
+
+
+def test_shutdown_cancels_the_canary_task(tmp_path: Path):
+    # Same lifetime as the worker, and for a concrete reason: the canary
+    # drives the shared httpx client, so it has to be stopped before the
+    # lifespan closes it.
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as c:
+        assert c.get("/health").json()["svt"]["alive"] is True
+    assert app.state.svt_canary_task.done() is True
+
+
+def test_health_never_exposes_the_api_key_through_the_canary(tmp_path: Path):
+    s = _settings(tmp_path)
+    with TestClient(create_app(s)) as c:
+        assert s.sonarr_api_key not in c.get("/health").text

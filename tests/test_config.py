@@ -246,3 +246,67 @@ async def test_svt_ua_from_the_file_reaches_svt(tmp_path: Path):
     await client.search_series("anything")
 
     assert seen["ua"] == "some-other-client"
+
+
+# --- svt_canary_interval_minutes -------------------------------------------
+#
+# Same shape as svt_ua above, and for the same reason: an escape hatch read
+# from the file but deliberately kept off the settings form. It is how an
+# operator on a metered or rate-limited connection reduces load on SVT's
+# unofficial API without a code change. A setting that is read but never
+# reaches anything is the same silent failure one layer along, so the whole
+# path is pinned -- including the floor, since config.yaml is hand-editable
+# and a 0 would otherwise become a loop firing at SVT as fast as it answers.
+
+
+def test_the_canary_interval_is_read_from_the_file(tmp_path: Path):
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "sonarr_url: http://x\nsonarr_api_key: k\n"
+        "incomplete_dir: /a\ncompleted_dir: /b\n"
+        "svt_canary_interval_minutes: 180\n",
+        encoding="utf-8",
+    )
+    assert Settings.load(cfg).svt_canary_interval_minutes == 180
+
+
+def test_the_canary_interval_falls_back_to_the_dataclass_default(tmp_path: Path):
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "sonarr_url: http://x\nsonarr_api_key: k\n"
+        "incomplete_dir: /a\ncompleted_dir: /b\n",
+        encoding="utf-8",
+    )
+    loaded = Settings.load(cfg)
+    assert loaded.svt_canary_interval_minutes == Settings.svt_canary_interval_minutes
+    assert loaded.svt_canary_interval_minutes == 60  # roughly hourly
+
+
+def test_the_canary_interval_is_not_on_the_settings_form(tmp_path: Path):
+    # Like svt_ua and the two paths above it: read from the file, not one
+    # click away. Turning it down makes the check noisier for no benefit --
+    # the failure it detects lasts until a human fixes it.
+    assert "svt_canary_interval_minutes" not in {f.key for f in SETTING_FIELDS}
+    assert "svt_canary_interval_minutes" not in setting_defaults()
+
+
+def test_a_zero_canary_interval_cannot_become_a_busy_loop(tmp_path: Path):
+    # config.yaml is hand-editable, so the floor lives where the canary is
+    # constructed rather than in the loader (which must keep round-tripping
+    # whatever is in the file).
+    from svtplay_arr.app import create_app
+
+    (tmp_path / "i").mkdir()
+    (tmp_path / "c").mkdir()
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "sonarr_url: http://x\nsonarr_api_key: k\n"
+        f"incomplete_dir: {tmp_path}/i\ncompleted_dir: {tmp_path}/c\n"
+        f"db_path: {tmp_path}/jobs.db\nmappings_file: {tmp_path}/mappings.yaml\n"
+        "svt_canary_interval_minutes: 0\n",
+        encoding="utf-8",
+    )
+    settings = Settings.load(cfg)
+    assert settings.svt_canary_interval_minutes == 0
+    app = create_app(settings)
+    assert app.state.svt_canary._interval >= 60.0

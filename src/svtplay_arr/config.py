@@ -45,6 +45,15 @@ class Settings:
     # rejecting this string is something an operator can work around
     # without a code change, not as a setting anyone should be adjusting.
     svt_ua: str = "svtplaywebb-play-render-prod-client"
+    # How often the SVT canary re-checks the operator's mappings (see
+    # canary.py). Read from config.yaml but deliberately not on the settings
+    # form, for the same reason as svt_ua above: it is an escape hatch, not
+    # a knob. Turning it up is how an operator on a metered or rate-limited
+    # connection reduces load on SVT's unofficial API without a code change;
+    # turning it down makes the check noisier for no benefit, since the
+    # failure it detects lasts until someone fixes it. Floored at 1 minute
+    # by create_app so a 0 cannot become a busy loop against SVT.
+    svt_canary_interval_minutes: int = 60
     # Only set when constructed via Settings.load(): the config page needs
     # to know which file it came from. Directly-constructed Settings (as in
     # most tests) leave this None.
@@ -94,6 +103,11 @@ class Settings:
             # dangerous-field class, and an escape hatch for SVT rejecting
             # the default identifier does not need to be one click away.
             svt_ua=str(raw.get("svt_ua") or cls.svt_ua),
+            svt_canary_interval_minutes=int(
+                raw.get(
+                    "svt_canary_interval_minutes", cls.svt_canary_interval_minutes
+                )
+            ),
             config_path=path,
         )
 

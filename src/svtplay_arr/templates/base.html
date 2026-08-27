@@ -436,7 +436,91 @@
       Active jobs:
       {{- ' ' }}{{ health.active_jobs if health.active_jobs is not none else 'unknown' }}
     </span>
+    {#- The one fact on this strip that is about the world outside this
+        process. Every other chip reports on the service itself, which is
+        exactly why an SVT format change could empty the feed while the
+        whole strip stayed green: the parser returns [], the resolver
+        returns nothing, Sonarr grabs nothing, and nothing above notices.
+        `health.svt` is /health's own already-computed verdict (see
+        canary.py and app.compute_health); this renders it and derives
+        none of it. Guarded, so a status_provider that predates the canary
+        -- or any dict without an `svt` key -- renders the rest of the
+        strip rather than failing. #}
+    {%- if health.svt %}
+    {%- set svt = health.svt %}
+    {%- set checked = svt.checked or 0 %}
+    <span class="status-chip{{ ' error' if svt.degraded else (' warn' if svt.state == 'unknown' else '') }}">
+      {%- if not svt.alive %}
+      SVT: NOT BEING CHECKED &mdash; the canary task has died
+      {%- elif svt.state == 'unavailable' %}
+      SVT: status unavailable
+      {%- elif svt.state == 'stale' %}
+      SVT: CHECK STALLED &mdash; no check has completed for
+      {{ (svt.last_checked_age_s / 60) | round | int if svt.last_checked_age_s
+         is not none else 'the whole time this service has been up' }}
+      {{- ' min' if svt.last_checked_age_s is not none }}
+      {%- elif svt.state == 'svt' %}
+      SVT: FAILING &mdash; none of {{ checked }} mapping{{ '' if checked == 1 else 's' }}
+      resolved
+      {%- elif svt.state == 'series' %}
+      SVT: {{ svt.failing }} of {{ checked }} mapping{{ '' if checked == 1 else 's' }}
+      failing
+      {%- elif svt.state == 'unknown' %}
+      SVT: not checked yet since restart
+      {%- elif svt.state == 'no_mappings' %}
+      SVT: no mappings to check
+      {%- else %}
+      SVT: ok &mdash; {{ checked }} mapping{{ '' if checked == 1 else 's' }},
+      {{ svt.episodes_seen }} episodes
+      {%- if svt.last_success_age_s is not none %},
+      confirmed {{ (svt.last_success_age_s / 60) | round | int }} min ago
+      {%- endif %}
+      {%- endif %}
+    </span>
+    {%- endif %}
   </div>
+  {#- The strip is a headline; a degraded canary needs to be actionable,
+      because this is the warning standing between the operator and a month
+      of silently missing episodes. It says which of the two failure shapes
+      this is -- everything failing means SVT or the parser, one show
+      failing means that row -- because they call for completely different
+      actions. Rendered only when something is actually wrong, and the full
+      per-mapping breakdown deliberately stays out of it. #}
+  {%- if health.svt and health.svt.degraded %}
+  {%- set svt = health.svt %}
+  <p class="error">
+    {%- if not svt.alive %}
+    Nothing is checking SVT any more: the background check has died, so a
+    change at SVT would now go unnoticed exactly as it did before this check
+    existed. Restart svtplay-arr, and look in its log for what killed it.
+    {%- elif svt.state == 'unavailable' %}
+    The SVT check could not be read, so nothing here can tell you whether SVT
+    is working. Check svtplay-arr's log.
+    {%- elif svt.state == 'stale' %}
+    No SVT check has completed recently, so nothing currently confirms that
+    SVT is reachable or that the parser still works. Check svtplay-arr's log.
+    {%- elif svt.state == 'svt' %}
+    <strong>None of your {{ svt.checked }} mapping{{ '' if svt.checked == 1 else 's' }}
+    resolved on SVT.</strong> That points at SVT or at this service's page
+    parser, not at any one show &mdash; nothing will be grabbed until it is
+    fixed.
+    {%- if svt.last_success_age_s is not none %}
+    SVT last worked {{ (svt.last_success_age_s / 60) | round | int }} minutes ago.
+    {%- else %}
+    SVT has not been confirmed working since this service started.
+    {%- endif %}
+    {%- if svt.last_error %} Last error: {{ svt.last_error }}{% endif %}
+    {%- elif svt.state == 'series' %}
+    <strong>{{ svt.failing }} of {{ svt.checked }} mappings did not resolve on
+    SVT.</strong> The rest did, so this is about {{ 'that show' if svt.failing == 1
+    else 'those shows' }} rather than SVT &mdash; it has probably ended, been
+    re-slugged, or moved. Fix the row{{ '' if svt.failing == 1 else 's' }} below:
+    {% for f in svt.failing_series %}{{ f.series_title }} ({{ f.svt_slug }}){{ ', '
+    if not loop.last }}{% endfor %}{% if svt.failing_series_truncated %}, and
+    {{ svt.failing - svt.failing_series | length }} more{% endif %}.
+    {%- endif %}
+  </p>
+  {%- endif %}
   {% endif %}
   {% if error %}<p class="error">{{ error }}</p>{% endif %}
   {% if notice %}<p class="notice">{{ notice }}</p>{% endif %}

@@ -59,7 +59,10 @@ service:
     curl localhost:9800/health
     # {"status": "ok", "same_filesystem": true, "worker_alive": true,
     #  "active_jobs": 0, "mappings": 3, "mappings_ever_loaded": true,
-    #  "mappings_degraded": false}
+    #  "mappings_degraded": false,
+    #  "svt": {"state": "ok", "degraded": false, "alive": true,
+    #          "checked": 3, "failing": 0, "episodes_seen": 41,
+    #          "last_success": "2026-08-27T09:00:00+00:00", ...}}
 
 If `same_filesystem` is `false`, `status` is `"degraded"`. Fix the mount
 layout before proceeding — do not add the indexer/download client to Sonarr
@@ -71,6 +74,32 @@ stale table, not the file. The feed keeps working; the file needs fixing.
 `mappings: 0` is not itself reported as degraded (a fresh install has no
 mappings yet) but it is the number to check when Sonarr rejects the indexer,
 because an empty feed is what makes it do that.
+
+The `svt` block is the SVT canary. Everything else on `/health` reports on
+*this* process, which is why an SVT page-format change could empty the feed
+while every other field stayed green: the parser returns nothing, the resolver
+returns nothing, Sonarr grabs nothing, and no existing check notices. Once an
+hour the canary re-checks the mappings you actually have — no hardcoded show,
+because a hardcoded slug rots — and reports:
+
+- `"state": "svt"` — **none** of your mappings resolved. That points at SVT or
+  at this service's page parser, not at any one show. Nothing will be grabbed
+  until it is fixed.
+- `"state": "series"` — some resolved and some did not. Those shows have
+  ended, been re-slugged, or moved; `failing_series` names them and each is
+  fixed by editing one row.
+- `"state": "unknown"` — nothing has been checked since this process started.
+  Deliberately *not* reported as `ok`, and it becomes `"stale"` (and degraded)
+  if no check ever completes.
+- `"alive": false` — the canary's own background task has died, so nothing is
+  checking SVT. Reported the same way `worker_alive` is, and for the same
+  reason: a monitoring task that quietly stopped monitoring must not look like
+  one that is working.
+
+`state` `svt`, `series` and `stale`, and `alive: false`, each set the
+top-level `status` to `"degraded"`. `svt_canary_interval_minutes` in
+`config.yaml` (default 60) is how to slow it down; it is not on the settings
+page.
 
 **If the NFS export squashes identities, do not `chown` anything under this
 mount.** An export configured with `mapall_user` / `mapall_group` (or

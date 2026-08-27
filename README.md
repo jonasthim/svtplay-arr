@@ -325,7 +325,8 @@ Then, in another terminal:
 ```sh
 curl localhost:9800/health
 # {"status":"ok","same_filesystem":true,"worker_alive":true,"active_jobs":0,
-#  "mappings":1,"mappings_ever_loaded":true,"mappings_degraded":false}
+#  "mappings":1,"mappings_ever_loaded":true,"mappings_degraded":false,
+#  "svt":{"state":"unknown","degraded":false,"alive":true, ...}}
 
 curl 'localhost:9800/api/?t=caps'      # must contain tvdbid in supportedParams
 ```
@@ -333,6 +334,12 @@ curl 'localhost:9800/api/?t=caps'      # must contain tvdbid in supportedParams
 If `same_filesystem` is `false`, stop and fix the directory layout before
 going any further — that field exists to catch the one mistake that can
 corrupt your library.
+
+The `svt` block is the SVT canary: once an hour it re-checks the mappings you
+actually have, so a change at SVT that empties the feed is reported instead of
+looking like an idle week. `"state":"unknown"` right after a restart is
+correct — nothing has been checked yet, and it deliberately does not claim to
+be `ok`. See [docs/configuration.md](docs/configuration.md#is-svt-still-working).
 
 </details>
 
