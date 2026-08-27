@@ -208,6 +208,11 @@ def test_a_state_provider_that_raises_leaves_the_page_rendering(tmp_path: Path):
     # ...and no row claims to be fine.
     assert "Resolves" not in row
     assert "Unknown" in row
+    # ...and it says the state could not be read, rather than that nothing
+    # is reporting one. Same distinction as everywhere else on this page:
+    # a read that failed is not an absence of findings, and only one of
+    # the two is worth looking in the log for.
+    assert "could not be read" in row
 
 
 def test_no_state_provider_does_not_claim_every_mapping_resolves(
@@ -217,6 +222,8 @@ def test_no_state_provider_does_not_claim_every_mapping_resolves(
 
     assert "Resolves" not in row
     assert "Unknown" in row
+    # ...and it does not claim a read failed either. Nothing was asked.
+    assert "could not be read" not in row
 
 
 def test_a_mapping_the_provider_says_nothing_about_is_not_called_ok(

@@ -188,13 +188,28 @@ def test_the_sweep_says_it_takes_a_while_before_it_is_clicked(
     assert "minute" in body
 
 
+def _sweep_warning(html: str) -> str:
+    """The paragraph that says what one Find mappings click costs.
+
+    Scoped to that paragraph deliberately. Asserting on the whole page
+    would let the stylesheet answer for it: `_text` keeps the contents of
+    <style>, and a font-weight of 600 is enough to satisfy a search for
+    "600" on a page whose prose has quietly hardcoded something else.
+    """
+    for m in re.finditer(r"<p class=\"help\">(.*?)</p>", html, re.S):
+        text = _text(m.group(1))
+        if "takes a while" in text:
+            return text
+    raise AssertionError(f"no sweep warning paragraph in:\n{html}")
+
+
 def test_the_sweep_names_the_bounds_it_actually_runs_with(tmp_path: Path):
     # Numbers read off the module's own constants rather than written into
     # prose, so the page cannot promise a bound the sweep does not honour.
-    body = _text(_populated_client(tmp_path).get("/config/mappings").text)
+    warning = _sweep_warning(_populated_client(tmp_path).get("/config/mappings").text)
 
-    assert str(_SWEEP_CAP) in body
-    assert str(_SWEEP_REQUEST_BUDGET) in body
+    assert str(_SWEEP_CAP) in warning, warning
+    assert str(_SWEEP_REQUEST_BUDGET) in warning, warning
 
 
 def test_the_sweep_control_is_still_a_plain_form(tmp_path: Path):
