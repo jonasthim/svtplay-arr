@@ -395,6 +395,13 @@ def create_app(settings: Settings) -> FastAPI:
             # cannot be read must not arrive at the page as a store with
             # nothing in it.
             activity_provider=compute_activity,
+            # The canary's own per-mapping record, so the Mappings view
+            # can show a dead row on arrival instead of leaving it to be
+            # discovered with the Check button. `canary.per_mapping` reads
+            # the same in-memory state /health's `svt` block is computed
+            # from -- there is one canary, and nothing re-derives its
+            # findings.
+            mapping_state_provider=canary.per_mapping,
         )
     )
 

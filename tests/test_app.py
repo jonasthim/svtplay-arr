@@ -1115,3 +1115,59 @@ def test_the_activity_view_never_exposes_the_api_key(tmp_path: Path):
     s = _settings(tmp_path)
     with TestClient(create_app(s)) as c:
         assert s.sonarr_api_key not in c.get("/config/activity").text
+
+
+# --- Per-mapping canary state reaches the Mappings view ----------------
+
+
+def test_the_mappings_view_shows_the_apps_own_canary_state(
+    tmp_path: Path, monkeypatch
+):
+    # End to end through the service's real canary: a row that stops
+    # resolving is visible in the Mappings view without anyone pressing
+    # Check. One canary, one set of findings -- this reads the same
+    # in-memory state /health's `svt` block is computed from.
+    _mappings_file(
+        tmp_path,
+        (1, "gift-vid-forsta-ogonkastet", "Gift vid första ögonkastet"),
+        (2, "morgonstudion", "Morgonstudion"),
+    )
+    _svt_returns(
+        monkeypatch,
+        {
+            "gift-vid-forsta-ogonkastet": [_episode(1), _episode(2)],
+            # Answers, parses to nothing: what a retired show or a broken
+            # parser looks like from here.
+            "morgonstudion": [],
+        },
+    )
+
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as c:
+        _run_a_canary_round(app)
+        body = c.get("/config/mappings").text
+        health = c.get("/health").json()
+
+    assert "Failing" in body
+    assert "no episodes could be parsed" in body
+    # ...and the page and /health are describing the same one failing row.
+    assert health["svt"]["failing"] == 1
+
+
+def test_the_mappings_view_never_calls_svt_to_render_that_state(
+    tmp_path: Path, monkeypatch
+):
+    # The state is the canary's, already collected on its own slow loop. A
+    # render that fired a request per mapping would be a new way to hammer
+    # SVT's unofficial API, on the page an operator refreshes.
+    _mappings_file(tmp_path, (1, "gift-vid-forsta-ogonkastet", "Gift"))
+    seen = _svt_returns(monkeypatch, {"gift-vid-forsta-ogonkastet": [_episode(1)]})
+
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as c:
+        _run_a_canary_round(app)
+        seen.clear()
+        c.get("/config/mappings")
+        c.get("/config")
+
+    assert seen == []

@@ -24,7 +24,7 @@
    table itself never called it. #}
 <table class="mappings">
   <thead>
-    <tr><th>Series</th><th>TVDB</th><th>SVT</th><th>Actions</th></tr>
+    <tr><th>Series</th><th>TVDB</th><th>SVT</th><th>SVT check</th><th>Actions</th></tr>
   </thead>
   <tbody>
   {% for m in mappings %}
@@ -35,6 +35,14 @@
      together. Without it on the second row, filtering a mapping away
      would leave its result stranded under someone else's. #}
   {% set filter_text = (m.series_title ~ ' ' ~ m.tvdb_id ~ ' ' ~ m.svt_series_id ~ ' ' ~ m.svt_slug) | lower %}
+  {# What the SVT canary last learned about this row. `none` here is not a
+     row that is fine: it is a row nothing is known about -- no state
+     provider wired in, a provider that failed, or a canary that has not
+     reported this mapping. All three render as Unknown, never as OK.
+     The canary collected this on its own slow loop; rendering it costs no
+     SVT request, and the Check button below is still the only thing on
+     this page that calls SVT. #}
+  {% set state = (mapping_states or {}).get(m.tvdb_id) %}
   <tr class="mapping-row" data-filter-text="{{ filter_text }}">
     {# Provenance sits beside the title rather than in a column of its
        own: the table's real content is series titles, and a fifth column
@@ -53,6 +61,42 @@
     <td data-label="Series">{{ m.series_title }}{% if m.source == 'auto' %} <span class="auto-badge">Auto-matched</span>{% endif %}</td>
     <td data-label="TVDB">{{ m.tvdb_id }}</td>
     <td data-label="SVT">{{ m.svt_series_id }} / {{ m.svt_slug }}</td>
+    {# Deliberately its own column rather than another badge beside the
+       title. `Auto-matched` says *nobody confirmed this is the right
+       show*; this says *this stopped resolving on SVT*. They are
+       independent -- a row can be both -- and a single decorated title
+       would blur two findings that call for different actions.
+
+       A word, not a colour. Same rule as the danger badge and the
+       Auto-matched badge: the marker reached production once as a bare
+       glyph nobody could read, and the fix belongs everywhere rather than
+       only where it was noticed. #}
+    <td data-label="SVT check" class="mapping-state">
+      {%- if state is none %}
+      <span class="status-chip">Unknown</span>
+      <span class="help">{% if mapping_states_unavailable %}The background
+        SVT check's state could not be read. Use Check to test this row
+        now.{% else %}Nothing is reporting this row's SVT check state. Use
+        Check to test it now.{% endif %}</span>
+      {%- elif state.ok is none %}
+      <span class="status-chip">Not checked</span>
+      <span class="help">The background check has not reached this row
+        since svtplay-arr started. That is not a finding about it.</span>
+      {%- elif state.ok %}
+      <span class="status-chip notice">Resolves</span>
+      <span class="help">{{ state.episode_count if state.episode_count is not none else '?' }}
+        episode{{ '' if state.episode_count == 1 else 's' }} on SVT
+        {%- if state.last_checked %}, checked {{ state.last_checked }}{% endif %}.
+        This says the slug resolves, not that it is the right show.</span>
+      {%- else %}
+      <span class="status-chip error">Failing</span>
+      <span class="help">{% if state.last_error %}{{ state.last_error }}{% else %}The
+        background check recorded no reason. Use Check to see the current
+        result.{% endif %}
+        {%- if state.last_success %} It last resolved {{ state.last_success }}.
+        {%- else %} It has not resolved since svtplay-arr started.{% endif %}</span>
+      {%- endif %}
+    </td>
     <td class="mapping-actions">
       <form method="post" action="/config/mappings/{{ m.tvdb_id }}/delete"
             class="delete-form">
@@ -79,7 +123,7 @@
      not a mapping which is correct -- and inside the actions cell it was
      a column two words wide on a phone, and a cramped one on a desktop. #}
   <tr class="mapping-check-row" data-filter-text="{{ filter_text }}">
-    <td colspan="4">
+    <td colspan="5">
       <p class="check-result{{ ' ' ~ row_check.css_class if row_check else '' }}"
          data-tvdb-id="{{ m.tvdb_id }}"{% if not row_check %} hidden{% endif %}
          >{% if row_check %}{{ row_check.message }}{% endif %}</p>
@@ -102,18 +146,18 @@
      no status dict to ask (no provider, or one that raised) neither claim
      is made. #}
   {% if mappings_ever_loaded is none %}
-  <tr><td colspan="4" class="warn">mappings.yaml could not be read (see the
+  <tr><td colspan="5" class="warn">mappings.yaml could not be read (see the
     error above), so this table is unavailable. It is not a list of zero
     mappings, and what the service is currently offering to Sonarr cannot
     be determined from this page. Fix the file, then reload.</td></tr>
   {% elif mappings_ever_loaded %}
-  <tr><td colspan="4" class="warn">mappings.yaml could not be read (see the
+  <tr><td colspan="5" class="warn">mappings.yaml could not be read (see the
     error above), so this table is unavailable. It is not a list of zero
     mappings and says nothing about what is currently offered to Sonarr:
     the service keeps serving the last table it loaded successfully. Fix
     the file, then reload this page.</td></tr>
   {% else %}
-  <tr><td colspan="4" class="error">mappings.yaml could not be read (see the
+  <tr><td colspan="5" class="error">mappings.yaml could not be read (see the
     error above) and has never been read successfully, so there is no
     last-known-good table behind it.
     The service is offering nothing to Sonarr right now, and Sonarr will
@@ -122,7 +166,7 @@
     same state.</td></tr>
   {% endif %}
   {% else %}
-  <tr><td colspan="4">No mappings yet. Nothing will be offered to Sonarr.</td></tr>
+  <tr><td colspan="5">No mappings yet. Nothing will be offered to Sonarr.</td></tr>
   {% endif %}
   {% endfor %}
   </tbody>

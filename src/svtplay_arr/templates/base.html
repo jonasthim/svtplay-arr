@@ -336,6 +336,21 @@
        cell is empty and collapses to just the rule. */
     table.mappings tr.mapping-row > td { border-bottom: 0; }
     table.mappings tr.mapping-check-row > td { padding: 0 .6rem; }
+    /* ---- Per-mapping SVT check state --------------------------------
+       What the canary last learned about one row, in a column of its own
+       rather than as another badge beside the title: `Auto-matched` says
+       nobody confirmed the row is the right show, this says the row
+       stopped resolving, and a single decorated title would blur two
+       findings that call for different actions.
+
+       The state word is a `.status-chip`, the same element the status
+       strip uses, so a failing row takes its red from tokens already
+       contrast-checked rather than from a second one. Geometry only is
+       overridden here, never colour -- the strip does the same. */
+    td.mapping-state { max-width: 20rem; }
+    td.mapping-state .help { margin: .2rem 0 0; }
+    table.mappings td.mapping-state .status-chip {
+      padding: .1rem .45rem; margin: 0; font-size: .75rem; }
     /* Beside a series title rather than at the head of a label, so it
        needs no right margin and should not push the title's baseline
        around. */
@@ -431,6 +446,9 @@
         content: attr(data-label); display: block;
         font-size: .6875rem; letter-spacing: .04em; text-transform: uppercase;
         color: var(--muted-fg); }
+      /* The state cell is a full-width block here, so the desktop
+         column cap would only make it needlessly narrow. */
+      table.mappings td.mapping-state { max-width: none; }
       table.mappings td.mapping-actions {
         padding-top: .5rem; white-space: normal; text-align: left; }
       table.mappings td.mapping-actions form {

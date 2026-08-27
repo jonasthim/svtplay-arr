@@ -385,6 +385,7 @@ def _recent_jobs(activity, limit: int = _STATUS_RECENT_LIMIT) -> list | None:
 def build_config_router(
     config_path: Path, mappings_path: Path, svt, sonarr, booted=None,
     status_provider=None, activity_provider=None,
+    mapping_state_provider=None,
 ) -> APIRouter:
     """`booted` is the `Settings` the service actually started with.
 
@@ -409,6 +410,12 @@ def build_config_router(
     unavailable" rather than a 500 -- the config page must be at least as
     forgiving as `/health` itself.
 
+    `mapping_state_provider`, if given, is a zero-argument callable
+    returning `SvtCanary.per_mapping()` -- one dict per mapping saying when
+    it was last checked, when it last succeeded, how many episodes were
+    seen and what the last error was. It is what makes a dead mapping
+    visible on arrival in the Mappings view instead of something the
+    operator has to go and press Check to discover.
     """
     router = APIRouter(prefix="/config")
 
@@ -558,6 +565,37 @@ def build_config_router(
             return {"activity": None, "activity_unavailable": True}
         return {"activity": activity, "activity_unavailable": False}
 
+    def _mapping_state_context() -> dict:
+        """Per-mapping canary state, keyed by tvdb_id.
+
+        In-memory in the canary, so no thread hop: this reads a dict the
+        canary already built, it does not touch SVT or the disk. The Check
+        control is still the only thing on this page that calls SVT.
+
+        Same three states as `_activity_context`, and the same reason: a
+        mapping with no state is rendered as "not checked yet", never as
+        "fine". `SvtCanary.per_mapping` already returns a row for a mapping
+        it has not reached, with `ok: None`; this guard covers the provider
+        itself failing or being absent.
+        """
+        if mapping_state_provider is None:
+            return {"mapping_states": None, "mapping_states_unavailable": False}
+        try:
+            rows = mapping_state_provider() or []
+            states = {}
+            for row in rows:
+                try:
+                    states[int(row["tvdb_id"])] = row
+                except (KeyError, TypeError, ValueError):
+                    continue
+        except Exception:
+            log.exception(
+                "mapping_state_provider failed; rendering the mappings "
+                "without their check state rather than as unchecked"
+            )
+            return {"mapping_states": None, "mapping_states_unavailable": True}
+        return {"mapping_states": states, "mapping_states_unavailable": False}
+
     def _load_mappings() -> tuple[list, bool, str | None]:
         """The mapping rows, and whether the file could be read at all.
 
@@ -654,6 +692,7 @@ def build_config_router(
                 "mappings_ever_loaded": _mappings_ever_loaded(chrome.get("health")),
                 "recent": _recent_jobs(activity["activity"]),
                 "failed_status": _FAILED,
+                **_mapping_state_context(),
                 **activity,
                 **chrome,
             },
@@ -696,6 +735,7 @@ def build_config_router(
                 # all, which is what keeps the Check control from ever
                 # firing on a page load.
                 "check": check,
+                **_mapping_state_context(),
                 **chrome,
             },
         )

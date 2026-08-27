@@ -580,6 +580,17 @@ POST /config/mappings/{tvdb_id}/check   live-check one mapping's slug
 POST /config/mappings/discover          sweep Sonarr for unmapped series
 ```
 
+**Mappings** carries each row's own SVT check state, read off
+`SvtCanary.per_mapping()` — when it was last checked, when it last
+succeeded, how many episodes were seen, and the last error. A dead mapping
+is therefore visible on arrival rather than something you go looking for
+with the Check button, and Check becomes a re-check. Rendering it costs no
+SVT request: the canary collected it on its own slow loop, and Check
+remains the only thing on the page that calls SVT. The state is kept
+distinct from the `Auto-matched` badge, which says something else entirely
+— *nobody confirmed this is the right show*, against *this stopped
+resolving*. Both can be true of one row.
+
 **Activity** is the job store, which nothing in the UI read until now: when
 a grab failed, the only record of why was `journalctl`. It shows what is in
 flight and what recently finished, with a failed job's recorded reason on

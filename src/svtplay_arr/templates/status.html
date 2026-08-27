@@ -68,9 +68,23 @@
     indexer until the file parses. A restart cannot help.</p>
   {% endif %}
   {% elif mappings %}
+  {#- Counted off the canary's own per-mapping state, not re-derived from
+      anything here. A pointer rather than a repeat of the reasons: the
+      Mappings view carries each failing row's error beside the row it is
+      about, which is where it can actually be acted on. #}
+  {%- set failing = (mapping_states or {}).values() | selectattr('ok', 'sameas', false) | list %}
   <p><strong>{{ mappings | length }}</strong>
     series {{ 'is' if mappings | length == 1 else 'are' }} offered to
     Sonarr.</p>
+  {% if failing %}
+  <p class="warn"><strong>{{ failing | length }} of them</strong>
+    {{ 'is' if failing | length == 1 else 'are' }} not resolving on SVT:
+    {% for f in failing %}{{ f.series_title }}{{ ', ' if not loop.last }}{% endfor %}.
+    Sonarr will not be offered anything for
+    {{ 'that series' if failing | length == 1 else 'those series' }} until
+    it is fixed. Each row's reason is beside it under
+    <a href="/config/mappings">Mappings</a>.</p>
+  {% endif %}
   {% else %}
   <p class="warn">No mappings yet, so nothing is offered to Sonarr and
     nothing will ever be downloaded. A mapping ties one Sonarr series to
