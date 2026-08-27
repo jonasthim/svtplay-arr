@@ -1,0 +1,1137 @@
+#!/usr/bin/env bash
+#
+# svtplay-arr installer and upgrader.
+#
+# One command for both jobs. It looks at the host, decides whether this is a
+# fresh install or an upgrade of an existing one, and does that. The operator
+# does not have to know which.
+#
+#     curl -fsSLO https://raw.githubusercontent.com/jonasthim/svtplay-arr/main/install.sh
+#     less install.sh          # you are installing a root-level service; read it
+#     sudo bash install.sh
+#
+# What it needs from the host:
+#
+#   * root, to create a system user, write under /opt and /etc, and talk to
+#     systemd;
+#   * ffmpeg, which svtplay-dl shells out to for muxing (installed via apt
+#     when apt is present; otherwise you install it and re-run);
+#   * curl and git, to fetch uv and the source.
+#
+# It does NOT need a system Python. uv brings its own interpreter, which is
+# the whole reason uv is here.
+#
+# Layout it creates:
+#
+#     /opt/svtplay-arr/releases/<commit>/   one directory per installed commit,
+#                                          each with its own .venv
+#     /opt/svtplay-arr/current -> releases/<commit>
+#     /opt/svtplay-arr/python/              uv-managed interpreters (shared)
+#     /etc/svtplay-arr/config.yaml          never touched once it exists
+#     /etc/svtplay-arr/mappings.yaml        never touched once it exists
+#     /etc/systemd/system/svtplay-arr.service
+#
+# An upgrade builds the new release in a new directory and only then flips
+# the `current` symlink, so the running version is never modified in place
+# and a rollback is a symlink flip rather than a restore.
+#
+# Every path above is overridable (see the variables below), every privileged
+# command goes through a variable that can point at a stub, and --dry-run
+# prints what would happen and changes nothing. tests/test_install_sh.py
+# exercises all of it.
+
+set -Eeuo pipefail
+
+SCRIPT_NAME=${0##*/}
+SCRIPT_VERSION="1.0.0"
+
+# ---------------------------------------------------------------------------
+# Overridable settings
+#
+# Anything the script reads or writes comes from one of these. Tests point
+# them at a temporary tree; operators can too.
+# ---------------------------------------------------------------------------
+
+: "${SVTPLAY_ARR_PREFIX:=/opt/svtplay-arr}"
+: "${SVTPLAY_ARR_CONFIG_DIR:=/etc/svtplay-arr}"
+: "${SVTPLAY_ARR_UNIT_DIR:=/etc/systemd/system}"
+: "${SVTPLAY_ARR_BIN_DIR:=/usr/local/bin}"
+: "${SVTPLAY_ARR_REPO:=https://github.com/jonasthim/svtplay-arr}"
+: "${SVTPLAY_ARR_REF:=main}"
+: "${SVTPLAY_ARR_USER:=svtplay}"
+: "${SVTPLAY_ARR_GROUP:=media}"
+: "${SVTPLAY_ARR_UNIT_NAME:=svtplay-arr.service}"
+: "${SVTPLAY_ARR_HEALTH_URL:=http://127.0.0.1:9800/health}"
+: "${SVTPLAY_ARR_HEALTH_TIMEOUT:=90}"
+: "${SVTPLAY_ARR_HEALTH_INTERVAL:=2}"
+: "${SVTPLAY_ARR_KEEP_RELEASES:=3}"
+# The Python uv installs for the service. pyproject's requires-python is
+# ">=3.12" with no ceiling; CI runs 3.12 and 3.13.
+: "${SVTPLAY_ARR_PYTHON:=3.13}"
+
+# Privileged or otherwise untestable interactions. Each is a command name by
+# default and a path to a stub in the test suite.
+: "${SVTPLAY_ARR_SYSTEMCTL:=systemctl}"
+: "${SVTPLAY_ARR_USERADD:=useradd}"
+: "${SVTPLAY_ARR_GROUPADD:=groupadd}"
+: "${SVTPLAY_ARR_GETENT:=getent}"
+: "${SVTPLAY_ARR_APT_GET:=apt-get}"
+: "${SVTPLAY_ARR_CHOWN:=chown}"
+: "${SVTPLAY_ARR_CURL:=curl}"
+: "${SVTPLAY_ARR_GIT:=git}"
+: "${SVTPLAY_ARR_FFMPEG:=ffmpeg}"
+: "${SVTPLAY_ARR_UV:=}"
+
+# The effective uid. A variable so a test can claim to be root without being
+# root; nothing else in the script looks at id(1).
+: "${SVTPLAY_ARR_EUID:=$(id -u)}"
+
+# The listen address is not configurable, deliberately. The download link
+# handed to Sonarr is built from the host Sonarr used to reach this service,
+# so moving the port here without moving it in Sonarr breaks grabs in a way
+# that looks like SVT breaking. deploy/README.md explains it.
+readonly LISTEN_HOST="0.0.0.0"
+readonly LISTEN_PORT="9800"
+
+# uv is pinned, and the checksum of every artifact of that pin is baked in
+# below. See install_uv() for why this is not `curl | sh`.
+readonly UV_VERSION="0.12.6"
+
+uv_expected_sha256() {
+    case "$1" in
+    x86_64-unknown-linux-gnu)
+        printf '%s' '8681d8921e7d520fb368991dcf5f9c1905b80f5bf2a265a0ed085c8d8e342477'
+        ;;
+    aarch64-unknown-linux-gnu)
+        printf '%s' 'd58030acd26159499ac82f32da12d1b3c12a3a1bfc414232d9082070c03e128d'
+        ;;
+    x86_64-unknown-linux-musl)
+        printf '%s' '14e4172aace66a475062cebec7ca04f497d5619e95325dfcc9e4447b9c516846'
+        ;;
+    aarch64-unknown-linux-musl)
+        printf '%s' '3719891de9ab41c878a84331e55826d2a46421976a346a65326513a6795b089a'
+        ;;
+    *) return 1 ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Derived paths
+# ---------------------------------------------------------------------------
+
+RELEASES_DIR="${SVTPLAY_ARR_PREFIX}/releases"
+CURRENT_LINK="${SVTPLAY_ARR_PREFIX}/current"
+PYTHON_DIR="${SVTPLAY_ARR_PREFIX}/python"
+UV_CACHE_DIR="${SVTPLAY_ARR_PREFIX}/.uv-cache"
+UNIT_PATH="${SVTPLAY_ARR_UNIT_DIR}/${SVTPLAY_ARR_UNIT_NAME}"
+UNIT_BACKUP="${SVTPLAY_ARR_PREFIX}/.${SVTPLAY_ARR_UNIT_NAME}.previous"
+CONFIG_FILE="${SVTPLAY_ARR_CONFIG_DIR}/config.yaml"
+MAPPINGS_FILE="${SVTPLAY_ARR_CONFIG_DIR}/mappings.yaml"
+
+# A release directory is only trusted once this file is in it. An interrupted
+# build leaves the directory without it, and the next run discards and
+# rebuilds rather than booting a half-installed tree.
+readonly RELEASE_STAMP=".svtplay-arr-release-ok"
+
+# ---------------------------------------------------------------------------
+# Runtime state
+# ---------------------------------------------------------------------------
+
+DRY_RUN=false
+MODE=""              # install | upgrade
+PHASE="starting up"  # what the failure trap reports
+PREVIOUS_TARGET=""   # what `current` pointed at before we touched it
+PREVIOUS_DESC=""     # human-readable version we started from
+UNIT_BACKED_UP=false
+ACTIVATED=false      # the symlink flip happened
+CONFIG_HASH_BEFORE=""
+MAPPINGS_HASH_BEFORE=""
+PRE_HEALTH_STATUS=""
+TMP_DIR=""
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+
+step() { printf '\n==> %s\n' "$*"; }
+log() { printf '    %s\n' "$*"; }
+warn() { printf 'warning: %s\n' "$*" >&2; }
+err() { printf 'error: %s\n' "$*" >&2; }
+
+die() {
+    err "$*"
+    printf 'state: %s\n' "$(state_summary)" >&2
+    exit 1
+}
+
+state_summary() {
+    local active
+    if [[ -L $CURRENT_LINK ]]; then
+        active="current -> $(readlink "$CURRENT_LINK")"
+    elif [[ -d ${SVTPLAY_ARR_PREFIX}/.venv ]]; then
+        active="pre-release-layout checkout at ${SVTPLAY_ARR_PREFIX}"
+    else
+        active="no release is active"
+    fi
+    printf 'failed while %s; %s; config at %s untouched' \
+        "$PHASE" "$active" "$SVTPLAY_ARR_CONFIG_DIR"
+}
+
+on_err() {
+    local rc=$1 line=$2
+    err "unexpected failure (exit ${rc}) at ${SCRIPT_NAME} line ${line}"
+    printf 'state: %s\n' "$(state_summary)" >&2
+}
+trap 'on_err $? $LINENO' ERR
+
+cleanup() {
+    if [[ -n $TMP_DIR && -d $TMP_DIR ]]; then
+        rm -rf "$TMP_DIR"
+    fi
+}
+trap cleanup EXIT
+
+# Every mutation goes through this. --dry-run is therefore a property of the
+# script rather than a thing each step has to remember.
+run() {
+    if $DRY_RUN; then
+        printf '    would: %s\n' "$*"
+        return 0
+    fi
+    "$@"
+}
+
+# ---------------------------------------------------------------------------
+# Arguments
+# ---------------------------------------------------------------------------
+
+usage() {
+    cat <<USAGE
+${SCRIPT_NAME} ${SCRIPT_VERSION} - install or upgrade svtplay-arr
+
+Usage: sudo bash ${SCRIPT_NAME} [options]
+
+The same command installs on a fresh host and upgrades an existing
+installation; which one it is is detected, not chosen.
+
+Options:
+  --dry-run             Print every action and change nothing. Does not
+                        need root.
+  --ref REF             Branch, tag or commit to install (default: ${SVTPLAY_ARR_REF}).
+  --repo URL            Source repository (default: ${SVTPLAY_ARR_REPO}).
+  --prefix DIR          Install root (default: ${SVTPLAY_ARR_PREFIX}).
+  --config-dir DIR      Configuration directory (default: ${SVTPLAY_ARR_CONFIG_DIR}).
+  --unit-dir DIR        systemd unit directory (default: ${SVTPLAY_ARR_UNIT_DIR}).
+  --health-timeout N    Seconds to wait for /health (default: ${SVTPLAY_ARR_HEALTH_TIMEOUT}).
+  --keep N              Old releases to keep (default: ${SVTPLAY_ARR_KEEP_RELEASES}).
+  -h, --help            This text.
+  --version             Print the script version.
+
+config.yaml and mappings.yaml are written only when they do not exist. An
+upgrade cannot modify them; the script verifies that it did not.
+USAGE
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+        --dry-run) DRY_RUN=true ;;
+        --ref)
+            [[ $# -ge 2 ]] || die "--ref needs a value"
+            SVTPLAY_ARR_REF=$2
+            shift
+            ;;
+        --repo)
+            [[ $# -ge 2 ]] || die "--repo needs a value"
+            SVTPLAY_ARR_REPO=$2
+            shift
+            ;;
+        --prefix)
+            [[ $# -ge 2 ]] || die "--prefix needs a value"
+            SVTPLAY_ARR_PREFIX=$2
+            shift
+            ;;
+        --config-dir)
+            [[ $# -ge 2 ]] || die "--config-dir needs a value"
+            SVTPLAY_ARR_CONFIG_DIR=$2
+            shift
+            ;;
+        --unit-dir)
+            [[ $# -ge 2 ]] || die "--unit-dir needs a value"
+            SVTPLAY_ARR_UNIT_DIR=$2
+            shift
+            ;;
+        --health-timeout)
+            [[ $# -ge 2 ]] || die "--health-timeout needs a value"
+            SVTPLAY_ARR_HEALTH_TIMEOUT=$2
+            shift
+            ;;
+        --keep)
+            [[ $# -ge 2 ]] || die "--keep needs a value"
+            SVTPLAY_ARR_KEEP_RELEASES=$2
+            shift
+            ;;
+        -h | --help)
+            usage
+            exit 0
+            ;;
+        --version)
+            printf '%s\n' "$SCRIPT_VERSION"
+            exit 0
+            ;;
+        *) die "unknown option: $1 (try --help)" ;;
+        esac
+        shift
+    done
+
+    # --prefix/--config-dir/--unit-dir land after the derived paths were
+    # computed from the defaults, so recompute.
+    RELEASES_DIR="${SVTPLAY_ARR_PREFIX}/releases"
+    CURRENT_LINK="${SVTPLAY_ARR_PREFIX}/current"
+    PYTHON_DIR="${SVTPLAY_ARR_PREFIX}/python"
+    UV_CACHE_DIR="${SVTPLAY_ARR_PREFIX}/.uv-cache"
+    UNIT_PATH="${SVTPLAY_ARR_UNIT_DIR}/${SVTPLAY_ARR_UNIT_NAME}"
+    UNIT_BACKUP="${SVTPLAY_ARR_PREFIX}/.${SVTPLAY_ARR_UNIT_NAME}.previous"
+    CONFIG_FILE="${SVTPLAY_ARR_CONFIG_DIR}/config.yaml"
+    MAPPINGS_FILE="${SVTPLAY_ARR_CONFIG_DIR}/mappings.yaml"
+}
+
+# ---------------------------------------------------------------------------
+# Preconditions
+# ---------------------------------------------------------------------------
+
+require_root() {
+    if [[ $SVTPLAY_ARR_EUID -eq 0 ]]; then
+        return 0
+    fi
+    if $DRY_RUN; then
+        log "not running as root; --dry-run changes nothing, so carrying on"
+        return 0
+    fi
+    err "this script must run as root."
+    err "It creates the ${SVTPLAY_ARR_USER} system user and the ${SVTPLAY_ARR_GROUP} group,"
+    err "writes ${SVTPLAY_ARR_PREFIX} and ${SVTPLAY_ARR_CONFIG_DIR}, installs a unit into"
+    err "${SVTPLAY_ARR_UNIT_DIR}, and calls systemctl. None of that is possible unprivileged."
+    err ""
+    err "    sudo bash ${SCRIPT_NAME}"
+    err ""
+    err "To see exactly what it would do first, without root and without changes:"
+    err ""
+    err "    bash ${SCRIPT_NAME} --dry-run"
+    exit 1
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+report_platform() {
+    local pretty="unknown" kernel arch
+    if [[ -r /etc/os-release ]]; then
+        # shellcheck disable=SC1091
+        pretty=$(. /etc/os-release && printf '%s' "${PRETTY_NAME:-${NAME:-unknown}}")
+    fi
+    kernel=$(uname -sr)
+    arch=$(uname -m)
+    step "Platform"
+    log "distribution: ${pretty}"
+    log "kernel:       ${kernel}"
+    log "architecture: ${arch}"
+    if have "$SVTPLAY_ARR_APT_GET"; then
+        log "packages:     apt (ffmpeg will be installed for you if missing)"
+    else
+        log "packages:     no apt; prerequisites must already be present"
+    fi
+}
+
+# apt is the documented deployment. On anything else the script refuses to
+# guess at package names for a distro nobody has tested this on, and instead
+# says exactly what is missing.
+ensure_os_prereqs() {
+    step "Host prerequisites"
+
+    local missing=()
+    have "$SVTPLAY_ARR_FFMPEG" || missing+=(ffmpeg)
+    have "$SVTPLAY_ARR_GIT" || missing+=(git)
+    have "$SVTPLAY_ARR_CURL" || missing+=(curl)
+
+    if [[ ${#missing[@]} -eq 0 ]]; then
+        log "ffmpeg, git and curl are present"
+        return 0
+    fi
+
+    if ! have "$SVTPLAY_ARR_APT_GET"; then
+        err "missing: ${missing[*]}"
+        err ""
+        err "This host has no apt, and guessing package names for an untested"
+        err "distribution is worse than saying so. Install the above with your"
+        err "package manager and run this script again. Nothing has changed."
+        exit 1
+    fi
+
+    log "installing with apt: ${missing[*]} ca-certificates"
+    run "$SVTPLAY_ARR_APT_GET" update -qq
+    run env DEBIAN_FRONTEND=noninteractive "$SVTPLAY_ARR_APT_GET" install -y \
+        --no-install-recommends "${missing[@]}" ca-certificates
+}
+
+# The uv target triple for this host, or failure if it is one uv does not
+# publish a Linux build for.
+uv_target() {
+    local machine libc
+    machine=$(uname -m)
+    case $machine in
+    x86_64 | amd64) machine=x86_64 ;;
+    aarch64 | arm64) machine=aarch64 ;;
+    *) return 1 ;;
+    esac
+    if [[ -e /lib/ld-musl-${machine}.so.1 ]]; then
+        libc=musl
+    elif ldd --version 2>&1 | head -n1 | grep -qi musl; then
+        libc=musl
+    else
+        libc=gnu
+    fi
+    printf '%s-unknown-linux-%s' "$machine" "$libc"
+}
+
+# Not `curl https://astral.sh/uv/install.sh | sh`.
+#
+# That pipes whatever is served at fetch time straight into a root shell:
+# nothing is pinned, nothing is verified, and there is no artifact left to
+# audit afterwards. An operator who refuses to run that is right to. So:
+# pin a version, fetch that exact release artifact, check it against the
+# SHA-256 recorded in this script (not one downloaded next to the tarball,
+# which would only prove the two came from the same place), and stop if they
+# disagree.
+install_uv() {
+    local target url sha tarball actual
+    target=$(uv_target) || die "no uv build for $(uname -m); install uv yourself and re-run"
+    sha=$(uv_expected_sha256 "$target") ||
+        die "no pinned checksum for uv target ${target}; install uv yourself and re-run"
+    url="https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-${target}.tar.gz"
+
+    log "uv is not installed; fetching uv ${UV_VERSION} for ${target}"
+    log "from     ${url}"
+    log "expected sha256 ${sha}"
+
+    if $DRY_RUN; then
+        printf '    would: download, verify sha256, and install uv and uvx into %s\n' \
+            "$SVTPLAY_ARR_BIN_DIR"
+        SVTPLAY_ARR_UV="${SVTPLAY_ARR_BIN_DIR}/uv"
+        return 0
+    fi
+
+    have sha256sum || die "sha256sum is missing; cannot verify the uv download"
+
+    TMP_DIR=$(mktemp -d)
+    tarball="${TMP_DIR}/uv.tar.gz"
+    "$SVTPLAY_ARR_CURL" -fsSL --proto '=https' --tlsv1.2 -o "$tarball" "$url" ||
+        die "could not download uv from ${url}; nothing has changed"
+
+    actual=$(sha256sum "$tarball" | cut -d' ' -f1)
+    if [[ $actual != "$sha" ]]; then
+        rm -f "$tarball"
+        err "uv checksum mismatch -- refusing to install."
+        err "  expected ${sha}"
+        err "  actual   ${actual}"
+        die "the download was discarded and nothing has changed"
+    fi
+    log "checksum verified"
+
+    tar -xzf "$tarball" -C "$TMP_DIR"
+    install -d -m 0755 "$SVTPLAY_ARR_BIN_DIR"
+    install -m 0755 "${TMP_DIR}/uv-${target}/uv" "${SVTPLAY_ARR_BIN_DIR}/uv"
+    install -m 0755 "${TMP_DIR}/uv-${target}/uvx" "${SVTPLAY_ARR_BIN_DIR}/uvx"
+    rm -rf "$TMP_DIR"
+    TMP_DIR=""
+    SVTPLAY_ARR_UV="${SVTPLAY_ARR_BIN_DIR}/uv"
+    log "installed ${SVTPLAY_ARR_BIN_DIR}/uv"
+}
+
+ensure_uv() {
+    step "uv"
+    if [[ -n $SVTPLAY_ARR_UV ]]; then
+        log "using ${SVTPLAY_ARR_UV}"
+        return 0
+    fi
+    if have uv; then
+        SVTPLAY_ARR_UV=$(command -v uv)
+        log "already installed: ${SVTPLAY_ARR_UV}"
+        return 0
+    fi
+    if [[ -x ${SVTPLAY_ARR_BIN_DIR}/uv ]]; then
+        SVTPLAY_ARR_UV="${SVTPLAY_ARR_BIN_DIR}/uv"
+        log "already installed: ${SVTPLAY_ARR_UV}"
+        return 0
+    fi
+    install_uv
+}
+
+ensure_account() {
+    step "Service account"
+
+    # On a dedicated container the media group does not exist. That is the
+    # normal path here, not an edge case: it is a host and NFS-export
+    # concept, and a fresh container inherits nothing.
+    if "$SVTPLAY_ARR_GETENT" group "$SVTPLAY_ARR_GROUP" >/dev/null 2>&1; then
+        log "group ${SVTPLAY_ARR_GROUP} exists"
+    else
+        log "creating group ${SVTPLAY_ARR_GROUP}"
+        run "$SVTPLAY_ARR_GROUPADD" --system "$SVTPLAY_ARR_GROUP"
+    fi
+
+    if "$SVTPLAY_ARR_GETENT" passwd "$SVTPLAY_ARR_USER" >/dev/null 2>&1; then
+        log "user ${SVTPLAY_ARR_USER} exists"
+    else
+        log "creating user ${SVTPLAY_ARR_USER}"
+        run "$SVTPLAY_ARR_USERADD" --system --no-create-home \
+            --shell /usr/sbin/nologin --gid "$SVTPLAY_ARR_GROUP" "$SVTPLAY_ARR_USER"
+    fi
+}
+
+ensure_directories() {
+    run install -d -m 0755 "$SVTPLAY_ARR_PREFIX"
+    run install -d -m 0755 "$RELEASES_DIR"
+    run install -d -m 0755 "$PYTHON_DIR"
+}
+
+# ---------------------------------------------------------------------------
+# Configuration
+#
+# seed_config_file is the ONLY thing in this script that writes into
+# SVTPLAY_ARR_CONFIG_DIR, and it refuses to write over an existing file. The
+# upgrade path therefore cannot modify config.yaml or mappings.yaml even by
+# accident -- and capture_config_fingerprint/assert_config_untouched prove it
+# afterwards rather than asking anyone to take it on trust.
+#
+# tests/test_install_sh.py::test_only_the_seeding_functions_write_to_the_
+# config_directory enforces the "only thing" half of that claim against the
+# source of this file, so a future edit cannot quietly add a second writer.
+# ---------------------------------------------------------------------------
+
+seed_config_file() {
+    local src=$1 dest=$2
+    if [[ -e $dest ]]; then
+        log "keeping existing ${dest}"
+        return 0
+    fi
+    if [[ ! -r $src ]]; then
+        die "example file ${src} is missing from the release"
+    fi
+    log "writing ${dest} from $(basename "$src")"
+    run install -m 0640 "$src" "$dest"
+}
+
+seed_config() {
+    local release_dir=$1
+    step "Configuration"
+    # 0750: config.yaml holds the Sonarr API key, so the directory is not
+    # readable beyond the service account and its group.
+    run install -d -m 0750 "$SVTPLAY_ARR_CONFIG_DIR"
+    seed_config_file "${release_dir}/deploy/config.example.yaml" "$CONFIG_FILE"
+    seed_config_file "${release_dir}/deploy/mappings.example.yaml" "$MAPPINGS_FILE"
+    run "$SVTPLAY_ARR_CHOWN" -R "${SVTPLAY_ARR_USER}:${SVTPLAY_ARR_GROUP}" \
+        "$SVTPLAY_ARR_CONFIG_DIR"
+}
+
+_hash_or_absent() {
+    if [[ -f $1 ]]; then
+        sha256sum "$1" | cut -d' ' -f1
+    else
+        printf 'absent'
+    fi
+}
+
+capture_config_fingerprint() {
+    CONFIG_HASH_BEFORE=$(_hash_or_absent "$CONFIG_FILE")
+    MAPPINGS_HASH_BEFORE=$(_hash_or_absent "$MAPPINGS_FILE")
+}
+
+_assert_one_untouched() {
+    local path=$1 before=$2 now
+    # A file that did not exist may have been seeded -- that is a repair of a
+    # half-installed system, not a clobber. A file that did exist must come
+    # out the other side identical.
+    if [[ $before == absent ]]; then
+        return 0
+    fi
+    now=$(_hash_or_absent "$path")
+    if [[ $now != "$before" ]]; then
+        err "${path} changed during an upgrade. This must never happen."
+        err "  before ${before}"
+        err "  after  ${now}"
+        return 1
+    fi
+    return 0
+}
+
+assert_config_untouched() {
+    local ok=0
+    _assert_one_untouched "$CONFIG_FILE" "$CONFIG_HASH_BEFORE" || ok=1
+    _assert_one_untouched "$MAPPINGS_FILE" "$MAPPINGS_HASH_BEFORE" || ok=1
+    if [[ $ok -ne 0 ]]; then
+        err "The service is running the new release, but an installer that can"
+        err "rewrite configuration is a bug regardless of the outcome. Restore"
+        err "your configuration and report this."
+        exit 1
+    fi
+    log "config.yaml and mappings.yaml are byte-for-byte unchanged"
+}
+
+# ---------------------------------------------------------------------------
+# Releases
+# ---------------------------------------------------------------------------
+
+resolve_ref() {
+    local line
+    line=$("$SVTPLAY_ARR_GIT" ls-remote "$SVTPLAY_ARR_REPO" "$SVTPLAY_ARR_REF" 2>/dev/null |
+        head -n1 || true)
+    if [[ -n $line ]]; then
+        printf '%s' "${line%%[[:space:]]*}"
+        return 0
+    fi
+    if [[ $SVTPLAY_ARR_REF =~ ^[0-9a-fA-F]{7,40}$ ]]; then
+        printf '%s' "$SVTPLAY_ARR_REF"
+        return 0
+    fi
+    return 1
+}
+
+release_id() { printf '%s' "${1:0:12}"; }
+
+project_version() {
+    local dir=$1 v
+    v=$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' \
+        "${dir}/pyproject.toml" 2>/dev/null | head -n1 || true)
+    printf '%s' "${v:-unknown}"
+}
+
+# What is running right now, in words.
+describe_current() {
+    local target
+    if [[ -L $CURRENT_LINK ]]; then
+        target=$(readlink -f "$CURRENT_LINK" 2>/dev/null || readlink "$CURRENT_LINK")
+        printf '%s (%s)' "$(project_version "$target")" "$(basename "$target")"
+        return 0
+    fi
+    if [[ -d ${SVTPLAY_ARR_PREFIX}/.venv ]]; then
+        local sha
+        sha=$("$SVTPLAY_ARR_GIT" -C "$SVTPLAY_ARR_PREFIX" rev-parse --short=12 HEAD 2>/dev/null || true)
+        printf '%s (%s, pre-release-layout checkout)' \
+            "$(project_version "$SVTPLAY_ARR_PREFIX")" "${sha:-unknown}"
+        return 0
+    fi
+    printf 'none'
+}
+
+# A release is built where it will live, never staged elsewhere and renamed.
+#
+# A virtualenv is not relocatable: uv bakes the absolute path of
+# .venv/bin/python into every console script it generates, and the editable
+# install of the project itself records an absolute path to src/. Building in
+# <dir>.staging and renaming afterwards produces an ExecStart that cannot
+# start -- which is exactly what an earlier version of this script did.
+#
+# Completeness is therefore marked by the stamp file rather than by the
+# directory's name. It is written last; a directory without it is the debris
+# of an interrupted run and is discarded here rather than trusted.
+fetch_release() {
+    local dest=$1 sha=$2
+
+    if [[ -f "${dest}/${RELEASE_STAMP}" ]]; then
+        log "release $(basename "$dest") is already built; reusing it"
+        return 0
+    fi
+    if [[ -e $dest ]]; then
+        log "discarding an incomplete ${dest} left by an earlier run"
+        run rm -rf "$dest"
+    fi
+
+    log "cloning ${SVTPLAY_ARR_REPO}"
+    run "$SVTPLAY_ARR_GIT" clone --quiet "$SVTPLAY_ARR_REPO" "$dest" ||
+        die "could not clone ${SVTPLAY_ARR_REPO}; nothing has changed"
+    run "$SVTPLAY_ARR_GIT" -C "$dest" checkout --quiet --detach "$sha" ||
+        die "could not check out ${sha}; nothing has changed"
+
+    build_release "$dest"
+
+    run touch "${dest}/${RELEASE_STAMP}"
+}
+
+build_release() {
+    local dir=$1
+    log "building the environment with uv (it provides Python ${SVTPLAY_ARR_PYTHON}; the host does not need one)"
+    # --python pins the interpreter to a version CI actually tests against.
+    # requires-python has no upper bound, so without this uv would happily
+    # pick whatever the newest release is on the day of the install and run
+    # the service on an interpreter nothing here has ever been run on.
+    #
+    # --python-preference only-managed keeps a stray system interpreter out
+    # of it entirely, which is the point of using uv here.
+    if ! run env \
+        UV_PYTHON_INSTALL_DIR="$PYTHON_DIR" \
+        UV_CACHE_DIR="$UV_CACHE_DIR" \
+        UV_PYTHON_PREFERENCE=only-managed \
+        UV_NO_PROGRESS=1 \
+        "$SVTPLAY_ARR_UV" sync --frozen --python "$SVTPLAY_ARR_PYTHON" --project "$dir"; then
+        run rm -rf "$dir"
+        err "uv could not build the environment for this release."
+        if [[ $MODE == upgrade ]]; then
+            die "the upgrade was abandoned before anything was switched over; ${PREVIOUS_DESC} is still running"
+        fi
+        die "nothing was installed"
+    fi
+}
+
+activate_release() {
+    local dest=$1
+    run ln -sfn "$dest" "${CURRENT_LINK}.new"
+    run mv -Tf "${CURRENT_LINK}.new" "$CURRENT_LINK"
+    ACTIVATED=true
+}
+
+prune_releases() {
+    local keep=$SVTPLAY_ARR_KEEP_RELEASES active
+    [[ -d $RELEASES_DIR ]] || return 0
+    active=$(readlink -f "$CURRENT_LINK" 2>/dev/null || true)
+    local -a candidates=()
+    local d
+    while IFS= read -r d; do
+        [[ -n $d ]] || continue
+        if [[ -n $active && $(readlink -f "$d") == "$active" ]]; then
+            continue
+        fi
+        candidates+=("$d")
+    done < <(find "$RELEASES_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' 2>/dev/null |
+        sort -rn | cut -d' ' -f2-)
+
+    # keep - 1, because the active release is one of the kept ones.
+    local drop_from=$((keep - 1))
+    if [[ $drop_from -lt 0 ]]; then
+        drop_from=0
+    fi
+    local i
+    for ((i = drop_from; i < ${#candidates[@]}; i++)); do
+        log "removing old release $(basename "${candidates[$i]}")"
+        run rm -rf "${candidates[$i]}"
+    done
+}
+
+# ---------------------------------------------------------------------------
+# systemd
+# ---------------------------------------------------------------------------
+
+# The generated unit and deploy/svtplay-arr.service must not drift: the only
+# difference is that this one points at the `current` symlink instead of a
+# fixed checkout. tests/test_install_sh.py::test_generated_unit_matches_packaged_unit
+# compares every directive of the two.
+render_unit() {
+    cat <<UNIT
+[Unit]
+Description=svtplay-arr
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${SVTPLAY_ARR_USER}
+Group=${SVTPLAY_ARR_GROUP}
+# NFS exports commonly squash identities, which makes a chown inside a
+# container cosmetic. The umask is what actually makes writes land as 664 /
+# 775 for the rest of the media stack.
+UMask=0002
+# systemd creates /var/lib/svtplay-arr owned ${SVTPLAY_ARR_USER}:${SVTPLAY_ARR_GROUP} before the
+# process starts; that is where Settings.db_path defaults to.
+StateDirectory=svtplay-arr
+# Deliberately empty. The key lives in config.yaml so the configuration page
+# can edit it; a non-empty value here silently overrides the file.
+Environment=SONARR_API_KEY=
+Environment=SVTPLAY_ARR_CONFIG=${CONFIG_FILE}
+# Written by install.sh. ExecStart goes through the 'current' symlink, so an
+# upgrade or a rollback is a symlink flip plus a restart.
+ExecStart=${CURRENT_LINK}/.venv/bin/uvicorn \\
+  --factory svtplay_arr.app:create_app_from_env \\
+  --host ${LISTEN_HOST} --port ${LISTEN_PORT}
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+}
+
+install_unit() {
+    step "systemd unit"
+    local desired
+    desired=$(render_unit)
+
+    if [[ -f $UNIT_PATH ]]; then
+        if [[ $desired == "$(cat "$UNIT_PATH")" ]]; then
+            log "${UNIT_PATH} is already correct"
+            return 0
+        fi
+        log "backing up the current unit to ${UNIT_BACKUP}"
+        run cp -p "$UNIT_PATH" "$UNIT_BACKUP"
+        UNIT_BACKED_UP=true
+    fi
+
+    log "writing ${UNIT_PATH}"
+    run install -d -m 0755 "$SVTPLAY_ARR_UNIT_DIR"
+    if $DRY_RUN; then
+        printf '    would: write the unit (ExecStart=%s/.venv/bin/uvicorn ... --host %s --port %s)\n' \
+            "$CURRENT_LINK" "$LISTEN_HOST" "$LISTEN_PORT"
+    else
+        # Written beside and renamed into place: a unit file truncated
+        # half-way through is one systemd will refuse, and this is the file
+        # the service is about to be restarted from.
+        render_unit >"${UNIT_PATH}.new"
+        chmod 0644 "${UNIT_PATH}.new"
+        mv -f "${UNIT_PATH}.new" "$UNIT_PATH"
+    fi
+    run "$SVTPLAY_ARR_SYSTEMCTL" daemon-reload
+}
+
+start_service() {
+    step "Service"
+    if [[ $MODE == install ]]; then
+        log "enabling and starting ${SVTPLAY_ARR_UNIT_NAME}"
+        run "$SVTPLAY_ARR_SYSTEMCTL" enable --now "$SVTPLAY_ARR_UNIT_NAME"
+    else
+        # enable is idempotent and cheap, and it repairs an installation whose
+        # unit was never enabled.
+        run "$SVTPLAY_ARR_SYSTEMCTL" enable "$SVTPLAY_ARR_UNIT_NAME"
+        log "restarting ${SVTPLAY_ARR_UNIT_NAME}"
+        run "$SVTPLAY_ARR_SYSTEMCTL" restart "$SVTPLAY_ARR_UNIT_NAME"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Health
+# ---------------------------------------------------------------------------
+
+json_field() {
+    printf '%s' "$1" | tr ',{}' '\n' |
+        sed -n "s/^[[:space:]]*\"$2\"[[:space:]]*:[[:space:]]*//p" |
+        head -n1 | tr -d '"' | tr -d '[:space:]'
+}
+
+fetch_health() {
+    "$SVTPLAY_ARR_CURL" -fsS --max-time 5 "$SVTPLAY_ARR_HEALTH_URL" 2>/dev/null || true
+}
+
+# Prints the health JSON on stdout and returns 0 if the endpoint answered
+# within the budget; returns 1 if it never did.
+wait_for_health() {
+    local deadline=$((SECONDS + SVTPLAY_ARR_HEALTH_TIMEOUT)) body=""
+    while :; do
+        body=$(fetch_health)
+        if [[ -n $body && $body == *'"status"'* ]]; then
+            printf '%s' "$body"
+            return 0
+        fi
+        if [[ $SECONDS -ge $deadline ]]; then
+            return 1
+        fi
+        sleep "$SVTPLAY_ARR_HEALTH_INTERVAL"
+    done
+}
+
+report_health() {
+    local body=$1 status same_fs
+    status=$(json_field "$body" status)
+    same_fs=$(json_field "$body" same_filesystem)
+    log "/health: ${body}"
+    log "status: ${status:-unknown}"
+
+    if [[ $same_fs == "false" ]]; then
+        warn ""
+        warn "same_filesystem is FALSE. incomplete_dir and completed_dir are not"
+        warn "on one filesystem, so publishing a finished download is no longer an"
+        warn "atomic rename -- it has degraded to copy-then-delete, and Sonarr can"
+        warn "import a half-copied file as a permanent, corrupt library entry."
+        warn "Nothing detects that after the fact."
+        warn ""
+        warn "Fix the mount layout before pointing Sonarr at this service."
+        warn "See docs/installation.md, 'The mount layout'."
+    fi
+    if [[ $(json_field "$body" worker_alive) == "false" ]]; then
+        warn "worker_alive is false: the download worker is not running. Check journalctl -u ${SVTPLAY_ARR_UNIT_NAME}."
+    fi
+    if [[ $(json_field "$body" mappings_degraded) == "true" ]]; then
+        warn "mappings_degraded is true: mappings.yaml failed to load and the last good table is being served."
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Rollback
+# ---------------------------------------------------------------------------
+
+rollback() {
+    local reason=$1
+    step "Rolling back"
+    err "$reason"
+    log "restoring ${PREVIOUS_DESC}"
+
+    if $ACTIVATED; then
+        if [[ -n $PREVIOUS_TARGET ]]; then
+            ln -sfn "$PREVIOUS_TARGET" "${CURRENT_LINK}.new"
+            mv -Tf "${CURRENT_LINK}.new" "$CURRENT_LINK"
+            log "current -> ${PREVIOUS_TARGET}"
+        else
+            rm -f "$CURRENT_LINK"
+            log "removed the ${CURRENT_LINK} symlink (there was none before)"
+        fi
+    fi
+
+    if $UNIT_BACKED_UP && [[ -f $UNIT_BACKUP ]]; then
+        cp -p "$UNIT_BACKUP" "$UNIT_PATH"
+        log "restored the previous unit file"
+    fi
+    "$SVTPLAY_ARR_SYSTEMCTL" daemon-reload || true
+    "$SVTPLAY_ARR_SYSTEMCTL" restart "$SVTPLAY_ARR_UNIT_NAME" || true
+
+    local body
+    if body=$(wait_for_health); then
+        step "Rollback complete"
+        err "The upgrade failed and was rolled back."
+        log "running: ${PREVIOUS_DESC}"
+        report_health "$body"
+        err "Nothing about your configuration was changed. Look at"
+        err "journalctl -u ${SVTPLAY_ARR_UNIT_NAME} for why the new version did not come up."
+        exit 1
+    fi
+
+    step "Rollback did not restore service"
+    err "The upgrade failed AND the previous version did not answer /health"
+    err "within ${SVTPLAY_ARR_HEALTH_TIMEOUT}s after being restored."
+    err "current -> $(readlink "$CURRENT_LINK" 2>/dev/null || echo "(absent)")"
+    err "unit:    ${UNIT_PATH}"
+    err "Your configuration was not touched. Check systemctl status ${SVTPLAY_ARR_UNIT_NAME}"
+    err "and journalctl -u ${SVTPLAY_ARR_UNIT_NAME}."
+    exit 1
+}
+
+# ---------------------------------------------------------------------------
+# Closing report
+# ---------------------------------------------------------------------------
+
+next_steps() {
+    local host
+    host=$(hostname 2>/dev/null || printf 'this-host')
+    step "Next steps"
+    cat <<NEXT
+    1. Open the configuration page and fill in Sonarr's URL and API key:
+
+           http://${host}:${LISTEN_PORT}/config
+
+       or edit ${CONFIG_FILE} directly. The four keys that must be set are
+       sonarr_url, sonarr_api_key, incomplete_dir and completed_dir.
+       Settings need a restart to apply:
+
+           systemctl restart ${SVTPLAY_ARR_UNIT_NAME}
+
+    2. Add at least one mapping (the same page, "Add mapping" or
+       "Find mappings"). Sonarr tests an indexer with a parameterless search
+       and rejects it outright if the feed comes back empty.
+
+    3. In Sonarr, turn Rename Episodes OFF
+       (Settings > Media Management > Episode Naming).
+
+       This project is built and tested against renameEpisodes off: the
+       release title svtplay-arr generates is also the output filename, so
+       the two cannot diverge. With renaming on, nothing here has been
+       tested.
+
+    4. Add the indexer (Newznab) and download client (SABnzbd), and the
+       remote path mapping -- docs/installation.md, "Connect Sonarr".
+
+    Logs:    journalctl -u ${SVTPLAY_ARR_UNIT_NAME} -f
+    Health:  curl ${SVTPLAY_ARR_HEALTH_URL}
+NEXT
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+detect_mode() {
+    if [[ -L $CURRENT_LINK || -d ${SVTPLAY_ARR_PREFIX}/.venv ]]; then
+        MODE=upgrade
+    else
+        MODE=install
+    fi
+}
+
+main() {
+    parse_args "$@"
+
+    step "svtplay-arr installer ${SCRIPT_VERSION}"
+    if $DRY_RUN; then
+        log "--dry-run: nothing will be changed"
+    fi
+
+    require_root
+    report_platform
+
+    detect_mode
+    PREVIOUS_DESC=$(describe_current)
+    if [[ -L $CURRENT_LINK ]]; then
+        PREVIOUS_TARGET=$(readlink "$CURRENT_LINK")
+    fi
+
+    step "Mode"
+    if [[ $MODE == install ]]; then
+        log "no existing installation under ${SVTPLAY_ARR_PREFIX}: installing"
+    else
+        log "existing installation found: upgrading"
+        log "currently installed: ${PREVIOUS_DESC}"
+        if [[ ! -L $CURRENT_LINK ]]; then
+            log "this installation predates the releases/ layout; it will be migrated"
+            log "to ${RELEASES_DIR}/<commit> with a ${CURRENT_LINK} symlink."
+            log "The existing checkout is left in place, untouched, as the rollback target."
+        fi
+        PRE_HEALTH_STATUS=$(json_field "$(fetch_health)" status)
+        if [[ -n $PRE_HEALTH_STATUS ]]; then
+            log "current /health status: ${PRE_HEALTH_STATUS}"
+        fi
+    fi
+
+    # Taken before anything is fetched or built, and checked at the end.
+    capture_config_fingerprint
+
+    PHASE="checking host prerequisites"
+    ensure_os_prereqs
+    PHASE="installing uv"
+    ensure_uv
+    PHASE="creating the service account"
+    ensure_account
+    PHASE="creating directories"
+    ensure_directories
+
+    PHASE="resolving ${SVTPLAY_ARR_REF}"
+    step "Source"
+    local sha id release_dir
+    sha=$(resolve_ref) ||
+        die "could not resolve ${SVTPLAY_ARR_REF} in ${SVTPLAY_ARR_REPO}; nothing has changed"
+    id=$(release_id "$sha")
+    release_dir="${RELEASES_DIR}/${id}"
+    log "repository: ${SVTPLAY_ARR_REPO}"
+    log "ref:        ${SVTPLAY_ARR_REF} -> ${sha}"
+    log "release:    ${release_dir}"
+
+    # The near-no-op second run.
+    local unit_is_current=false
+    if [[ -f $UNIT_PATH ]] && [[ $(render_unit) == "$(cat "$UNIT_PATH")" ]]; then
+        unit_is_current=true
+    fi
+    if [[ -f "${release_dir}/${RELEASE_STAMP}" ]] &&
+        [[ -L $CURRENT_LINK ]] &&
+        [[ $(readlink -f "$CURRENT_LINK") == "$(readlink -f "$release_dir")" ]] &&
+        $unit_is_current; then
+        step "Already up to date"
+        log "${PREVIOUS_DESC} is installed and active; there is nothing to do"
+        PHASE="checking health"
+        local body
+        if body=$(wait_for_health); then
+            step "Health"
+            report_health "$body"
+        else
+            warn "the service did not answer ${SVTPLAY_ARR_HEALTH_URL}; check systemctl status ${SVTPLAY_ARR_UNIT_NAME}"
+        fi
+        exit 0
+    fi
+
+    PHASE="fetching and building ${id}"
+    step "Release ${id}"
+    fetch_release "$release_dir" "$sha"
+
+    PHASE="seeding configuration"
+    if $DRY_RUN; then
+        step "Configuration"
+        printf '    would: create %s (0750) and write %s and %s from the release examples if absent (0640, %s:%s)\n' \
+            "$SVTPLAY_ARR_CONFIG_DIR" "$CONFIG_FILE" "$MAPPINGS_FILE" \
+            "$SVTPLAY_ARR_USER" "$SVTPLAY_ARR_GROUP"
+    else
+        seed_config "$release_dir"
+    fi
+
+    PHASE="setting ownership"
+    run "$SVTPLAY_ARR_CHOWN" -R "${SVTPLAY_ARR_USER}:${SVTPLAY_ARR_GROUP}" "$SVTPLAY_ARR_PREFIX"
+
+    PHASE="installing the systemd unit"
+    install_unit
+
+    PHASE="activating release ${id}"
+    step "Activating ${id}"
+    activate_release "$release_dir"
+    log "current -> ${release_dir}"
+
+    PHASE="starting the service"
+    start_service
+
+    PHASE="checking health"
+    step "Health"
+    if $DRY_RUN; then
+        printf '    would: poll %s for up to %ss and report what it says\n' \
+            "$SVTPLAY_ARR_HEALTH_URL" "$SVTPLAY_ARR_HEALTH_TIMEOUT"
+    else
+        local body
+        if body=$(wait_for_health); then
+            report_health "$body"
+            local status
+            status=$(json_field "$body" status)
+            # An upgrade that turns a healthy service into an unhealthy one is
+            # a failed upgrade. An upgrade of a service that was already
+            # degraded (a mount is down, say) is not -- rolling back would not
+            # fix it and would lose the upgrade.
+            if [[ $MODE == upgrade && $status != "ok" && $PRE_HEALTH_STATUS == "ok" ]]; then
+                rollback "the service came back as '${status}' after the upgrade; it was 'ok' before"
+            fi
+        else
+            if [[ $MODE == upgrade ]]; then
+                rollback "${SVTPLAY_ARR_HEALTH_URL} did not answer within ${SVTPLAY_ARR_HEALTH_TIMEOUT}s after the upgrade"
+            fi
+            err "the service did not answer ${SVTPLAY_ARR_HEALTH_URL} within ${SVTPLAY_ARR_HEALTH_TIMEOUT}s."
+            err "It is installed and enabled, and your configuration is in place."
+            err "Look at: systemctl status ${SVTPLAY_ARR_UNIT_NAME}"
+            err "         journalctl -u ${SVTPLAY_ARR_UNIT_NAME} -n 50"
+            exit 1
+        fi
+    fi
+
+    PHASE="verifying configuration was untouched"
+    if [[ $MODE == upgrade ]] && ! $DRY_RUN; then
+        step "Configuration"
+        assert_config_untouched
+    fi
+
+    PHASE="pruning old releases"
+    step "Housekeeping"
+    prune_releases
+    log "keeping at most ${SVTPLAY_ARR_KEEP_RELEASES} releases in ${RELEASES_DIR}"
+
+    step "Done"
+    if $DRY_RUN; then
+        log "nothing was changed."
+        log "would go from: ${PREVIOUS_DESC}"
+        log "to:            release ${id} (${sha})"
+    elif [[ $MODE == upgrade ]]; then
+        log "before: ${PREVIOUS_DESC}"
+        log "after:  $(describe_current)"
+    else
+        log "installed: $(describe_current)"
+    fi
+
+    if [[ $MODE == install ]] || $DRY_RUN; then
+        next_steps
+    else
+        log ""
+        log "Settings changes need: systemctl restart ${SVTPLAY_ARR_UNIT_NAME}"
+        log "Mapping changes do not."
+    fi
+}
+
+# Sourcing the script defines its functions without running anything, which
+# is how the test suite gets at render_unit with the real default paths.
+if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
+    main "$@"
+fi
