@@ -16,6 +16,8 @@ from pathlib import Path
 import pytest
 
 from svtplay_arr.canary import (
+    ATTENTION_STATES,
+    DEGRADED_STATES,
     STATE_NO_MAPPINGS,
     STATE_OK,
     STATE_SERIES,
@@ -150,6 +152,21 @@ def test_an_unknown_that_never_resolves_goes_stale_and_degrades():
     assert s["degraded"] is True
 
 
+async def test_a_recovered_show_stops_asking_for_attention():
+    # The amber must clear on its own once the row is fixed, or it becomes
+    # the same permanent noise by another route.
+    results = {"show-2": SvtApiError("404", status_code=404)}
+    c = _canary([_mapping(1), _mapping(2)], FakeSvt(results))
+    await c.run_once()
+    assert c.status()["needs_attention"] is True
+    results.pop("show-2")
+    await c.run_once()
+    s = c.status()
+    assert s["state"] == STATE_OK
+    assert s["needs_attention"] is False
+    assert s["degraded"] is False
+
+
 async def test_a_round_that_stops_happening_goes_stale():
     clock = Clock()
     svt = FakeSvt()
@@ -189,8 +206,55 @@ async def test_every_mapping_failing_reports_the_svt_or_parser_shape():
     s = c.status()
     assert s["state"] == STATE_SVT
     assert s["degraded"] is True
+    assert s["needs_attention"] is True
     assert s["checked"] == 3
     assert s["failing"] == 3
+
+
+# --- Which findings turn the light red -------------------------------------
+#
+# A failing show is real and it is the operator's to fix, but it must not
+# hold /health's top-level status red until they get round to deleting the
+# row. This project has already shipped the other version of that mistake:
+# the installer warning that fired on 100% of fresh installs, which the docs
+# then taught the reader to explain away. A warning meant to prevent a
+# serious failure is worth nothing once it is background noise -- and the
+# noise here would be sitting on the exact channel the `svt` shape needs.
+
+
+async def test_one_failing_show_asks_for_attention_without_turning_the_light_red():
+    svt = FakeSvt(results={"show-2": SvtApiError("404", status_code=404)})
+    c = _canary([_mapping(1), _mapping(2), _mapping(3)], svt)
+    await c.run_once()
+    s = c.status()
+    assert s["needs_attention"] is True
+    assert s["degraded"] is False
+    # ...and it is still fully reported, so an operator polling /health can
+    # apply whatever policy they like. This is about what turns the light
+    # red, not about hiding anything.
+    assert s["failing"] == 1
+    assert [f["tvdb_id"] for f in s["failing_series"]] == [2]
+
+
+async def test_the_urgent_shape_still_turns_the_light_red():
+    # The one that must survive: nothing will be grabbed until this is
+    # fixed, and it is now the only canary state standing between the
+    # operator and a month of silently missing episodes.
+    svt = FakeSvt(default=SvtApiError("boom"))
+    c = _canary([_mapping(1), _mapping(2)], svt)
+    await c.run_once()
+    s = c.status()
+    assert s["degraded"] is True
+    assert s["needs_attention"] is True
+
+
+def test_the_states_that_turn_the_light_red_are_exactly_these():
+    # Pinned as a set, so adding a state cannot quietly widen or narrow what
+    # alerting fires on.
+    assert DEGRADED_STATES == {STATE_STALE, STATE_SVT, STATE_UNAVAILABLE}
+    assert STATE_SERIES not in DEGRADED_STATES
+    assert STATE_SERIES in ATTENTION_STATES
+    assert DEGRADED_STATES < ATTENTION_STATES
 
 
 async def test_one_mapping_failing_reports_the_per_show_shape():
@@ -199,7 +263,6 @@ async def test_one_mapping_failing_reports_the_per_show_shape():
     await c.run_once()
     s = c.status()
     assert s["state"] == STATE_SERIES
-    assert s["degraded"] is True
     assert s["checked"] == 3
     assert s["failing"] == 1
     # A single boolean cannot tell the operator which row to edit; the
@@ -539,4 +602,5 @@ def test_unavailable_status_is_degraded_and_not_ok():
     s = unavailable_status()
     assert s["state"] == STATE_UNAVAILABLE
     assert s["degraded"] is True
+    assert s["needs_attention"] is True
     assert s["last_checked"] is None

@@ -3421,6 +3421,7 @@ def _sample_svt(**overrides) -> dict:
     base = {
         "state": "ok",
         "degraded": False,
+        "needs_attention": False,
         "alive": True,
         "checked": 3,
         "failing": 0,
@@ -3491,7 +3492,8 @@ def test_every_mapping_failing_reads_as_urgent_and_names_the_cause(
     tmp_path: Path,
 ):
     body = _canary_page(
-        tmp_path, state="svt", degraded=True, checked=3, failing=3,
+        tmp_path, state="svt", degraded=True, needs_attention=True,
+        checked=3, failing=3,
         episodes_seen=0, last_error="SVT answered but no episodes could be parsed",
         failing_series=[
             {"tvdb_id": 1, "series_title": "A", "svt_slug": "a", "error": "x"},
@@ -3509,8 +3511,15 @@ def test_every_mapping_failing_reads_as_urgent_and_names_the_cause(
 
 
 def test_one_mapping_failing_reads_as_that_show_not_as_an_outage(tmp_path: Path):
+    # `degraded` is False here on purpose -- that is what /health hands the
+    # page for this state (see canary.DEGRADED_STATES). The row must still be
+    # fully visible: keeping one dead mapping off the machine-readable
+    # verdict is about not training the operator to ignore a red light, and
+    # it would be self-defeating if it also made the row invisible on the
+    # page they actually read.
     body = _canary_page(
-        tmp_path, state="series", degraded=True, checked=3, failing=1,
+        tmp_path, state="series", degraded=False, needs_attention=True,
+        checked=3, failing=1,
         failing_series=[
             {"tvdb_id": 7, "series_title": "Ended Show", "svt_slug": "ended-show",
              "error": "404"},
@@ -3518,10 +3527,13 @@ def test_one_mapping_failing_reads_as_that_show_not_as_an_outage(tmp_path: Path)
     )
     strip = _strip_of(body)
     assert "SVT: 1 of 3 mappings" in strip
-    assert "status-chip error" in strip
+    # Amber, not red: real and theirs to fix, but nothing else has stopped.
+    assert "status-chip warn" in strip
+    assert "status-chip error" not in strip
     assert "SVT: FAILING" not in strip
     assert "Ended Show (ended-show)" in body
     assert "re-slugged" in body
+    assert '<p class="warn">' in body
     # The urgent shape's claim must not appear here: it would send the
     # operator looking for an outage that is not happening.
     assert "None of your" not in body
@@ -3529,7 +3541,8 @@ def test_one_mapping_failing_reads_as_that_show_not_as_an_outage(tmp_path: Path)
 
 def test_a_long_failure_list_is_truncated_with_a_count(tmp_path: Path):
     body = _canary_page(
-        tmp_path, state="series", degraded=True, checked=20, failing=9,
+        tmp_path, state="series", degraded=False, needs_attention=True,
+        checked=20, failing=9,
         failing_series=[
             {"tvdb_id": i, "series_title": f"S{i}", "svt_slug": f"s{i}",
              "error": "404"}
@@ -3542,9 +3555,9 @@ def test_a_long_failure_list_is_truncated_with_a_count(tmp_path: Path):
 
 def test_a_dead_canary_task_reads_as_nothing_is_checking(tmp_path: Path):
     body = _canary_page(
-        tmp_path, state="unknown", degraded=True, alive=False,
-        checked=0, failing=0, last_checked=None, last_success=None,
-        last_checked_age_s=None, last_success_age_s=None,
+        tmp_path, state="unknown", degraded=True, needs_attention=True,
+        alive=False, checked=0, failing=0, last_checked=None,
+        last_success=None, last_checked_age_s=None, last_success_age_s=None,
     )
     strip = _strip_of(body)
     assert "SVT: NOT BEING CHECKED" in strip
@@ -3554,7 +3567,8 @@ def test_a_dead_canary_task_reads_as_nothing_is_checking(tmp_path: Path):
 
 def test_a_stalled_canary_says_so(tmp_path: Path):
     body = _canary_page(
-        tmp_path, state="stale", degraded=True, checked=3, failing=0,
+        tmp_path, state="stale", degraded=True, needs_attention=True,
+        checked=3, failing=0,
         last_checked_age_s=14400.0, last_success_age_s=14400.0,
     )
     strip = _strip_of(body)

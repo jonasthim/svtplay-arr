@@ -132,10 +132,40 @@ STATE_SVT = "svt"
 # Reading the canary's own state failed. Unknown for an unknown reason.
 STATE_UNAVAILABLE = "unavailable"
 
-# The states that make `/health` say "degraded". `STATE_UNKNOWN` is
-# deliberately absent and `STATE_STALE` deliberately present; that pair is
-# the whole "must not read as healthy, must not cry wolf" balance.
-DEGRADED_STATES = frozenset({STATE_STALE, STATE_SERIES, STATE_SVT, STATE_UNAVAILABLE})
+# The states that turn `/health`'s top-level `status` to "degraded".
+#
+# `STATE_UNKNOWN` is deliberately absent and `STATE_STALE` deliberately
+# present; that pair is the whole "must not read as healthy, must not cry
+# wolf" balance.
+#
+# `STATE_SERIES` is deliberately absent too, and that one is worth stating
+# outright, because the obvious choice is the wrong one. A dead row *is* a
+# real failure and it *is* the operator's to fix -- but consider what
+# actually happens if it holds `status` red: a show ends, SVT retires the
+# URL, the operator does not get round to deleting the row, and every
+# monitoring setup polling this endpoint has a permanently red check. Within
+# a week they stop looking at it. Then the day SVT breaks the parser and the
+# state goes to `svt`, the signal built to catch exactly that arrives on a
+# channel everyone has already learned to ignore.
+#
+# This project has shipped that defect once already -- the installer warning
+# that fired on 100% of fresh installs, which the docs then taught the reader
+# to explain away. A warning meant to prevent a serious failure is worth
+# nothing once it is background noise.
+#
+# So the two shapes get different urgency as well as different words: `svt`
+# means nothing will be grabbed and the operator cannot fix the cause, which
+# is what a red light is for; `series` means one row is dead, which does not
+# stop anything else working and belongs in front of the operator's eyes
+# rather than on the machine-readable endpoint's verdict. `/health` still
+# *reports* the failing rows either way -- see `failing_series` -- so an
+# operator polling it can apply whatever policy they like. This is about
+# what turns the light red, not about hiding anything.
+DEGRADED_STATES = frozenset({STATE_STALE, STATE_SVT, STATE_UNAVAILABLE})
+# ...and the states that must be visible on every rendered surface, which is
+# the same set plus `series`. The strip and its banner key off this; only
+# `/health`'s top-level `status` keys off DEGRADED_STATES above.
+ATTENTION_STATES = DEGRADED_STATES | {STATE_SERIES}
 
 
 def _utcnow() -> datetime:
@@ -194,6 +224,7 @@ def unavailable_status() -> dict:
     return {
         "state": STATE_UNAVAILABLE,
         "degraded": True,
+        "needs_attention": True,
         "last_checked_age_s": None,
         "last_success_age_s": None,
         "checked": None,
@@ -312,7 +343,13 @@ class SvtCanary:
         failing = [h for h in self._health.values() if h.ok is False]
         return {
             "state": state,
+            # Does this turn /health's top-level light red? See
+            # DEGRADED_STATES for why one failing show deliberately does not.
             "degraded": state in DEGRADED_STATES,
+            # Is there a finding the operator should be looking at? A
+            # superset: `series` is here and not above, which is exactly the
+            # gap between "worth your attention" and "worth an alert".
+            "needs_attention": state in ATTENTION_STATES,
             # Ages, not just timestamps. "When did we last confirm SVT
             # works" is the strip's headline question, and an ISO instant in
             # UTC makes the operator do timezone arithmetic to answer it.

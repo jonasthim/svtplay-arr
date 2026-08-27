@@ -156,6 +156,14 @@ def create_app(settings: Settings) -> FastAPI:
         # same precedent as `worker_alive`: a monitoring task that silently
         # stopped monitoring must not look like one that is working, or the
         # canary becomes a second silence rather than the end of the first.
+        #
+        # Only `svt["degraded"]` reaches the top-level `status` below;
+        # `svt["needs_attention"]` is the wider set the rendered surfaces
+        # use. One failing show is in the second and not the first, so a
+        # dead mapping row nobody has got round to deleting cannot hold this
+        # endpoint red forever -- see DEGRADED_STATES in canary.py for why
+        # that distinction is load-bearing rather than cosmetic. The failing
+        # rows are still reported here either way.
         try:
             svt = canary.status()
         except Exception:
@@ -164,6 +172,7 @@ def create_app(settings: Settings) -> FastAPI:
         svt["alive"] = canary_task is not None and not canary_task.done()
         if not svt["alive"]:
             svt["degraded"] = True
+            svt["needs_attention"] = True
 
         same_fs = settings.dirs_share_filesystem()
         status = (

@@ -87,7 +87,8 @@ because a hardcoded slug rots — and reports:
   until it is fixed.
 - `"state": "series"` — some resolved and some did not. Those shows have
   ended, been re-slugged, or moved; `failing_series` names them and each is
-  fixed by editing one row.
+  fixed by editing one row. This one deliberately leaves `status` at `"ok"`
+  — see below.
 - `"state": "unknown"` — nothing has been checked since this process started.
   Deliberately *not* reported as `ok`, and it becomes `"stale"` (and degraded)
   if no check ever completes.
@@ -96,10 +97,18 @@ because a hardcoded slug rots — and reports:
   reason: a monitoring task that quietly stopped monitoring must not look like
   one that is working.
 
-`state` `svt`, `series` and `stale`, and `alive: false`, each set the
-top-level `status` to `"degraded"`. `svt_canary_interval_minutes` in
-`config.yaml` (default 60) is how to slow it down; it is not on the settings
-page.
+`state` `svt` and `stale`, and `alive: false`, set the top-level `status` to
+`"degraded"`. `series` does **not**, and that is deliberate: a show ends, SVT
+retires the URL, nobody gets round to deleting the row, and a `status` that
+went red for it would stay red — so within a week the check is background
+noise, and the day SVT breaks the parser the `svt` state arrives on a channel
+everyone has learned to ignore. One dead row does not stop anything else
+working; it is reported in full (`failing`, `failing_series`) so you can alert
+on it yourself if you want to, and it is rendered prominently on the
+configuration page either way.
+
+`svt_canary_interval_minutes` in `config.yaml` (default 60) is how to slow the
+check down; it is not on the settings page.
 
 **If the NFS export squashes identities, do not `chown` anything under this
 mount.** An export configured with `mapall_user` / `mapall_group` (or

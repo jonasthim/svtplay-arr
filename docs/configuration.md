@@ -583,7 +583,7 @@ They need different actions, so they are reported differently:
 | --- | --- | --- |
 | `ok` | Every mapping resolved. | Nothing. |
 | `svt` | **None** of them did. | This is SVT or the parser, not any one show. Nothing will be grabbed until it is fixed. |
-| `series` | Some did, some did not. | Those shows ended, were re-slugged, or moved. `failing_series` names them; fix one row each. |
+| `series` | Some did, some did not. | Those shows ended, were re-slugged, or moved. `failing_series` names them; fix one row each. Everything else keeps working. |
 | `no_mappings` | Nothing to check. | Nothing — a fresh install legitimately has no mappings. |
 | `unknown` | No check has completed since the service started. | Wait. It is deliberately not reported as `ok`. |
 | `stale` | No check has completed for three intervals. | Something is wrong with the check itself; look in the log. |
@@ -593,16 +593,38 @@ They need different actions, so they are reported differently:
 monitoring task that quietly stopped monitoring must not look like one that is
 working. `false` means nothing is checking SVT at all — restart the service.
 
-`svt`, `series` and `stale`, and `alive: false`, each set `/health`'s top-level
-`status` to `"degraded"` and show up on the configuration page's status strip.
-`unknown` does not: for the first interval after a restart nothing is known to
-be *wrong*, and a check that reported degraded on every boot is one you would
-learn to ignore. It becomes `stale` if it never resolves, so it cannot sit
-quietly forever.
+### Which findings turn the light red
+
+`svt` and `stale`, and `alive: false`, set `/health`'s top-level `status` to
+`"degraded"`. Each means the same thing at bottom: **nothing is being grabbed,
+or nothing currently knows whether it is**, and you cannot fix the cause by
+editing a row.
+
+Two states deliberately do *not*, and both exclusions are load-bearing:
+
+- **`series`.** One dead mapping is real and it is yours to fix, but it does not
+  stop anything else working — and if it held `status` red until you got round
+  to deleting the row, it would hold it red for weeks. A monitoring check that
+  is permanently red is one you stop reading, and the day SVT breaks the parser
+  the `svt` state would arrive on exactly that channel. This project has shipped
+  that mistake once already, as an installer warning that fired on every fresh
+  install. It is still reported in full (`failing`, `failing_series`), so you can
+  alert on it yourself if you prefer, and it is rendered prominently on the
+  configuration page regardless.
+- **`unknown`.** For the first interval after a restart nothing is known to be
+  *wrong*, and a check that reported degraded on every boot is one you would
+  learn to ignore for the same reason. It cannot sit there quietly forever,
+  because it becomes `stale` if it never resolves.
+
+Every state with a finding — `svt`, `series`, `stale`, `unavailable`, and a dead
+canary task — shows up on the configuration page's status strip, red for the
+ones above and amber for `series`.
 
 ### What it reports
 
-Alongside `state` and `alive`: `checked` and `failing` (the counts that
+Alongside `state` and `alive`: `degraded` (does this turn the top-level light
+red) and `needs_attention` (is there a finding at all — a superset, and the gap
+between them is `series`), `checked` and `failing` (the counts that
 separate the two shapes), `episodes_seen`, `last_checked` and `last_success`
 with their ages in seconds, `last_error` with `last_error_at`, and
 `failing_series` — up to five failing rows by name and slug, with

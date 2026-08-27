@@ -449,7 +449,14 @@
     {%- if health.svt %}
     {%- set svt = health.svt %}
     {%- set checked = svt.checked or 0 %}
-    <span class="status-chip{{ ' error' if svt.degraded else (' warn' if svt.state == 'unknown' else '') }}">
+    {#- Three levels, not two. `degraded` is the red one: nothing will be
+        grabbed and the operator cannot fix the cause. `needs_attention`
+        without `degraded` is one dead mapping row -- real, theirs to fix,
+        and deliberately amber rather than red, because a per-show failure
+        that painted the strip red would sit there until they got round to
+        deleting the row and teach them to read past it. See
+        DEGRADED_STATES in canary.py. #}
+    <span class="status-chip{{ ' error' if svt.degraded else (' warn' if svt.needs_attention or svt.state == 'unknown' else '') }}">
       {%- if not svt.alive %}
       SVT: NOT BEING CHECKED &mdash; the canary task has died
       {%- elif svt.state == 'unavailable' %}
@@ -479,16 +486,23 @@
     </span>
     {%- endif %}
   </div>
-  {#- The strip is a headline; a degraded canary needs to be actionable,
-      because this is the warning standing between the operator and a month
-      of silently missing episodes. It says which of the two failure shapes
-      this is -- everything failing means SVT or the parser, one show
-      failing means that row -- because they call for completely different
-      actions. Rendered only when something is actually wrong, and the full
-      per-mapping breakdown deliberately stays out of it. #}
-  {%- if health.svt and health.svt.degraded %}
+  {#- The strip is a headline; a canary with a finding needs to be
+      actionable, because this is the warning standing between the operator
+      and a month of silently missing episodes. It says which of the two
+      failure shapes this is -- everything failing means SVT or the parser,
+      one show failing means that row -- because they call for completely
+      different actions.
+
+      Both shapes render here, at full width, however the machine-readable
+      `/health` status is scored: keeping one failing row off that endpoint's
+      verdict is about not training the operator to ignore a red light, and
+      it would be self-defeating if it also made the row invisible on the
+      page they actually read. Rendered only when something is genuinely
+      wrong, and the full per-mapping breakdown deliberately stays out of
+      it. #}
+  {%- if health.svt and health.svt.needs_attention %}
   {%- set svt = health.svt %}
-  <p class="error">
+  <p class="{{ 'error' if svt.degraded else 'warn' }}">
     {%- if not svt.alive %}
     Nothing is checking SVT any more: the background check has died, so a
     change at SVT would now go unnoticed exactly as it did before this check
@@ -514,7 +528,8 @@
     <strong>{{ svt.failing }} of {{ svt.checked }} mappings did not resolve on
     SVT.</strong> The rest did, so this is about {{ 'that show' if svt.failing == 1
     else 'those shows' }} rather than SVT &mdash; it has probably ended, been
-    re-slugged, or moved. Fix the row{{ '' if svt.failing == 1 else 's' }} below:
+    re-slugged, or moved. Everything else keeps working, so this is yours to fix
+    when you get to it. Fix the row{{ '' if svt.failing == 1 else 's' }} below:
     {% for f in svt.failing_series %}{{ f.series_title }} ({{ f.svt_slug }}){{ ', '
     if not loop.last }}{% endfor %}{% if svt.failing_series_truncated %}, and
     {{ svt.failing - svt.failing_series | length }} more{% endif %}.

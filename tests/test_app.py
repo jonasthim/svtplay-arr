@@ -848,6 +848,9 @@ def test_every_mapping_failing_reads_as_svt_or_the_parser(
     assert body["svt"]["state"] == "svt"
     assert body["svt"]["checked"] == 2
     assert body["svt"]["failing"] == 2
+    # The shape that must keep turning the light red: nothing will be
+    # grabbed until it is fixed and the operator cannot fix the cause.
+    assert body["svt"]["degraded"] is True
     assert body["status"] == "degraded"
     assert "SVT: FAILING" in page
     assert 'class="status-chip error"' in page
@@ -871,14 +874,29 @@ def test_one_mapping_failing_reads_as_that_show(tmp_path: Path, monkeypatch):
     assert body["svt"]["checked"] == 2
     assert body["svt"]["failing"] == 1
     assert [f["tvdb_id"] for f in body["svt"]["failing_series"]] == [2]
-    assert body["status"] == "degraded"
-    # Scoped to the canary's own banner, not the page: the mappings table
-    # below prints every series title, so an unscoped search for "B Show"
-    # would pass with nothing about the canary rendered at all.
+    assert body["svt"]["needs_attention"] is True
+
+    # ...and the top-level light stays green. A dead row is real and it is
+    # the operator's to fix, but if it held /health red until they got round
+    # to deleting it, every monitoring setup polling this endpoint would have
+    # a permanently red check inside a week -- and the `svt` shape, which is
+    # the one that means nothing will be grabbed, would then arrive on a
+    # channel everyone had learned to ignore. Same defect as the installer
+    # warning that fired on 100% of fresh installs.
+    assert body["svt"]["degraded"] is False
+    assert body["status"] == "ok"
+
+    # Nothing is hidden, though: /health names the failing row (above) and
+    # the page renders it at full width. Scoped to the canary's own banner,
+    # because the mappings table below prints every series title -- an
+    # unscoped search for "B Show" would pass with nothing about the canary
+    # rendered at all.
     banner = _canary_banner(page)
     assert "B Show" in banner
     assert "b-show" in banner
     assert "1 of 2 mappings" in banner
+    # Amber, not red: the two shapes differ in urgency as well as wording.
+    assert 'class="status-chip warn"' in page
     # The urgent shape's wording must not appear for a single failing show:
     # it would send the operator looking for an outage that is not there.
     assert "SVT: FAILING" not in page
@@ -929,6 +947,35 @@ def test_a_canary_round_that_raises_leaves_the_service_healthy(
         assert c.get("/config").status_code == 200
 
 
+def test_a_dead_canary_task_still_turns_the_light_red(tmp_path: Path, monkeypatch):
+    # The case that matters most now that one failing show does not. With
+    # `series` off the top-level verdict, a dead canary and the `svt` shape
+    # are the whole of what stands between the operator and a month of
+    # silently missing episodes -- so both must reach `status`.
+    async def _dies_immediately(self):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(
+        "svtplay_arr.canary.SvtCanary.run_forever", _dies_immediately
+    )
+    # A perfectly healthy mapping, so nothing *else* could account for the
+    # degrade: the only thing wrong is that nothing is checking.
+    _mappings_file(tmp_path, (1, "a-show", "A Show"))
+    _svt_returns(monkeypatch, {"a-show": [_episode(1)]})
+
+    with TestClient(create_app(_settings(tmp_path))) as c:
+        deadline = time.monotonic() + 2.0
+        body = c.get("/health").json()
+        while body["svt"]["alive"] and time.monotonic() < deadline:
+            time.sleep(0.02)
+            body = c.get("/health").json()
+
+        assert body["svt"]["alive"] is False
+        assert body["svt"]["degraded"] is True
+        assert body["svt"]["needs_attention"] is True
+        assert body["status"] == "degraded"
+
+
 def test_health_never_500s_on_a_broken_canary(tmp_path: Path, monkeypatch):
     # Same rule as the mapping table's own guard: /health is monitoring
     # infrastructure and must not be able to fail the thing it monitors.
@@ -972,7 +1019,16 @@ def _canary_banner(page: str) -> str:
     """
     strip_end = page.index('class="status-strip"')
     strip_end = page.index("</div>", strip_end)
-    start = page.index('<p class="error">', strip_end)
+    starts = [
+        i
+        for i in (
+            page.find('<p class="error">', strip_end),
+            page.find('<p class="warn">', strip_end),
+        )
+        if i != -1
+    ]
+    assert starts, "no canary banner on the page"
+    start = min(starts)
     return " ".join(page[start: page.index("</p>", start)].split())
 
 
