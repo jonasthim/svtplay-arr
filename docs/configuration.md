@@ -513,8 +513,11 @@ Practical notes:
 
 ```sh
 SVTPLAY_ARR_CONFIG=/etc/svtplay-arr/config.yaml \
-  /opt/svtplay-arr/.venv/bin/svtplay-arr-suggest-mappings
+  /opt/svtplay-arr/current/.venv/bin/svtplay-arr-suggest-mappings
 ```
+
+(`current/` is the release symlink `install.sh` maintains; a hand-built
+install has the venv directly at `/opt/svtplay-arr/.venv`.)
 
 Runs exactly the sweep above, at the same configured `air_date_tolerance_days`,
 and **never writes `mappings.yaml`**. Corroborated rows go to stdout as

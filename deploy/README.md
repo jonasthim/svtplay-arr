@@ -85,6 +85,13 @@ systemd unit (already set below) so svtplay-arr's own writes land as files
 
 ## Installing the service
 
+**[`install.sh`](../install.sh) in the repository root does all of this**, and
+is the supported way to install and to upgrade — it also gives you a versioned
+release layout with automatic rollback, which the manual steps below do not.
+See [docs/installation.md](../docs/installation.md). What follows is the same
+install by hand: the reference for what the script is doing, and the path for
+a platform it will not run on.
+
 The unit runs as `User=svtplay Group=media`, not root. Nothing in the steps
 below is optional — skip the ownership steps and the service will fail to
 start with a `PermissionError` the first time it tries to open its job
@@ -203,7 +210,10 @@ The same sweep runs from the install directory, writing nothing at all (it
 needs the same config/env as the service):
 
     SVTPLAY_ARR_CONFIG=/etc/svtplay-arr/config.yaml \
-      /opt/svtplay-arr/.venv/bin/svtplay-arr-suggest-mappings
+      /opt/svtplay-arr/current/.venv/bin/svtplay-arr-suggest-mappings
+
+(`current/` is the release symlink `install.sh` maintains; drop it for a
+hand-built install, where the venv sits directly at `/opt/svtplay-arr/.venv`.)
 
 Confident rows go to stdout as pasteable YAML — slug derived, byte-for-byte
 what the page would have written; everything needing a decision goes to

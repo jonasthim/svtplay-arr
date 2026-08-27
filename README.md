@@ -259,23 +259,46 @@ renders the Sonarr API key into the page by deliberate choice. See
 ## Requirements
 
 - **A Swedish IP address.** See the top of this file.
-- **Python 3.12 or newer.**
+- **A Linux host with systemd, and root on it.** Its own container or VM is
+  recommended, not co-located with Sonarr.
 - **`ffmpeg`**, which `svtplay-dl` shells out to for muxing. Without it,
-  downloads fail late rather than at startup.
+  downloads fail late rather than at startup. The installer installs it for
+  you on Debian and Ubuntu; elsewhere it tells you to.
 - **Sonarr**, reachable from this service, with an API key. Developed and run
   against Sonarr v4 (4.0.19); other versions are untested.
-- A host to run it on — its own container or VM is recommended, not
-  co-located with Sonarr.
 - Access to Sonarr's completed-downloads storage, with an `incomplete/` and a
   `completed/` directory as **siblings on one filesystem**. This one is not
   negotiable; see [docs/installation.md](docs/installation.md) for why.
 
+**No system Python.** The installer uses [uv](https://docs.astral.sh/uv/),
+which brings its own interpreter — there is no Python version to satisfy and
+no `python3-venv` to add. Python 3.12+ is only a requirement if you install by
+hand or want to work on the code.
+
 ## Quick start
 
-The full walkthrough — service user, systemd unit, mount layout, connecting
-Sonarr — is in **[docs/installation.md](docs/installation.md)**, and the
-operational deployment reference is **[deploy/README.md](deploy/README.md)**.
-The short version, to see it run:
+```sh
+curl -fsSLO https://raw.githubusercontent.com/jonasthim/svtplay-arr/main/install.sh
+less install.sh                 # a root-level installer; read it first
+sudo bash install.sh
+```
+
+That is the whole install: OS prerequisites, uv, the `svtplay` user and the
+`media` group, the code, the configuration files, the systemd unit, and a
+health check at the end. `bash install.sh --dry-run` prints every action and
+changes nothing (and does not need root).
+
+**The same command upgrades.** It builds the new release beside the running
+one, flips a symlink, and rolls itself back if the service does not come back
+healthy. It never touches `config.yaml` or `mappings.yaml`.
+
+Then open `http://<host>:9800/config`, fill in Sonarr's URL and API key, add a
+mapping, and follow [docs/installation.md](docs/installation.md) to add the
+indexer and download client in Sonarr. Sonarr needs **Rename Episodes off**;
+the installation guide explains why.
+
+<details>
+<summary>Running it from a checkout instead, just to see it work</summary>
 
 ```sh
 git clone https://github.com/jonasthim/svtplay-arr
@@ -305,14 +328,13 @@ If `same_filesystem` is `false`, stop and fix the directory layout before
 going any further — that field exists to catch the one mistake that can
 corrupt your library.
 
-Open `http://localhost:9800/config` to add a mapping, then follow
-[docs/installation.md](docs/installation.md) to add the indexer and download
-client in Sonarr.
+</details>
 
 ## Documentation
 
 | Document | What it covers |
 | --- | --- |
+| [install.sh](install.sh) | The installer and upgrader. One command for both; `--dry-run` shows what it would do |
 | [docs/installation.md](docs/installation.md) | Fresh container to working service, and connecting Sonarr |
 | [docs/configuration.md](docs/configuration.md) | Every setting, its default and its consequences; the mappings file format |
 | [docs/how-it-works.md](docs/how-it-works.md) | The request flow, the resolver, the wire surfaces — for contributors |

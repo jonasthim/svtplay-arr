@@ -27,7 +27,10 @@
 # The packaged script runs the same sweep and writes nothing at all:
 #
 #     SVTPLAY_ARR_CONFIG=/etc/svtplay-arr/config.yaml \
-#       /opt/svtplay-arr/.venv/bin/svtplay-arr-suggest-mappings
+#       /opt/svtplay-arr/current/.venv/bin/svtplay-arr-suggest-mappings
+#
+# (install.sh puts each release under /opt/svtplay-arr/releases/ with a
+# `current` symlink; a hand-built install has no `current/` in that path.)
 #
 # A wrong mapping is the class of mistake this project refuses to make on a
 # guess -- it makes every episode of that show a permanently wrong filename
