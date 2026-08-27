@@ -59,3 +59,18 @@ jobs:
       # `-W ignore::...` beside this, never a blanket removal.
       - name: Run the test suite (integration tests excluded, see above)
         run: uv run --extra dev pytest -m "not integration" -q -W error
+
+  shellcheck:
+    name: shellcheck (install.sh)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # install.sh runs as root on someone else's machine, so it gets the
+      # same "warnings are failures" treatment the Python does. `-S style`
+      # is the strictest severity shellcheck offers; the script is clean at
+      # it today, and the way to keep a finding out of the build is to fix
+      # it or to add a justified `# shellcheck disable=` beside the line,
+      # never to relax the severity here.
+      - name: Lint install.sh
+        run: shellcheck --severity=style --shell=bash install.sh
