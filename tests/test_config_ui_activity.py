@@ -17,8 +17,8 @@ lying:
   has to carry whatever the store recorded about why.
 """
 
+import asyncio
 import re
-import threading
 from pathlib import Path
 
 import pytest
@@ -260,16 +260,28 @@ def test_the_store_read_does_not_happen_on_the_event_loop(
     # read *on the event loop*, the same loop the download worker runs on,
     # and a page render would stall the downloads it is reporting on.
     # asyncio.to_thread is what keeps both true; nothing else observes it.
-    threads = []
+    #
+    # Asked of asyncio rather than of `threading.current_thread()`: the
+    # test client runs the app on a thread of its own, so "not the main
+    # thread" is true either way and a version of this test asserting that
+    # passed with the hop removed. Inside a to_thread worker there is no
+    # running loop at all, and that is not true of anywhere else this could
+    # be called from.
+    where = []
 
     def _provider():
-        threads.append(threading.current_thread())
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            where.append("off the loop")
+        else:
+            where.append("on the loop")
         return {"active": [], "history": []}
 
     _client(tmp_path, _provider).get(path)
 
-    assert threads, "the activity provider was never called"
-    assert threading.main_thread() not in threads
+    assert where, "the activity provider was never called"
+    assert set(where) == {"off the loop"}, where
 
 
 # --- The Status view's own summary ------------------------------------

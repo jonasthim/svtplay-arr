@@ -15,6 +15,7 @@ could most easily have broken invisibly, since a refusal that renders the
 wrong view still renders a perfectly valid page.
 """
 
+import asyncio
 import re
 from pathlib import Path
 
@@ -293,6 +294,39 @@ def test_the_no_js_check_re_renders_the_mappings_view(tmp_path: Path):
 
     assert r.status_code == 200
     assert _current_view(r.text) == "Mappings"
+
+
+@pytest.mark.parametrize("key,label,path", VIEWS)
+def test_the_health_read_does_not_happen_on_the_event_loop(
+    tmp_path: Path, key: str, label: str, path: str
+):
+    # compute_health reads the job store, and every route here is a
+    # coroutine -- so calling it inline runs a blocking sqlite read on the
+    # event loop the download worker also runs on. Rendering any view
+    # would then stall the downloads it is reporting on for as long as the
+    # worker held the store's lock.
+    #
+    # Inside an asyncio.to_thread worker there is no running loop; asking
+    # for one is the only check here that a version of the test could not
+    # pass by accident, since the test client already runs the app off the
+    # main thread.
+    where = []
+
+    def _provider():
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            where.append("off the loop")
+        else:
+            where.append("on the loop")
+        return {"status": "ok", "worker_alive": True, "active_jobs": 0,
+                "same_filesystem": True, "mappings": 1,
+                "mappings_ever_loaded": True, "mappings_degraded": False}
+
+    _client(tmp_path, status_provider=_provider).get(path)
+
+    assert where, "the status provider was never called"
+    assert set(where) == {"off the loop"}, where
 
 
 def test_the_pending_restart_banner_is_on_every_view(tmp_path: Path):
