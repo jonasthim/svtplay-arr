@@ -10,7 +10,7 @@ import yaml
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from svtplay_arr.api.config_ui import build_config_router
+from svtplay_arr.api.config_ui import VIEWS, build_config_router
 from svtplay_arr.config import SETTING_FIELDS, Settings
 from svtplay_arr.mappings import MappingTable, add_mapping
 from svtplay_arr.models import SonarrEpisode, SvtEpisode, SvtSearchHit
@@ -150,7 +150,7 @@ def _client(tmp_path: Path, svt=None, sonarr=None) -> TestClient:
 
 
 def test_index_lists_the_existing_mapping(tmp_path: Path):
-    body = _client(tmp_path).get("/config").text
+    body = _client(tmp_path).get("/config/mappings").text
     assert TITLE in body
     assert "288649" in body
 
@@ -159,7 +159,7 @@ def test_index_renders_the_api_key_as_an_editable_masked_field(tmp_path: Path):
     # Reversal of test_index_never_renders_the_api_key, decided 2026-08-25.
     # The value is deliberately in the page source; masking is a
     # shoulder-surfing measure, not a confidentiality one.
-    body = _client(tmp_path).get("/config").text
+    body = _client(tmp_path).get("/config/settings").text
     assert "SECRET-KEY-VALUE" in body
     assert 'name="sonarr_api_key"' in body
     assert 'type="password"' in body
@@ -197,7 +197,7 @@ def test_the_api_key_field_is_masked_and_holds_the_value_exactly_once(
     # twice. The security posture is unchanged either way (the value is in
     # the source), but a second rendered copy is a second place to leak
     # from for no gain.
-    body = _client(tmp_path).get("/config").text
+    body = _client(tmp_path).get("/config/settings").text
     field = _input_tag(body, "sonarr_api_key")
     assert 'type="password"' in field, f"the API key field is not masked: {field}"
     assert 'value="SECRET-KEY-VALUE"' in field
@@ -219,7 +219,7 @@ def test_the_show_hide_button_exists_only_once_javascript_has_run(tmp_path: Path
     # script -- which sets everything through properties and setAttribute
     # -- cannot contain, so the script's own presence in the page cannot
     # satisfy them.
-    body = _client(tmp_path).get("/config").text
+    body = _client(tmp_path).get("/config/settings").text
     assert 'type="button"' not in body, (
         "a button that only JavaScript can make work is server-rendered"
     )
@@ -347,14 +347,14 @@ def test_the_show_hide_button_sits_inside_the_field_without_covering_it(
 
 
 def test_index_shows_every_editable_setting(tmp_path: Path):
-    body = _client(tmp_path).get("/config").text
+    body = _client(tmp_path).get("/config/settings").text
     for key in ("sonarr_url", "incomplete_dir", "air_date_tolerance_days",
                 "rss_window_days", "max_concurrent_downloads"):
         assert key in body
 
 
 def test_index_states_the_tolerance_consequence(tmp_path: Path):
-    assert "ambiguous" in _client(tmp_path).get("/config").text.lower()
+    assert "ambiguous" in _client(tmp_path).get("/config/settings").text.lower()
 
 
 _SECTION_FIELDS = {
@@ -384,7 +384,7 @@ def _section_slices(body: str) -> dict[str, str]:
 
 
 def test_index_groups_settings_into_labeled_sections_in_order(tmp_path: Path):
-    body = _client(tmp_path).get("/config").text
+    body = _client(tmp_path).get("/config/settings").text
     names = [m.group(1) for m in re.finditer(r"<legend>([^<]+)</legend>", body)]
     # A future edit that drops a section, or reorders the fieldsets, fails
     # here rather than only being noticeable by eye.
@@ -394,7 +394,7 @@ def test_index_groups_settings_into_labeled_sections_in_order(tmp_path: Path):
 def test_index_places_every_field_in_its_documented_section_and_no_other(
     tmp_path: Path,
 ):
-    body = _client(tmp_path).get("/config").text
+    body = _client(tmp_path).get("/config/settings").text
     slices = _section_slices(body)
     assert set(slices) == set(_SECTION_FIELDS)
 
@@ -413,7 +413,7 @@ def test_index_places_every_field_in_its_documented_section_and_no_other(
 
 
 def test_dangerous_fields_are_visibly_marked(tmp_path: Path):
-    body = _client(tmp_path).get("/config").text
+    body = _client(tmp_path).get("/config/settings").text
     for key in ("air_date_tolerance_days", "incomplete_dir", "completed_dir"):
         pattern = re.compile(
             r'<div class="field-danger">\s*<label for="' + re.escape(key) + '"'
@@ -422,7 +422,7 @@ def test_dangerous_fields_are_visibly_marked(tmp_path: Path):
 
 
 def test_ordinary_fields_are_not_marked_dangerous(tmp_path: Path):
-    body = _client(tmp_path).get("/config").text
+    body = _client(tmp_path).get("/config/settings").text
     for key in ("sonarr_url", "sonarr_api_key", "rss_window_days",
                 "max_concurrent_downloads"):
         pattern = re.compile(
@@ -471,7 +471,7 @@ def test_the_danger_marker_says_what_it_means_in_words(tmp_path: Path):
     # a word, and it has to be a word in the markup -- CSS-generated
     # content is not dependably announced and is absent entirely with CSS
     # off.
-    body = _client(tmp_path).get("/config").text
+    body = _client(tmp_path).get("/config/settings").text
     for key in _DANGEROUS_KEYS:
         badge = _danger_badge(_danger_block(body, key), key)
         text = re.sub(r"<[^>]+>", "", badge)
@@ -488,7 +488,7 @@ def test_the_danger_glyph_is_never_the_only_carrier_of_the_meaning(
     # nothing or an unpronounceable symbol, so it is hidden from the
     # accessibility tree and the word beside it -- real text, inside the
     # label, announced with the field -- carries the meaning.
-    body = _client(tmp_path).get("/config").text
+    body = _client(tmp_path).get("/config/settings").text
     for key in _DANGEROUS_KEYS:
         badge = _danger_badge(_danger_block(body, key), key)
         holders = re.findall(r"<([a-z]+)([^>]*)>[^<]*" + _DANGER_GLYPH, badge)
@@ -517,7 +517,7 @@ def test_dangerous_field_treatment_does_not_duplicate_the_help_text(
     # The spec text: don't add a second explanation that could drift from
     # the field's own help string. The visible marker must be styling, not
     # new prose -- so the consequence sentence still appears exactly once.
-    body = _client(tmp_path).get("/config").text
+    body = _client(tmp_path).get("/config/settings").text
     assert body.count("ambiguous") == 1
 
 
@@ -542,7 +542,7 @@ def test_the_numeric_settings_ask_a_phone_for_a_numeric_keypad(tmp_path: Path):
     # declared `kind`, not a list of key names -- a fourth int setting must
     # get the keypad by being declared an int, not by someone remembering
     # to add it here.
-    body = _client(tmp_path).get("/config").text
+    body = _client(tmp_path).get("/config/settings").text
     ints = [f for f in SETTING_FIELDS if f.kind == "int"]
     assert ints, "no int settings; this test would be vacuous"
 
@@ -564,7 +564,7 @@ def test_the_numeric_settings_are_not_type_number(tmp_path: Path):
     # that silently discard non-numeric input -- which would quietly take
     # over from `save_settings`' own int() validation and the deliberately
     # specific errors it raises (see test_invalid_settings_are_refused...).
-    body = _client(tmp_path).get("/config").text
+    body = _client(tmp_path).get("/config/settings").text
     assert 'type="number"' not in body
     for f in SETTING_FIELDS:
         if f.kind == "int":
@@ -584,13 +584,16 @@ def test_index_survives_a_malformed_config_file(tmp_path: Path):
     )
     app = FastAPI()
     app.include_router(build_config_router(cfg, maps, FakeSvt(), FakeSonarr()))
-    resp = TestClient(app).get("/config")
+    client = TestClient(app)
+    resp = client.get("/config/settings")
 
     assert resp.status_code == 200
     assert str(cfg) in resp.text
-    # the rest of the page still renders usefully: the mappings table, which
-    # doesn't depend on config.yaml at all, is untouched by the failure.
-    assert TITLE in resp.text
+    # ...and the views that do not depend on config.yaml are untouched by
+    # the failure. One broken file must not take the whole page down, which
+    # is the same property this asserted when it was all one page.
+    assert TITLE in client.get("/config/mappings").text
+    assert client.get("/config").status_code == 200
 
 
 def test_index_survives_a_malformed_mappings_file(tmp_path: Path):
@@ -598,13 +601,14 @@ def test_index_survives_a_malformed_mappings_file(tmp_path: Path):
     maps.write_text("series: [unterminated\n", encoding="utf-8")
     app = FastAPI()
     app.include_router(build_config_router(cfg, maps, FakeSvt(), FakeSonarr()))
-    resp = TestClient(app).get("/config")
+    client = TestClient(app)
+    resp = client.get("/config/mappings")
 
     assert resp.status_code == 200
     assert str(maps) in resp.text
-    # the rest of the page still renders usefully: the settings form, which
-    # doesn't depend on mappings.yaml at all, is untouched by the failure.
-    assert "sonarr_url" in resp.text
+    # ...and the settings form, which doesn't depend on mappings.yaml at
+    # all, is untouched by the failure.
+    assert "sonarr_url" in client.get("/config/settings").text
 
 
 # --- A failed mappings load must never be reported as "no mappings" ---
@@ -640,7 +644,7 @@ def test_a_broken_mappings_file_never_claims_nothing_is_offered_to_sonarr(
             ),
         )
     )
-    body = TestClient(app).get("/config").text
+    body = TestClient(app).get("/config/mappings").text
 
     # The sentence that prompts the destructive action must be gone...
     assert "Nothing will be offered to Sonarr" not in body
@@ -663,7 +667,7 @@ def test_a_legitimately_empty_mappings_file_still_says_there_are_none(
     maps.write_text("series: []\n", encoding="utf-8")
     app = FastAPI()
     app.include_router(build_config_router(cfg, maps, FakeSvt(), FakeSonarr()))
-    body = TestClient(app).get("/config").text
+    body = TestClient(app).get("/config/mappings").text
 
     assert "No mappings yet. Nothing will be offered to Sonarr." in body
     assert "could not be read" not in body
@@ -690,7 +694,7 @@ def _broken_mappings_body(tmp_path: Path, status_provider=None) -> str:
             cfg, maps, FakeSvt(), FakeSonarr(), status_provider=status_provider,
         )
     )
-    return TestClient(app).get("/config").text
+    return TestClient(app).get("/config/mappings").text
 
 
 def test_a_broken_mappings_file_after_a_good_load_says_the_table_survives(
@@ -917,7 +921,7 @@ def test_the_warning_says_saves_are_blocked_when_the_file_has_no_key(
     app = FastAPI()
     app.include_router(build_config_router(cfg, maps, FakeSvt(), FakeSonarr()))
 
-    body = TestClient(app).get("/config").text
+    body = TestClient(app).get("/config/settings").text
 
     assert "every settings save will be refused" in body
     assert "ENV-OVERRIDE-KEY" not in body
@@ -936,7 +940,7 @@ def test_no_blocked_saves_warning_when_the_file_has_its_own_key(
     app.include_router(build_config_router(cfg, maps, FakeSvt(), FakeSonarr()))
     client = TestClient(app)
 
-    body = client.get("/config").text
+    body = client.get("/config/settings").text
     assert "svtplay-arr.service" in body          # the override warning stands
     assert "every settings save will be refused" not in body
 
@@ -956,7 +960,7 @@ def test_the_page_warns_when_the_environment_overrides_the_api_key(
     # using the old value forever. Exactly the silent failure this project
     # keeps getting bitten by.
     monkeypatch.setenv("SONARR_API_KEY", "ENV-OVERRIDE-KEY")
-    body = _client(tmp_path).get("/config").text
+    body = _client(tmp_path).get("/config/settings").text
 
     assert "SONARR_API_KEY" in body
     assert "svtplay-arr.service" in body
@@ -977,7 +981,7 @@ def test_no_environment_warning_when_the_variable_is_unset_or_empty(
         monkeypatch.delenv("SONARR_API_KEY", raising=False)
     else:
         monkeypatch.setenv("SONARR_API_KEY", value)
-    body = _client(tmp_path).get("/config").text
+    body = _client(tmp_path).get("/config/settings").text
     assert "svtplay-arr.service" not in body
 
 
@@ -1245,7 +1249,7 @@ def test_a_config_without_the_optional_keys_renders_their_defaults(tmp_path: Pat
     cfg, maps = _deployed_paths(tmp_path)
     app = FastAPI()
     app.include_router(build_config_router(cfg, maps, FakeSvt(), FakeSonarr()))
-    body = TestClient(app).get("/config").text
+    body = TestClient(app).get("/config/settings").text
 
     values = _rendered_field_values(body)
     for key in _DEFAULTED_INT_KEYS:
@@ -1265,7 +1269,7 @@ def test_a_save_of_the_rendered_page_succeeds_on_the_deployed_config(tmp_path: P
     app.include_router(build_config_router(cfg, maps, FakeSvt(), FakeSonarr()))
     client = TestClient(app)
 
-    body = client.get("/config").text
+    body = client.get("/config/settings").text
     submitted = _rendered_field_values(body)
     submitted["expected_mtime"] = str(cfg.stat().st_mtime)
 
@@ -1294,7 +1298,7 @@ def test_saving_the_deployed_config_untouched_reports_nothing_changed(
     )
     client = TestClient(app)
 
-    submitted = _rendered_field_values(client.get("/config").text)
+    submitted = _rendered_field_values(client.get("/config/settings").text)
     submitted["expected_mtime"] = str(cfg.stat().st_mtime)
 
     r = client.post("/config/settings", data=submitted)
@@ -1317,7 +1321,7 @@ def test_a_setting_written_in_the_file_still_renders_the_files_value(tmp_path: P
     )
     app = FastAPI()
     app.include_router(build_config_router(cfg, maps, FakeSvt(), FakeSonarr()))
-    body = TestClient(app).get("/config").text
+    body = TestClient(app).get("/config/settings").text
 
     values = _rendered_field_values(body)
     assert values["rss_window_days"] == "21"
@@ -1347,7 +1351,7 @@ def test_the_api_key_has_no_default_and_still_renders_blank_when_absent(
     )
     app = FastAPI()
     app.include_router(build_config_router(cfg, maps, FakeSvt(), FakeSonarr()))
-    body = TestClient(app).get("/config").text
+    body = TestClient(app).get("/config/settings").text
 
     assert _rendered_field_values(body)["sonarr_api_key"] == ""
 
@@ -1365,7 +1369,7 @@ def test_an_unknown_key_survives_a_save_from_the_deployed_config(tmp_path: Path)
     app.include_router(build_config_router(cfg, maps, FakeSvt(), FakeSonarr()))
     client = TestClient(app)
 
-    submitted = _rendered_field_values(client.get("/config").text)
+    submitted = _rendered_field_values(client.get("/config/settings").text)
     submitted["expected_mtime"] = str(cfg.stat().st_mtime)
     r = client.post("/config/settings", data=submitted)
 
@@ -1935,7 +1939,7 @@ def test_the_pending_banner_names_the_api_key_but_never_shows_it(
     app.include_router(
         build_config_router(cfg, maps, FakeSvt(), FakeSonarr(), booted=booted)
     )
-    body = TestClient(app).get("/config").text
+    body = TestClient(app).get("/config/settings").text
 
     pending = _pending_text(body)
     assert "Sonarr API key" in pending
@@ -1961,7 +1965,7 @@ def test_no_pending_api_key_banner_while_the_environment_overrides_it(
     app.include_router(
         build_config_router(cfg, maps, FakeSvt(), FakeSonarr(), booted=booted)
     )
-    body = TestClient(app).get("/config").text
+    body = TestClient(app).get("/config/settings").text
 
     assert '<p class="pending">' not in body
     assert "svtplay-arr.service" in body  # the env warning is there instead
@@ -1976,7 +1980,7 @@ def test_saving_a_new_api_key_raises_the_pending_restart_banner(tmp_path: Path):
         "/config/settings",
         data=_form(tmp_path, cfg.stat().st_mtime, sonarr_api_key="NEW-KEY-VALUE"),
     )
-    pending = _pending_text(client.get("/config").text)
+    pending = _pending_text(client.get("/config/settings").text)
 
     assert "Sonarr API key" in pending
     assert "NEW-KEY-VALUE" not in pending
@@ -1986,7 +1990,7 @@ def test_the_page_still_renders_without_booted_settings(tmp_path: Path):
     # build_config_router is called without `booted` throughout the tests
     # and could be in a deployment where Settings was constructed directly.
     # A missing baseline degrades to no banner, never to a broken page.
-    body = _client(tmp_path).get("/config").text
+    body = _client(tmp_path).get("/config/settings").text
     assert "sonarr_url" in body
     assert '<p class="pending">' not in body
 
@@ -2642,9 +2646,12 @@ def test_the_no_js_check_response_is_a_page_not_a_json_blob(tmp_path: Path):
     assert r.status_code == 200
     assert r.headers["content-type"].startswith("text/html")
     assert r.text.lstrip().lower().startswith("<!doctype html>")
-    # Page furniture that no JSON payload could ever contain.
+    # Page furniture that no JSON payload could ever contain. The no-JS
+    # branch re-renders the view the Check button lives on, so this is the
+    # Mappings view and its nav, not the settings form it used to sit
+    # underneath.
     assert "<h2>Mappings</h2>" in r.text
-    assert "<h2>Settings</h2>" in r.text
+    assert '<nav class="nav"' in r.text
 
 
 def test_the_js_check_response_is_json_not_a_page(tmp_path: Path):
@@ -2746,7 +2753,7 @@ def test_the_check_control_is_a_plain_form_reachable_without_javascript(tmp_path
     # Part 2's rule: everything works with JavaScript disabled, as a full
     # page round trip. The Check control must be an ordinary <form method=
     # post>, not a button with only a JS handler.
-    body = _client(tmp_path).get("/config").text
+    body = _client(tmp_path).get("/config/mappings").text
     form = re.search(
         r'<form method="post" action="/config/mappings/288649/check"[^>]*>'
         r"\s*<button type=\"submit\">Check</button>",
@@ -2760,7 +2767,7 @@ def test_the_mapping_filter_input_is_not_in_the_server_rendered_page(tmp_path: P
     # server never emits it; initMappingFilter (base.html) creates and
     # inserts it at runtime. A filter box that does nothing with JS off is
     # worse than none, so it must be entirely absent from a plain fetch.
-    body = _client(tmp_path).get("/config").text
+    body = _client(tmp_path).get("/config/mappings").text
     assert 'id="mapping-filter"' not in body
     # ...and the mechanism that would add it is actually present, so this
     # cannot pass simply because the feature doesn't exist at all.
@@ -2905,7 +2912,7 @@ def test_the_check_fetch_refuses_a_response_it_cannot_trust(tmp_path: Path):
 def test_each_mapping_row_carries_filter_text_for_the_js_filter(tmp_path: Path):
     # The client-side filter (initMappingFilter) matches against this
     # attribute rather than re-deriving column text itself.
-    body = _client(tmp_path).get("/config").text
+    body = _client(tmp_path).get("/config/mappings").text
     assert 'data-filter-text="gift vid första ögonkastet 288649 jpmqd3q gift-vid-forsta-ogonkastet"' in body
 
 
@@ -2991,8 +2998,14 @@ def test_the_narrow_layout_targets_elements_the_page_actually_renders(
     # A media query is easy to write and easy to leave pointing at markup
     # that no longer exists (or never did) -- it fails invisibly, on a
     # phone, in production. Every class, attribute and element the narrow
-    # rules select must be something /config genuinely emits.
-    body = _client(tmp_path).get("/config").text
+    # rules select must be something one of the views genuinely emits.
+    #
+    # Every view, not just the landing one: the stylesheet is shared, so a
+    # rule targeting the settings form is as easy to leave dangling as one
+    # targeting the mappings table, and pinning it to a single page would
+    # quietly stop covering whichever half moved.
+    client = _client(tmp_path)
+    body = "".join(client.get(path).text for _key, _label, path in VIEWS)
     selectors = _selectors(_narrow_media_query())
     assert selectors, "the narrow-viewport media query is empty"
 
@@ -3065,7 +3078,7 @@ def test_the_check_result_gets_the_full_width_of_the_table(tmp_path: Path):
     # The Check message is several sentences by design (it has to say that
     # a resolving slug does not mean a correct mapping). Squeezed into the
     # actions column it was unreadable on a phone and cramped on a desktop.
-    body = _client(tmp_path).get("/config").text
+    body = _client(tmp_path).get("/config/mappings").text
     columns = len(re.findall(r"<th[\s>]", body))
     assert columns >= 3, f"no mapping table header in:\n{body}"
 
@@ -3085,7 +3098,7 @@ def test_the_check_result_is_filtered_away_with_its_own_mapping(tmp_path: Path):
     # `data-filter-text`. Without the same text on the result's row, a
     # filter that hides a mapping would leave its Check result stranded on
     # the page under someone else's row.
-    body = _client(tmp_path).get("/config").text
+    body = _client(tmp_path).get("/config/mappings").text
     rows = re.findall(r"<tr\b[^>]*>.*?</tr>", body, re.S)
     result_rows = [r for r in rows if 'class="check-result' in r]
     assert result_rows, f"no check-result row in:\n{body}"
@@ -3105,7 +3118,7 @@ def test_the_mapping_cells_label_themselves_for_the_stacked_layout(
 ):
     # With the header row gone below the breakpoint, "288649" on a line of
     # its own means nothing; each cell carries its own label instead.
-    body = _client(tmp_path).get("/config").text
+    body = _client(tmp_path).get("/config/mappings").text
     labels = re.findall(r'<td data-label="([^"]+)"', body)
     assert labels, f"no self-labelling cells in:\n{body}"
     headers = [
@@ -3178,7 +3191,7 @@ def test_no_field_hides_its_explanation_inside_its_label(tmp_path: Path):
     # are correct -- so at label weight each setting read as a paragraph
     # with an input attached and nothing guided the eye. The wording is
     # untouched; it just may not be part of the label any more.
-    body = _client(tmp_path).get("/config").text
+    body = _client(tmp_path).get("/config/settings").text
     for f in SETTING_FIELDS:
         label = re.search(
             r'<label for="' + re.escape(f.key) + r'".*?</label>', body, re.S
@@ -3194,13 +3207,13 @@ def test_no_field_hides_its_explanation_inside_its_label(tmp_path: Path):
 def test_every_field_still_renders_its_help_text_verbatim(tmp_path: Path):
     # ...and the counterpart, so the test above can never be satisfied by
     # the explanation having been shortened or dropped instead of moved.
-    body = html_mod.unescape(_client(tmp_path).get("/config").text)
+    body = html_mod.unescape(_client(tmp_path).get("/config/settings").text)
     for f in SETTING_FIELDS:
         assert f.help in body, f"{f.key}'s help text is missing"
 
 
 def test_every_field_renders_its_help_beneath_its_control(tmp_path: Path):
-    body = _client(tmp_path).get("/config").text
+    body = _client(tmp_path).get("/config/settings").text
     for f in SETTING_FIELDS:
         control = _input_tag(body, f.key)
         help_p = _help_paragraph(body, f.key)
@@ -3214,7 +3227,7 @@ def test_every_field_control_points_at_its_own_help_text(tmp_path: Path):
     # screen-reader user the explanation entirely: it used to be announced
     # because it was part of the label. aria-describedby is what keeps it
     # announced with the field now, so it is not optional decoration.
-    body = _client(tmp_path).get("/config").text
+    body = _client(tmp_path).get("/config/settings").text
     for f in SETTING_FIELDS:
         _help_paragraph(body, f.key)  # the id it points at exists
         assert f'aria-describedby="{f.key}-help"' in _input_tag(body, f.key), (
@@ -3321,7 +3334,7 @@ def test_a_dangerous_field_is_marked_by_an_edge_not_a_filled_block(
 
     # ...and the badge is still there, so this cannot pass by the warning
     # having been removed rather than quietened.
-    body = _client(tmp_path).get("/config").text
+    body = _client(tmp_path).get("/config/settings").text
     for key in _DANGEROUS_KEYS:
         _danger_badge(_danger_block(body, key), key)
 
@@ -3353,7 +3366,7 @@ def test_each_settings_section_renders_as_a_panel_with_a_quiet_header(
     # A card with a header, not a bare fieldset outline -- and still a
     # real <fieldset>/<legend>, so the grouping remains something a screen
     # reader announces rather than a div that merely looks grouped.
-    body = _client(tmp_path).get("/config").text
+    body = _client(tmp_path).get("/config/settings").text
     for name in _SECTION_FIELDS:
         assert re.search(
             r'<fieldset class="settings-section">\s*<legend>'
@@ -3613,7 +3626,7 @@ def test_no_status_provider_renders_no_status_strip(tmp_path: Path):
     # called without status_provider throughout this file (as most
     # deployments' tests do), and the page must still work -- just without
     # a strip, never a broken one.
-    body = _client(tmp_path).get("/config").text
+    body = _client(tmp_path).get("/config/mappings").text
     assert 'class="status-strip"' not in body
     assert "Status unavailable" not in body
     assert TITLE in body  # the rest of the page is unaffected
@@ -3782,7 +3795,7 @@ def test_a_provider_that_raises_leaves_the_page_rendering(tmp_path: Path):
     app.include_router(
         build_config_router(cfg, maps, FakeSvt(), FakeSonarr(), status_provider=_boom)
     )
-    r = TestClient(app).get("/config")
+    r = TestClient(app).get("/config/mappings")
 
     assert r.status_code == 200
     assert 'class="status-strip"' not in r.text
@@ -3868,7 +3881,7 @@ def _discover(client, maps, **extra):
 def test_the_index_offers_find_mappings_as_a_plain_form(tmp_path: Path):
     # No JS: the sweep must work with JavaScript off, so the control is a
     # form POST, not a fetch.
-    body = _client(tmp_path).get("/config").text
+    body = _client(tmp_path).get("/config/mappings").text
     assert 'action="/config/mappings/discover"' in body
     assert "Find mappings" in body
 
@@ -4572,14 +4585,14 @@ _LEGACY_ROW = (
 
 
 def test_an_auto_created_row_is_marked_in_the_mappings_table(tmp_path: Path):
-    body = _auto_rows_client(tmp_path, _AUTO_ROW).get("/config").text
+    body = _auto_rows_client(tmp_path, _AUTO_ROW).get("/config/mappings").text
     assert _BADGE in _series_cell(body, "Guessed Show")
 
 
 def test_a_hand_confirmed_row_carries_no_marker(tmp_path: Path):
     # A row a human picked needs no decoration; marking everything would
     # make the marker mean nothing.
-    body = _auto_rows_client(tmp_path, _MANUAL_ROW).get("/config").text
+    body = _auto_rows_client(tmp_path, _MANUAL_ROW).get("/config/mappings").text
     assert _BADGE not in _series_cell(body, "Confirmed Show")
     assert _BADGE not in body
 
@@ -4591,7 +4604,7 @@ def test_a_row_from_a_file_with_no_source_field_is_not_called_a_guess(
     # feature existed has no `source` key at all, and those rows were all
     # put there by a human. Rendering them as guesses would tell every
     # existing operator their whole library was machine-written.
-    body = _auto_rows_client(tmp_path, _LEGACY_ROW).get("/config").text
+    body = _auto_rows_client(tmp_path, _LEGACY_ROW).get("/config/mappings").text
     assert "Legacy Show" in body                     # it still renders
     assert _BADGE not in _series_cell(body, "Legacy Show")
 
@@ -4601,7 +4614,7 @@ def test_the_auto_marker_says_what_it_means_in_words(tmp_path: Path):
     # as a bare "!" whose first review question was what it meant. A glyph
     # alone carries nothing to someone seeing it for the first time.
     cell = _series_cell(
-        _auto_rows_client(tmp_path, _AUTO_ROW).get("/config").text, "Guessed Show"
+        _auto_rows_client(tmp_path, _AUTO_ROW).get("/config/mappings").text, "Guessed Show"
     )
     m = re.search(r'<span class="auto-badge"[^>]*>(.*?)</span>', cell, re.S)
     assert m, f"no auto badge in:\n{cell}"
@@ -4619,7 +4632,7 @@ def _auto_note(html: str) -> str | None:
 def test_the_marker_is_explained_once_beneath_the_table(tmp_path: Path):
     # Understandable without hovering or guessing: one note under the
     # table saying what the badge means and what to do about it.
-    note = _auto_note(_auto_rows_client(tmp_path, _AUTO_ROW).get("/config").text)
+    note = _auto_note(_auto_rows_client(tmp_path, _AUTO_ROW).get("/config/mappings").text)
     assert note is not None, "the auto marker is never explained"
     assert "confirm" in note.lower()
     assert "filename" in note.lower()
@@ -4628,7 +4641,7 @@ def test_the_marker_is_explained_once_beneath_the_table(tmp_path: Path):
 def test_nothing_is_explained_when_nothing_was_auto_matched(tmp_path: Path):
     # An explanation of a marker that appears nowhere is noise on the page
     # every operator who never runs the sweep will look at.
-    body = _auto_rows_client(tmp_path, _MANUAL_ROW).get("/config").text
+    body = _auto_rows_client(tmp_path, _MANUAL_ROW).get("/config/mappings").text
     assert _BADGE not in body
     assert _auto_note(body) is None
 
@@ -4645,7 +4658,7 @@ def test_a_swept_row_shows_its_marker_on_the_very_next_page_load(tmp_path: Path)
     client, maps = _sweep_client(tmp_path, svt, sonarr)
 
     _discover(client, maps)
-    body = client.get("/config").text
+    body = client.get("/config/mappings").text
 
     assert _BADGE in _series_cell(body, OTHER)
     # The fixture row was added by hand and must not have been relabelled.

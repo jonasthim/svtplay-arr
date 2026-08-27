@@ -260,7 +260,8 @@ permanently corrupt library entry.
 
 ## Step 4: configure it
 
-Open `http://<host>:9800/config` and fill in the four keys that are required,
+Open `http://<host>:9800/config`, follow **Settings** in the nav bar, and
+fill in the four keys that are required,
 or edit `/etc/svtplay-arr/config.yaml` directly:
 
 ```yaml
@@ -299,8 +300,8 @@ nothing about TVDB. A mapping row is the hand-confirmed bridge, one per show.
 See [the README](../README.md#mappings-the-part-you-would-not-guess) for why
 this cannot be automatic.
 
-**Through the configuration page** — open `http://<host>:9800/config`, choose
-*Add mapping*, type a show title. The page searches SVT and lists Sonarr's
+**Through the configuration page** — open `http://<host>:9800/config`, follow
+**Mappings** in the nav bar, choose *Add a series*, type a show title. The page searches SVT and lists Sonarr's
 series beside the results; pick one of each and confirm. The `series_title` is
 copied verbatim from Sonarr's record rather than typed, which matters because
 it becomes the permanent filename.

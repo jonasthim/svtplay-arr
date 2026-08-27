@@ -244,9 +244,11 @@ resolver then refuses.
 
 ## The configuration page
 
-The service serves its own configuration page at `/config`. It manages the
-mapping table (search SVT, pick a show, pick the matching Sonarr series,
-confirm) and the settings file. Mapping changes apply immediately; setting
+The service serves its own configuration page at `/config`. It opens on
+**Status** — the answer to "is it working" — with **Mappings** and
+**Settings** a click away in the nav bar. Mappings manages the mapping table
+(search SVT, pick a show, pick the matching Sonarr series, confirm);
+Settings edits the settings file. Mapping changes apply immediately; setting
 changes need a restart, and the page says so with a banner naming exactly
 which settings are pending.
 

@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block content %}
+{# The landing view, and deliberately so: an operator opens this page to
+   ask "is it working" far more often than to change a setting, and a
+   setting needs a restart before it does anything anyway.
+
+   Everything here is rendered from a fact somebody else computed --
+   /health's own dict (app.compute_health), the mapping file's own rows.
+   Nothing on this page derives a verdict of its own; two places computing
+   one fact and drifting apart is this project's most common defect, and a
+   status page that disagreed with /health would be worse than no status
+   page at all.
+
+   The chips above are rendered by base.html on every view, because a dead
+   worker is worth knowing about wherever you happen to be. What this view
+   adds is the detail behind them and the next thing to look at. #}
+<h2>Status</h2>
+
+<section class="panel">
+  <div class="panel-head">Mappings</div>
+  <div class="panel-inner">
+  {% if mappings_unavailable %}
+  {# Same three-way split the Mappings view makes, for the same reason: a
+     file that could not be read is not a file with no series in it, and
+     whether the running service still has a last known-good table decides
+     whether this is urgent or merely wrong. #}
+  {% if mappings_ever_loaded is none %}
+  <p class="warn">mappings.yaml could not be read, so the number of series
+    offered to Sonarr cannot be determined from this page. It is not zero.
+    Fix the file, then reload.</p>
+  {% elif mappings_ever_loaded %}
+  <p class="warn">mappings.yaml could not be read. The service is still
+    serving the last table it loaded successfully, so the feed is working
+    but stale &mdash; anything you have added since is not in it. Fix the
+    file, then reload.</p>
+  {% else %}
+  <p class="error">mappings.yaml could not be read and has never been read
+    successfully, so there is no last-known-good table behind it. Nothing
+    is being offered to Sonarr right now and Sonarr will reject this
+    indexer until the file parses. A restart cannot help.</p>
+  {% endif %}
+  {% elif mappings %}
+  <p><strong>{{ mappings | length }}</strong>
+    series {{ 'is' if mappings | length == 1 else 'are' }} offered to
+    Sonarr.</p>
+  {% else %}
+  <p class="warn">No mappings yet, so nothing is offered to Sonarr and
+    nothing will ever be downloaded. A mapping ties one Sonarr series to
+    the SVT Play programme its episodes come from.</p>
+  {% endif %}
+  <p><a href="/config/mappings">Mappings</a></p>
+  </div>
+</section>
+{% endblock %}

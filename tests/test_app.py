@@ -222,7 +222,7 @@ def test_config_page_renders_the_settings_form(tmp_path: Path):
     # correctly-wired form from the error-path form.
     s = _settings(tmp_path)
     with TestClient(create_app(s)) as c:
-        assert f'value="{s.sonarr_url}"' in c.get("/config").text
+        assert f'value="{s.sonarr_url}"' in c.get("/config/settings").text
 
 
 def test_config_page_renders_the_api_key_as_an_editable_field(tmp_path: Path):
@@ -236,7 +236,7 @@ def test_config_page_renders_the_api_key_as_an_editable_field(tmp_path: Path):
     # implementation".
     s = _settings(tmp_path)
     with TestClient(create_app(s)) as c:
-        body = c.get("/config").text
+        body = c.get("/config/settings").text
     assert s.sonarr_api_key in body
     assert 'name="sonarr_api_key"' in body
     assert 'type="password"' in body

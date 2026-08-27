@@ -1,6 +1,9 @@
 {% extends "base.html" %}
 {% block content %}
 <h2>Mappings</h2>
+{# What svtplay-arr offers to Sonarr: one row per series, tying Sonarr's
+   tvdbId to the SVT Play programme its episodes come from. Mappings take
+   effect immediately -- unlike settings, nothing here needs a restart. #}
 <section class="panel">
   <div class="panel-inner">
 {# No filter input is rendered here. initMappingFilter in base.html
@@ -167,101 +170,4 @@ coincidence is not an explanation. Everything else is listed for you to
 decide, with the count that decided it.</p>
   </div>
 </section>
-
-<h2>Settings</h2>
-<p class="help">Changes here need a service restart to take effect.
-Mappings above apply immediately.</p>
-<form method="post" action="/config/settings">
-  <input type="hidden" name="expected_mtime" value="{{ config_mtime }}">
-  {% for section_name, section_fields in sections %}
-  <fieldset class="settings-section">
-    <legend>{{ section_name }}</legend>
-    <div class="panel-inner">
-    {% for f in section_fields %}
-    {# One row per field: a short bold label in the left column, the
-       control and its help text in the right one (base.html stacks them
-       below the mobile breakpoint). A dangerous field is the same row
-       with a different class rather than an extra one, because the
-       dangerous-field tests match `<div class="field-danger">` followed
-       immediately by that field's own label. #}
-    {% if f.key in dangerous_fields %}<div class="field-danger">{% else %}<div class="field">{% endif %}
-    {# The badge is a word, not only a glyph: the marker's whole job is to
-       say that this setting can silently break the service, and a bare
-       icon does not say it -- the first thing asked of the live page was
-       "what does the ! mean". It sits inside the <label>, so a screen
-       reader announces it with the field, and the glyph inside it is
-       aria-hidden so it decorates the word rather than being read as one.
-       The field's own help text is untouched; this labels the marker, it
-       does not re-explain the setting. #}
-    <label for="{{ f.key }}">{% if f.key in dangerous_fields %}<span class="danger-badge"><span aria-hidden="true">&#9888;</span> Careful</span> {% endif %}{{ f.label }}</label>
-      <div class="control">
-    {% if f.kind == "secret" %}
-    {% if env_overrides_api_key %}
-    <p class="warn">The running service reads its API key from the
-      <code>SONARR_API_KEY</code> environment variable, which overrides this
-      file. A value saved here is stored but not used. Remove the variable
-      from <code>svtplay-arr.service</code> and restart first.
-      {%- if not values.get(f.key) %}
-      <br>This field is empty because the file has no key of its own, so
-      every settings save will be refused &mdash; including changes to every
-      other setting on this form. Paste the key in here to save anything at
-      all (it will be stored, and still not used until the variable is gone).
-      {%- endif %}</p>
-    {% endif %}
-    {# Masked for shoulder-surfing only: the value is in this page's source
-       either way, so nothing here is a confidentiality measure -- see the
-       field's own help text and SETTING_FIELDS in config.py.
-
-       One element, not two. This used to render the value a second time
-       in a `<code>` that a pure-CSS checkbox chain unhid, because
-       JavaScript was ruled out when it was written. The unmasking is now
-       a Show/Hide button that flips this input's own `type`, which only
-       script can do -- so initSecretToggles (base.html) creates the
-       button at runtime and the server emits none. With JavaScript off
-       there is no button, the field stays masked, and it stays fully
-       editable: revealing is the convenience, replacing the key is the
-       function.
-
-       The wrapper is what the script looks for, and `data-secret-label`
-       is where it gets the field name for the button's accessible name,
-       so the button says which field it acts on without a second copy of
-       that label living in the script. #}
-    <div class="secret-field" data-secret-label="{{ f.label }}">
-      <input type="password" id="{{ f.key }}" name="{{ f.key }}"
-             aria-describedby="{{ f.key }}-help"
-             value="{{ values.get(f.key, '') }}">
-    </div>
-    {% else %}
-    {# `inputmode`, not `type="number"`: on a phone this is the difference
-       between a numeric keypad and a full alphabetic keyboard, and it
-       changes nothing else. `type="number"` would also bring spinners,
-       locale-dependent parsing, and browsers that silently discard
-       non-numeric input -- quietly taking over from save_settings' own
-       int() validation and the specific errors it raises. Keyed off the
-       field's declared `kind`, so a fourth int setting gets this by being
-       an int rather than by someone remembering to list it. #}
-    <input type="text" id="{{ f.key }}" name="{{ f.key }}"
-           aria-describedby="{{ f.key }}-help"
-           {% if f.kind == "int" %}inputmode="numeric" {% endif %}value="{{ values.get(f.key, '') }}">
-    {% endif %}
-    {# Below the control and visibly subordinate to the label, not inside
-       it at label size. It sits outside the <label>, so the control
-       points at it with aria-describedby above and it is still announced
-       with the field. The wording itself is unchanged. #}
-    <p class="help" id="{{ f.key }}-help">{{ f.help }}</p>
-      </div>
-    </div>
-    {% endfor %}
-    </div>
-  </fieldset>
-  {% endfor %}
-  <p class="confirm">
-    <label class="confirm-label"><input type="checkbox" name="confirm_paths" value="yes">
-      I understand changing the directories orphans in-flight downloads
-    </label>
-  </p>
-  <div class="form-actions">
-    <button type="submit" class="primary">Save settings</button>
-  </div>
-</form>
 {% endblock %}

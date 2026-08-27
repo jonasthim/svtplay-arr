@@ -557,10 +557,19 @@ a per-row confirmation, and it may write only what
 `discovery.corroborated_match` approved; that gate lives in `discovery.py`,
 not here.
 
+Four server-rendered views behind a nav bar, listed once in
+`config_ui.VIEWS`. `/config` still serves the entry point it always did — it
+is documented, deployed, and the published SSO resource points at it — but
+what it serves is now **Status**, not the settings form. An operator opens
+this page to ask "is it working" far more often than to change a setting,
+and a setting needs a restart before it does anything.
+
 Routes:
 
 ```
-GET  /config                            settings form + mappings table
+GET  /config                            Status: is it working?
+GET  /config/mappings                   Mappings: the table, add/remove, sweep
+GET  /config/settings                   Settings: the form
 POST /config/settings                   save settings
 GET  /config/mappings/new               "which show?" form
 POST /config/mappings/search            SVT hits beside Sonarr series

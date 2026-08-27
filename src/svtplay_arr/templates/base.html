@@ -103,6 +103,24 @@
              letter-spacing: .02em; color: var(--topbar-fg); }
     .page { max-width: 58rem; margin: 0 auto; padding: 1.25rem 1rem 0; }
 
+    /* ---- View nav ---------------------------------------------------
+       Four server-rendered links under the app bar. It wraps rather than
+       scrolls: four short words fit a phone on one or two lines, and a
+       horizontally scrolling nav hides the last item exactly where the
+       screen is smallest. The current view is marked by an underline and
+       a weight change as well as by ink, so it is not colour alone that
+       says where you are. */
+    .nav { background: var(--panel-bg); border-bottom: 1px solid var(--border); }
+    .nav-inner { max-width: 58rem; margin: 0 auto; padding: 0 .35rem;
+                 display: flex; flex-wrap: wrap; }
+    .nav-link { display: inline-block; padding: .6rem .65rem;
+                min-height: 2.75rem; font-size: .875rem; font-weight: 600;
+                color: var(--muted-fg); text-decoration: none;
+                border-bottom: 3px solid transparent; }
+    .nav-link:hover { color: var(--fg); }
+    .nav-link.current { color: var(--fg); font-weight: 700;
+                        border-bottom-color: var(--accent); }
+
     h2 { font-size: 1.0625rem; font-weight: 600; letter-spacing: .01em;
          margin: 1.75rem 0 .6rem; }
     /* Only when nothing precedes it -- with a banner above, the heading
@@ -402,6 +420,20 @@
   <header class="topbar">
     <div class="topbar-inner"><h1 class="brand">svtplay-arr</h1></div>
   </header>
+  {# Server-rendered links, one per view, in one order defined once in
+     config_ui.VIEWS -- there is no client-side routing here and no build
+     step, so every one of these is an ordinary GET of an ordinary page.
+     `aria-current` rather than colour alone marks where you are, for the
+     same reason the danger badge is a word: the highlight is a second
+     signal, never the only one. #}
+  <nav class="nav" aria-label="Sections">
+    <div class="nav-inner">
+      {%- for key, label, path in views %}
+      <a class="nav-link{{ ' current' if key == view else '' }}"
+         href="{{ path }}"{% if key == view %} aria-current="page"{% endif %}>{{ label }}</a>
+      {%- endfor %}
+    </div>
+  </nav>
   <main class="page">
   {# The one place these facts are rendered; the dict is /health's own
      response, produced by the single compute_health() call app.py hands

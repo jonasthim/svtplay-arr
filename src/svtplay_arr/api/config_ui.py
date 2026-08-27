@@ -1,5 +1,17 @@
 """The configuration page.
 
+Four server-rendered views behind a nav bar -- Status, Mappings and
+Settings, listed in `VIEWS` -- with Status served from `/config` itself.
+That URL is documented, deployed, and the published SSO resource points at
+it; the restructure changed which view answers there, never whether one
+does. There is no client-side routing and no build step: every link is an
+ordinary GET and every control is an ordinary form POST.
+
+The landing view is Status rather than the settings form because an
+operator opens this page to ask "is it working" far more often than to
+change a setting -- and a setting needs a service restart before it does
+anything, so the form is the one thing here that is never urgent.
+
 Contains no matching logic and no SVT knowledge: it calls SvtClient and
 SonarrClient the same way `discovery.sweep_for_mappings` does. That seam is
 what makes it impossible for a UI change to alter what gets grabbed.
@@ -16,6 +28,7 @@ gate lives in `discovery.py`, not here. This module holds no matching rule
 of its own, here as everywhere else.
 """
 
+import asyncio
 import logging
 import os
 from pathlib import Path
@@ -67,6 +80,23 @@ _TEMPLATES = Jinja2Templates(
 _SWEEP_CONCURRENCY = 4
 _SWEEP_CAP = 200
 _SWEEP_REQUEST_BUDGET = 600
+
+# The four views, their nav labels and their paths, in nav order. One
+# list, read by the nav bar, by the routes that render each view and by
+# the tests that walk them -- rather than a copy per surface that can
+# drift into a nav link pointing at a view that no longer exists.
+#
+# Status is first *and* lives at /config itself. That URL is documented,
+# deployed, and the published SSO resource points at it; it stays the
+# entry point, and what changed is only which view it serves. An operator
+# opens this page to ask "is it working" far more often than to change a
+# setting -- and settings need a restart anyway, so the form is the one
+# thing here that is never urgent.
+VIEWS = (
+    ("status", "Status", "/config"),
+    ("mappings", "Mappings", "/config/mappings"),
+    ("settings", "Settings", "/config/settings"),
+)
 
 _CHECK_CSS_CLASS = {
     "found": "notice",
@@ -346,6 +376,7 @@ def build_config_router(
     on), and a provider that raises is caught and rendered as "status
     unavailable" rather than a 500 -- the config page must be at least as
     forgiving as `/health` itself.
+
     """
     router = APIRouter(prefix="/config")
 
@@ -421,8 +452,30 @@ def build_config_router(
         except OSError:
             return None
 
-    def _status_strip_context() -> dict:
+    async def _status_strip_context() -> dict:
         """The `health`/`status_unavailable` pair the template needs.
+
+        `await asyncio.to_thread(...)`, not a plain call, and that is the
+        one interesting decision on this page. Every route here is
+        `async def` (enforced by a test) because `JobStore` drives one
+        `sqlite3.Connection` behind a blocking `threading.Lock` and a
+        threadpool thread holding that lock stalls things it should not.
+        But `async def` only moves the problem: `compute_health` reads
+        `store.all_active()`, so calling it inline runs a blocking sqlite
+        read *on the event loop* -- the same loop the download worker runs
+        on. If the worker is mid-write and holding the lock, rendering this
+        page stops the downloads it is reporting on.
+
+        `to_thread` is what makes both rules true at once: the route stays
+        a coroutine, and the blocking read happens on a worker thread,
+        which is exactly what `check_same_thread=False` plus that lock
+        exist to make safe. The cost is one thread hop per render, on a
+        page a human loads by hand.
+
+        (`compute_health` also reads `Task.done()` on the worker and canary
+        tasks from that thread. That is a plain attribute read on an
+        asyncio object -- it can be a moment stale, which for a liveness
+        chip it already was, and it cannot tear.)
 
         Never raises: a broken status_provider must not take the whole
         config page down with it (the page must be at least as forgiving as
@@ -433,13 +486,196 @@ def build_config_router(
         if status_provider is None:
             return {"health": None, "status_unavailable": False}
         try:
-            return {"health": status_provider(), "status_unavailable": False}
+            health = await asyncio.to_thread(status_provider)
         except Exception:
             log.exception(
                 "status_provider failed; rendering the config page without "
                 "the status strip"
             )
             return {"health": None, "status_unavailable": True}
+        return {"health": health, "status_unavailable": False}
+
+    def _load_mappings() -> tuple[list, bool, str | None]:
+        """The mapping rows, and whether the file could be read at all.
+
+        Distinguishes "the file says there are no mappings" from "the file
+        could not be read", which are the same empty list here and must
+        never render as the same sentence: while this load fails the
+        running service may still be serving a last known-good table, so
+        telling the operator that nothing is offered to Sonarr can be
+        false, and reads as an invitation to restart -- which is the one
+        action that would make it true.
+        """
+        try:
+            return MappingTable.load(mappings_path).all(), False, None
+        except Exception as exc:
+            log.warning(
+                "mappings file %s is invalid; rendering the page with an "
+                "error instead of failing the request",
+                mappings_path,
+                exc_info=True,
+            )
+            return [], True, f"{mappings_path} is invalid: {exc}"
+
+    def _mappings_ever_loaded(health) -> bool | None:
+        """Tri-state, and the templates branch on all three.
+
+        "The service keeps serving its last good table" is true after a
+        successful load and false on a fresh boot whose file was already
+        broken -- where nothing was ever loaded, nothing is offered to
+        Sonarr, and Sonarr will reject the indexer. Saying the reassuring
+        thing there is the same defect as the "Nothing will be offered to
+        Sonarr" row this replaced, merely inverted: it offers comfort
+        exactly where urgency is needed.
+
+        None means "no status dict to ask" -- no provider (as most routers
+        are built), or one that raised. The page then hedges and asserts
+        neither, because a last-good table that cannot be confirmed must
+        never be claimed. Read off /health's own dict rather than
+        recomputed here; this module renders health facts, it never
+        derives them.
+        """
+        if isinstance(health, dict) and health.get("mappings_ever_loaded") is not None:
+            return bool(health["mappings_ever_loaded"])
+        return None
+
+    async def _chrome(view: str, errors=None, notice=None) -> dict:
+        """Everything base.html renders around a view's own content.
+
+        The nav bar, the status strip, the canary's attention banner and
+        the three message banners. Built once here rather than per view,
+        so a view added later cannot arrive without a nav bar or without
+        the strip.
+
+        The pending-restart banner is deliberately on every view, not only
+        on Settings. It says the running service is not using what is on
+        disk, which is a fact about whether the service is working -- the
+        question the Status view exists to answer.
+        """
+        status_context = await _status_strip_context()
+        pending = _pending_restart_fields()
+        pending_notice = (
+            "Restart svtplay-arr to apply: "
+            + ", ".join(f.label for f in pending)
+            + ". The running service is still using the previous values."
+        ) if pending else None
+        messages = [e for e in (errors or []) if e]
+        return {
+            "view": view,
+            "views": VIEWS,
+            "error": "; ".join(messages) if messages else None,
+            "notice": notice,
+            "pending": pending_notice,
+            **status_context,
+        }
+
+    async def _status_view(request: Request, error=None, notice=None):
+        """The landing view: is it working?
+
+        Everything on it is a fact somebody else computed -- /health's own
+        dict, the canary's own per-mapping state, the job store's own rows.
+        Nothing here derives a verdict of its own.
+        """
+        errors = [error] if error else []
+        mappings, mappings_unavailable, load_error = _load_mappings()
+        if load_error:
+            errors.append(load_error)
+        chrome = await _chrome("status", errors, notice)
+        return _TEMPLATES.TemplateResponse(
+            request,
+            "status.html",
+            {
+                "mappings": mappings,
+                "mappings_unavailable": mappings_unavailable,
+                "mappings_ever_loaded": _mappings_ever_loaded(chrome.get("health")),
+                **chrome,
+            },
+        )
+
+    async def _mappings_view(
+        request: Request, error=None, notice=None, check=None
+    ):
+        errors = [error] if error else []
+        mappings, mappings_unavailable, load_error = _load_mappings()
+        if load_error:
+            errors.append(load_error)
+        chrome = await _chrome("mappings", errors, notice)
+        mappings_mtime = _mappings_mtime()
+        return _TEMPLATES.TemplateResponse(
+            request,
+            "mappings.html",
+            {
+                "mappings": mappings,
+                # True only when the load above raised, never when the file
+                # legitimately holds `series: []` -- see the guard there.
+                "mappings_unavailable": mappings_unavailable,
+                # True / False / None; only consulted when the above is
+                # True. See where it is computed for why None is a state.
+                "mappings_ever_loaded": _mappings_ever_loaded(chrome.get("health")),
+                "mappings_mtime": "" if mappings_mtime is None else mappings_mtime,
+                # Set only by the no-JS Check form POST, and only for the
+                # one row it was submitted for -- see the check route below.
+                # No view ever fills this in itself and none of them calls
+                # SVT: every GET, and every other POST, passes no `check` at
+                # all, which is what keeps the Check control from ever
+                # firing on a page load.
+                "check": check,
+                **chrome,
+            },
+        )
+
+    async def _settings_view(
+        request: Request, error=None, notice=None, submitted=None
+    ):
+        errors = [error] if error else []
+        try:
+            raw, config_mtime = read_with_mtime(config_path)
+        except Exception as exc:
+            # A malformed config.yaml must render the page with an error,
+            # not propagate: config.yaml is the file a human is most likely
+            # to have hand-edited, since that's the entire premise of the
+            # settings form below.
+            log.warning(
+                "config file %s is invalid; rendering the page with an "
+                "error instead of failing the request",
+                config_path,
+                exc_info=True,
+            )
+            raw, config_mtime = {}, None
+            errors.append(f"{config_path} is invalid: {exc}")
+
+        # After a rejected save, redisplay what the operator typed rather
+        # than what is still on disk -- a save refused over one bad field
+        # must not also discard every other field they filled in. Only
+        # SETTING_FIELDS keys are ever consulted here, so a `submitted`
+        # dict built from raw form data can never smuggle the API key (or
+        # anything else) into the page.
+        #
+        # The fallback is the *effective* value, not the file's literal
+        # contents: a key config.yaml omits is not unset, the service is
+        # running on its default, and the form has to render that. Rendering
+        # it blank is what made every save on the live deployment fail --
+        # see effective_setting_values.
+        effective = effective_setting_values(raw)
+        values = {
+            f.key: (submitted or {}).get(f.key, effective[f.key])
+            for f in SETTING_FIELDS
+        }
+        chrome = await _chrome("settings", errors, notice)
+        return _TEMPLATES.TemplateResponse(
+            request,
+            "settings.html",
+            {
+                "sections": grouped_setting_fields(),
+                "dangerous_fields": DANGEROUS_FIELDS,
+                "values": values,
+                "config_mtime": "" if config_mtime is None else config_mtime,
+                # Drives the warning beside the API key field. Without it a
+                # save on an env-overridden deployment looks like it worked.
+                "env_overrides_api_key": _env_overrides_api_key(),
+                **chrome,
+            },
+        )
 
     async def _check_context(tvdb_id: int) -> dict:
         """Look up the mapping for `tvdb_id` and run `_check_slug` on it.
@@ -479,138 +715,25 @@ def build_config_router(
         result = await _check_slug(svt, mapping.svt_slug)
         return {"tvdb_id": tvdb_id, **result}
 
-    def _index(request: Request, error=None, notice=None, submitted=None, check=None):
-        errors = [error] if error else []
-
-        try:
-            raw, config_mtime = read_with_mtime(config_path)
-        except Exception as exc:
-            # A malformed config.yaml must render the page with an error,
-            # not propagate: config.yaml is the file a human is most likely
-            # to have hand-edited, since that's the entire premise of the
-            # settings form below.
-            log.warning(
-                "config file %s is invalid; rendering the page with an "
-                "error instead of failing the request",
-                config_path,
-                exc_info=True,
-            )
-            raw, config_mtime = {}, None
-            errors.append(f"{config_path} is invalid: {exc}")
-
-        mappings_mtime = _mappings_mtime()
-
-        # Distinguishes "the file says there are no mappings" from "the
-        # file could not be read", which are the same empty list here and
-        # must never render as the same sentence: while this load fails the
-        # running service may still be serving a last known-good table, so
-        # telling the operator that nothing is offered to Sonarr can be
-        # false, and reads as an invitation to restart -- which is the one
-        # action that would make it true.
-        mappings_unavailable = False
-        try:
-            mappings = MappingTable.load(mappings_path).all()
-        except Exception as exc:
-            log.warning(
-                "mappings file %s is invalid; rendering the page with an "
-                "error instead of failing the request",
-                mappings_path,
-                exc_info=True,
-            )
-            mappings = []
-            mappings_unavailable = True
-            errors.append(f"{mappings_path} is invalid: {exc}")
-
-        # After a rejected save, redisplay what the operator typed rather
-        # than what is still on disk -- a save refused over one bad field
-        # must not also discard every other field they filled in. Only
-        # SETTING_FIELDS keys are ever consulted here, so a `submitted`
-        # dict built from raw form data can never smuggle the API key (or
-        # anything else) into the page.
-        #
-        # The fallback is the *effective* value, not the file's literal
-        # contents: a key config.yaml omits is not unset, the service is
-        # running on its default, and the form has to render that. Rendering
-        # it blank is what made every save on the live deployment fail --
-        # see effective_setting_values.
-        effective = effective_setting_values(raw)
-        values = {
-            f.key: (submitted or {}).get(f.key, effective[f.key])
-            for f in SETTING_FIELDS
-        }
-
-        # Rendered on every GET, not just the POST that caused it -- a page
-        # that shows the new value with no sign the service is still using
-        # the old one is exactly the "implies a change took effect when it
-        # did not" the spec's Reload model rules out.
-        # Called once and reused: it invokes status_provider, and the
-        # mappings row below needs the same dict the strip renders.
-        status_context = _status_strip_context()
-
-        # Deliberately tri-state, and the template branches on all three.
-        # "The service keeps serving its last good table" is true after a
-        # successful load and false on a fresh boot whose file was already
-        # broken -- where nothing was ever loaded, nothing is offered to
-        # Sonarr, and Sonarr will reject the indexer. Saying the
-        # reassuring thing there is the same defect as the "Nothing will be
-        # offered to Sonarr" row this replaced, merely inverted: it offers
-        # comfort exactly where urgency is needed.
-        #
-        # None means "no status dict to ask" -- no provider (as most
-        # routers are built), or one that raised. The page then hedges and
-        # asserts neither, because a last-good table that cannot be
-        # confirmed must never be claimed. Read off /health's own dict
-        # rather than recomputed here; this module renders health facts, it
-        # never derives them.
-        health = status_context.get("health")
-        mappings_ever_loaded = None
-        if isinstance(health, dict) and health.get("mappings_ever_loaded") is not None:
-            mappings_ever_loaded = bool(health["mappings_ever_loaded"])
-
-        pending = _pending_restart_fields()
-        pending_notice = (
-            "Restart svtplay-arr to apply: "
-            + ", ".join(f.label for f in pending)
-            + ". The running service is still using the previous values."
-        ) if pending else None
-
-        return _TEMPLATES.TemplateResponse(
-            request,
-            "index.html",
-            {
-                "sections": grouped_setting_fields(),
-                "dangerous_fields": DANGEROUS_FIELDS,
-                "values": values,
-                "mappings": mappings,
-                # True only when the load above raised, never when the file
-                # legitimately holds `series: []` -- see the guard there.
-                "mappings_unavailable": mappings_unavailable,
-                # True / False / None; only consulted when the above is
-                # True. See where it is computed for why None is a state.
-                "mappings_ever_loaded": mappings_ever_loaded,
-                "config_mtime": "" if config_mtime is None else config_mtime,
-                "mappings_mtime": "" if mappings_mtime is None else mappings_mtime,
-                "error": "; ".join(errors) if errors else None,
-                "notice": notice,
-                "pending": pending_notice,
-                # Drives the warning beside the API key field. Without it a
-                # save on an env-overridden deployment looks like it worked.
-                "env_overrides_api_key": _env_overrides_api_key(),
-                # Set only by the no-JS Check form POST, and only for the
-                # one row it was submitted for -- see the check route below.
-                # `_index` never computes this itself and this function
-                # never calls SVT: every other caller (every GET, every
-                # other POST) passes no `check` at all, which is what keeps
-                # the Check control from ever firing on a page load.
-                "check": check,
-                **status_context,
-            },
-        )
-
+    # `/config` keeps serving the entry point it always did; what changed
+    # is which view it is. It is documented, deployed and the published SSO
+    # resource points at it, so the other three views live beneath it
+    # rather than beside it.
     @router.get("", response_class=HTMLResponse)
     @router.get("/", response_class=HTMLResponse)
     async def index(request: Request):
-        return _index(request)
+        return await _status_view(request)
+
+    @router.get("/mappings", response_class=HTMLResponse)
+    async def mappings_page(request: Request):
+        return await _mappings_view(request)
+
+    # Same path as the POST that writes it, so the form posts to where it
+    # is served from and every existing `POST /config/settings` -- the
+    # deployed one included -- is untouched.
+    @router.get("/settings", response_class=HTMLResponse)
+    async def settings_page(request: Request):
+        return await _settings_view(request)
 
     @router.post("/settings", response_class=HTMLResponse)
     async def save(request: Request):
@@ -621,7 +744,9 @@ def build_config_router(
 
         expected, mtime_error = _parse_expected_mtime(raw_mtime)
         if mtime_error is not None:
-            return _index(request, error=mtime_error, submitted=submitted)
+            return await _settings_view(
+                request, error=mtime_error, submitted=submitted
+            )
 
         # The spec requires an explicit confirmation for a path change
         # specifically: changing these under a running worker orphans
@@ -642,7 +767,7 @@ def build_config_router(
                 config_path,
                 exc_info=True,
             )
-            return _index(
+            return await _settings_view(
                 request,
                 error=f"{config_path} is invalid: {exc}",
                 submitted=submitted,
@@ -662,7 +787,7 @@ def build_config_router(
             and submitted[f.key].strip() != str(existing.get(f.key, ""))
         ]
         if changed_paths and not confirmed:
-            return _index(
+            return await _settings_view(
                 request,
                 error=(
                     "Changing "
@@ -676,13 +801,17 @@ def build_config_router(
         try:
             save_settings(config_path, submitted, expected_mtime=expected)
         except ConcurrentModification as exc:
-            return _index(request, error=str(exc), submitted=submitted)
+            return await _settings_view(
+                request, error=str(exc), submitted=submitted
+            )
         except ConfigError as exc:
-            return _index(request, error=str(exc), submitted=submitted)
+            return await _settings_view(
+                request, error=str(exc), submitted=submitted
+            )
         except Exception as exc:
             # Never a 500 -- render the problem instead.
             log.exception("settings save failed")
-            return _index(
+            return await _settings_view(
                 request,
                 error=f"could not save settings: {exc}",
                 submitted=submitted,
@@ -698,7 +827,7 @@ def build_config_router(
             # notice-wording bug -- fall back to the generic notice rather
             # than a 500.
             log.exception("could not compute changed settings fields")
-            return _index(request, notice=default_notice)
+            return await _settings_view(request, notice=default_notice)
 
         if not changed:
             notice = "Settings saved unchanged."
@@ -708,12 +837,12 @@ def build_config_router(
                 f"Settings saved. {names} changed; restart svtplay-arr to "
                 "apply (mappings apply immediately; settings do not)."
             )
-        return _index(request, notice=notice)
+        return await _settings_view(request, notice=notice)
 
     @router.get("/mappings/new", response_class=HTMLResponse)
     async def new_mapping(request: Request):
         return _TEMPLATES.TemplateResponse(
-            request, "mapping_new.html", {"error": None, "notice": None}
+            request, "mapping_new.html", await _chrome("mappings")
         )
 
     async def _build_search_context(query: str):
@@ -814,7 +943,7 @@ def build_config_router(
             _parse_svt_selection(form)
         )
         if not query:
-            return _index(request, error=error)
+            return await _mappings_view(request, error=error)
         try:
             svt_hits, sonarr_series, mappings_mtime, _rerun_error = (
                 await _build_search_context(query)
@@ -824,7 +953,7 @@ def build_config_router(
                 "could not rebuild the search results after a failed "
                 "mapping create; falling back to the index page"
             )
-            return _index(request, error=error)
+            return await _mappings_view(request, error=error)
         return _TEMPLATES.TemplateResponse(
             request,
             "mapping_search.html",
@@ -833,8 +962,6 @@ def build_config_router(
                 "svt_hits": svt_hits,
                 "sonarr_series": sonarr_series,
                 "mappings_mtime": "" if mappings_mtime is None else mappings_mtime,
-                "error": error,
-                "notice": None,
                 # The operator's picks, so a duplicate-tvdb_id or similar
                 # error lets them change just the one thing that was wrong
                 # instead of re-selecting everything from scratch.
@@ -842,7 +969,9 @@ def build_config_router(
                 "selected_svt_series_id": selected_svt_series_id,
                 "selected_svt_slug": selected_svt_slug,
                 "selected_sonarr": str(form.get("sonarr", "") or ""),
-                **_status_strip_context(),
+                # The search-results page is a Mappings-view page: it is
+                # reached from there and it writes there, so the nav says so.
+                **await _chrome("mappings", [error]),
             },
         )
 
@@ -858,7 +987,7 @@ def build_config_router(
             return _TEMPLATES.TemplateResponse(
                 request,
                 "mapping_new.html",
-                {"error": "Enter a show title to search.", "notice": None},
+                await _chrome("mappings", ["Enter a show title to search."]),
             )
 
         svt_hits, sonarr_series, mappings_mtime, error = (
@@ -876,17 +1005,15 @@ def build_config_router(
                 # empty hidden field as "no expected mtime", silently
                 # skipping the concurrency check. Same test _index uses.
                 "mappings_mtime": "" if mappings_mtime is None else mappings_mtime,
-                "error": error,
-                "notice": None,
                 "selected_svt": None,
                 "selected_svt_series_id": None,
                 "selected_svt_slug": None,
                 "selected_sonarr": None,
                 # The search-results page is where an operator troubleshoots
-                # after a failed create, so it needs the same strip /config
-                # has -- a degraded mappings table or a dead worker is at
-                # least as relevant here as it is there.
-                **_status_strip_context(),
+                # after a failed create, so it needs the same strip the
+                # Status view has -- a degraded mappings table or a dead
+                # worker is at least as relevant here as it is there.
+                **await _chrome("mappings", [error]),
             },
         )
 
@@ -949,8 +1076,10 @@ def build_config_router(
             return await _search_failure_response(
                 request, form, f"could not save mapping: {exc}"
             )
-        return _index(request, notice=f"Added {match.get('title')!r}. "
-                                      "Mappings apply immediately.")
+        return await _mappings_view(
+            request,
+            notice=f"Added {match.get('title')!r}. Mappings apply immediately.",
+        )
 
     @router.post("/mappings/discover", response_class=HTMLResponse)
     async def discover(request: Request):
@@ -991,7 +1120,7 @@ def build_config_router(
         form = dict(await request.form())
         expected, mtime_error = _parse_expected_mtime(form.get("expected_mtime"))
         if mtime_error is not None:
-            return _index(request, error=mtime_error)
+            return await _mappings_view(request, error=mtime_error)
 
         try:
             existing = MappingTable.load(mappings_path).all()
@@ -1000,7 +1129,7 @@ def build_config_router(
                 "mappings file %s is invalid; refusing to sweep over it",
                 mappings_path, exc_info=True,
             )
-            return _index(
+            return await _mappings_view(
                 request,
                 error=(
                     f"{mappings_path} is invalid: {exc}. Nothing was "
@@ -1030,7 +1159,7 @@ def build_config_router(
             )
         except Exception as exc:
             log.warning("mapping sweep failed", exc_info=True)
-            return _index(
+            return await _mappings_view(
                 request,
                 error=f"Could not search for mappings ({exc}); nothing was written.",
             )
@@ -1084,13 +1213,11 @@ def build_config_router(
                 "mappings_mtime": (
                     "" if mtime_after_write is None else mtime_after_write
                 ),
-                # The same string in both places on purpose: base.html
-                # renders `error` as the page banner, and the template
-                # branches on `write_error` to decide whether the confident
-                # matches are shown as saved or as found-but-not-saved.
-                "error": write_error,
-                "notice": None,
-                **_status_strip_context(),
+                # base.html renders the chrome's `error` as the page
+                # banner from this same string; the template branches on
+                # `write_error` to decide whether the confident matches are
+                # shown as saved or as found-but-not-saved.
+                **await _chrome("mappings", [write_error]),
             },
         )
 
@@ -1099,18 +1226,22 @@ def build_config_router(
         form = dict(await request.form())
         expected, mtime_error = _parse_expected_mtime(form.get("expected_mtime"))
         if mtime_error is not None:
-            return _index(request, error=mtime_error)
+            return await _mappings_view(request, error=mtime_error)
         try:
             remove_mapping(
                 mappings_path, tvdb_id,
                 expected_mtime=expected,
             )
         except (MappingError, ConcurrentModification) as exc:
-            return _index(request, error=str(exc))
+            return await _mappings_view(request, error=str(exc))
         except Exception as exc:
             log.exception("mapping delete failed")
-            return _index(request, error=f"could not remove mapping: {exc}")
-        return _index(request, notice=f"Removed mapping for tvdbId {tvdb_id}.")
+            return await _mappings_view(
+                request, error=f"could not remove mapping: {exc}"
+            )
+        return await _mappings_view(
+            request, notice=f"Removed mapping for tvdbId {tvdb_id}."
+        )
 
     @router.post("/mappings/{tvdb_id}/check", response_class=HTMLResponse)
     async def check_mapping(request: Request, tvdb_id: int):
@@ -1138,6 +1269,6 @@ def build_config_router(
         result = await _check_context(tvdb_id)
         if "application/json" in request.headers.get("accept", ""):
             return JSONResponse(result)
-        return _index(request, check=result)
+        return await _mappings_view(request, check=result)
 
     return router
