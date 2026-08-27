@@ -75,26 +75,23 @@
       {%- if state is none %}
       <span class="status-chip">Unknown</span>
       <span class="help">{% if mapping_states_unavailable %}The background
-        SVT check's state could not be read. Use Check to test this row
-        now.{% else %}Nothing is reporting this row's SVT check state. Use
-        Check to test it now.{% endif %}</span>
+        check's state could not be read.{% else %}Nothing is reporting a
+        check state for this row.{% endif %}</span>
       {%- elif state.ok is none %}
       <span class="status-chip">Not checked</span>
-      <span class="help">The background check has not reached this row
-        since svtplay-arr started. That is not a finding about it.</span>
+      <span class="help">Not reached since svtplay-arr started.</span>
       {%- elif state.ok %}
       <span class="status-chip notice">Resolves</span>
       <span class="help">{{ state.episode_count if state.episode_count is not none else '?' }}
-        episode{{ '' if state.episode_count == 1 else 's' }} on SVT
-        {%- if state.last_checked %}, checked {{ state.last_checked }}{% endif %}.
-        This says the slug resolves, not that it is the right show.</span>
+        episode{{ '' if state.episode_count == 1 else 's' }}
+        {%- if state.last_checked %}, {{ state.last_checked }}{% endif %}</span>
       {%- else %}
       <span class="status-chip error">Failing</span>
       <span class="help">{% if state.last_error %}{{ state.last_error }}{% else %}The
-        background check recorded no reason. Use Check to see the current
+        background check recorded no reason; use Check for the current
         result.{% endif %}
-        {%- if state.last_success %} It last resolved {{ state.last_success }}.
-        {%- else %} It has not resolved since svtplay-arr started.{% endif %}</span>
+        {%- if state.last_success %} Last resolved {{ state.last_success }}.
+        {%- else %} Has not resolved since svtplay-arr started.{% endif %}</span>
       {%- endif %}
     </td>
     <td class="mapping-actions">
@@ -166,7 +163,30 @@
     same state.</td></tr>
   {% endif %}
   {% else %}
-  <tr><td colspan="5">No mappings yet. Nothing will be offered to Sonarr.</td></tr>
+  {# A fresh install, and the one moment this page has the operator's full
+     attention. "No mappings yet" is true and useless on its own: they
+     have just installed this, and nothing here has ever said what a
+     mapping is, why svtplay-arr cannot work one out for itself, or what
+     to press next.
+
+     Only for a file that loaded and holds no series. A file that failed
+     to load takes the branch above -- telling someone whose YAML is
+     malformed to run the sweep would be advice to sweep over a file that
+     cannot be read. #}
+  <tr><td colspan="5" class="empty-state">
+    <p><strong>No mappings yet. Nothing will be offered to Sonarr.</strong></p>
+    <p class="help">A mapping is the bridge between one Sonarr series and
+      the SVT Play programme its episodes come from. Sonarr knows a series
+      by its TVDB id; SVT Play knows it by the slug in its URL and knows
+      nothing about TVDB, so nothing links the two and svtplay-arr cannot
+      guess. Until a series is mapped, its episodes are invisible to
+      Sonarr no matter how many are on SVT.</p>
+    <p class="help">Start with <strong>Find mappings</strong> below: it
+      walks your Sonarr library and works out the ones it can prove, by
+      comparing episode dates and numbers rather than by matching titles.
+      Everything it is not sure about it lists for you to decide. Or add a
+      single series by hand with <strong>Add a series</strong>.</p>
+  </td></tr>
   {% endif %}
   {% endfor %}
   </tbody>
@@ -176,6 +196,18 @@
    Check submit and this render. The common case (a check against a
    mapping still on the page) never reaches this; it is shown inline in
    the row above instead. #}
+{# Explained once beneath the table rather than in every row: an
+   important caveat repeated on each line stops being read, and "Resolves"
+   is on most rows most of the time. Rendered only when there is a table
+   to explain. #}
+{% if mappings %}
+<p class="help">The <strong>SVT check</strong> column is the background
+check's last word on each row, collected on its own slow loop &mdash;
+opening this page never asks SVT anything, and <strong>Check</strong>
+re-tests one row right now. <em>Resolves</em> means the slug still returns
+episodes; it does not mean the mapping points at the right show, which only
+you can tell.</p>
+{% endif %}
 {% if auto_rows %}
 {# Only when at least one badge is actually on the page. An explanation
    of a marker that appears nowhere is noise on the page every operator
@@ -205,6 +237,19 @@
   </form>
   <a href="/config/mappings/new">Add a series</a>
 </div>
+{# What the click costs, said before it happens. With JavaScript off this
+   is a blocking POST that can sit for a minute with nothing on screen,
+   and afterwards there is nothing left to read -- so the warning is only
+   any use here. The numbers are the module's own constants, passed in
+   rather than written into the prose, so the page cannot promise a bound
+   the sweep does not honour. #}
+<p class="help"><strong>This takes a while.</strong> One click walks your
+whole Sonarr library: up to {{ sweep_cap }} unmapped series in a run and at
+most {{ sweep_request_budget }} requests to SVT, spread out so as not to
+hammer it. On a large library expect a minute or more with no visible
+progress, and nothing to read until it finishes. It is safe to leave
+running &mdash; it writes only at the end, and re-running continues where a
+capped run stopped.</p>
 <p class="help">Find mappings searches SVT for every Sonarr series that is
 not mapped yet &mdash; under its own title and Sonarr's alternate titles
 &mdash; and then compares each likely SVT programme's episodes against that

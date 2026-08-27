@@ -601,7 +601,20 @@ activity read go through `asyncio.to_thread`: every config route is `async
 def` (see below), so a plain call would run a blocking sqlite read on the
 event loop the download worker also runs on.
 
-`POST /config/mappings/discover` is the Find mappings sweep. It parses
+A fresh install with no mappings gets an explanation rather than an empty
+table: what a mapping is, why svtplay-arr cannot work one out on its own,
+and which control to press. It is onboarding, not furniture — it disappears
+as soon as there is a row, and a mappings file that *failed to load* takes
+the error branch instead, since advising a sweep over an unreadable file
+would be wrong.
+
+`POST /config/mappings/discover` is the Find mappings sweep. What one click
+costs — the per-run series cap and the request budget, read off the module's
+own constants rather than written into prose — is on the page *before* the
+button, because with JavaScript off there is nothing to read after it. With
+JavaScript on, `initSweepProgress` adds a line once the click has happened;
+it never calls `preventDefault`, so the POST is the same plain form
+submission either way. It parses
 `expected_mtime`, loads mappings.yaml (refusing to sweep at all if it will not
 parse — without knowing what is already mapped it would re-search the library
 and could append a duplicate on top of a file it could not read), runs

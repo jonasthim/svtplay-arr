@@ -728,6 +728,12 @@ def build_config_router(
                 # True. See where it is computed for why None is a state.
                 "mappings_ever_loaded": _mappings_ever_loaded(chrome.get("health")),
                 "mappings_mtime": "" if mappings_mtime is None else mappings_mtime,
+                # The sweep's own bounds, rendered rather than described
+                # in prose: the page says what one Find mappings click
+                # costs, and it cannot promise a bound this module does
+                # not actually pass to `sweep_for_mappings`.
+                "sweep_cap": _SWEEP_CAP,
+                "sweep_request_budget": _SWEEP_REQUEST_BUDGET,
                 # Set only by the no-JS Check form POST, and only for the
                 # one row it was submitted for -- see the check route below.
                 # No view ever fills this in itself and none of them calls

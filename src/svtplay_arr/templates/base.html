@@ -417,6 +417,14 @@
     form.accept-form { display: flex; flex-wrap: wrap; align-items: center;
                        gap: .5rem; margin: .3rem 0; }
     form.accept-form .help { margin: 0; }
+    /* Added by initSweepProgress once a sweep is actually under way;
+       the server renders nothing here. Inside the form, so it sits under
+       the button it describes rather than beside the "Add a series" link
+       the flex row also carries. */
+    form.discover-form { display: flex; flex-wrap: wrap; align-items: center;
+                         gap: .4rem .75rem; }
+    .sweep-progress { margin: 0; flex-basis: 100%; }
+
     /* ---- Narrow viewports ------------------------------------------
        Below this width the two-column form rows stack, and the mappings
        table stops being a table. Series / TVDB / SVT plus two buttons in
@@ -782,10 +790,48 @@
         });
       }
 
+      // The sweep is a plain form POST that walks the whole Sonarr
+      // library: up to a few hundred SVT requests, with nothing on screen
+      // until it finishes. With JavaScript off the browser's own loading
+      // indicator is the only feedback, which is why the wording beside
+      // the control says what the click costs *before* it is clicked --
+      // see mappings.html. This adds a line once it has been.
+      //
+      // It never calls preventDefault and never fetches anything: the
+      // POST the browser is already performing goes exactly where it went
+      // before, and this only annotates it. Turning the sweep into
+      // something that needs script to happen at all is the one thing
+      // this must not do.
+      function initSweepProgress() {
+        document.querySelectorAll("form.discover-form").forEach(function (form) {
+          // Created here, never rendered by the server: a progress note
+          // that can never update is worse than no note, the same
+          // reasoning as the mappings filter input above.
+          var note = document.createElement("p");
+          note.className = "help sweep-progress";
+          note.setAttribute("aria-live", "polite");
+          note.hidden = true;
+          form.appendChild(note);
+
+          form.addEventListener("submit", function () {
+            // A second click would start a second full sweep against SVT
+            // while the first is still running.
+            var go = form.querySelector("button");
+            if (go) { go.disabled = true; }
+            note.hidden = false;
+            note.textContent =
+              "Searching SVT\u2026 this can take a minute or more on a " +
+              "large library. Leave this page open; the results appear " +
+              "when it finishes.";
+          });
+        });
+      }
+
       function init() {
         initCheckForms();
         initMappingFilter();
         initSecretToggles();
+        initSweepProgress();
       }
 
       if (document.readyState === "loading") {
