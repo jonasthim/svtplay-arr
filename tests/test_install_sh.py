@@ -24,6 +24,7 @@ What is not covered here, and why, is in
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shutil
@@ -120,6 +121,22 @@ class Harness:
     def fail_uv(self, failing: bool = True) -> None:
         (self.root / "uv-mode").write_text("fail" if failing else "ok")
 
+    def kill_during_build(self) -> None:
+        (self.root / "uv-mode").write_text("kill")
+
+    def kill_during_restart(self) -> None:
+        (self.root / "kill-on-restart").write_text("")
+
+    def tamper_with_config_on_restart(self) -> None:
+        (self.root / "tamper-config").write_text("")
+
+    def fail_downloads(self) -> None:
+        (self.root / "curl-fail").write_text("")
+
+    @property
+    def active_marker(self) -> Path:
+        return self.prefix / ".active-release"
+
     # -- the source repository ------------------------------------------
 
     def git(self, *args: str) -> str:
@@ -134,12 +151,19 @@ class Harness:
         return proc.stdout
 
     def commit_upstream(self, version: str = "0.2.0") -> str:
+        """An untagged commit on main."""
         (self.remote / "pyproject.toml").write_text(
             f'[project]\nname = "svtplay-arr"\nversion = "{version}"\n'
         )
         self.git("add", "-A")
         self.git("commit", "-q", "-m", f"release {version}")
         return self.git("rev-parse", "HEAD").strip()
+
+    def release_upstream(self, version: str = "0.2.0") -> str:
+        """A commit plus the vN.N.N tag the installer targets by default."""
+        sha = self.commit_upstream(version)
+        self.git("tag", f"v{version}")
+        return sha
 
     # -- inspection ------------------------------------------------------
 
@@ -191,6 +215,26 @@ def harness(tmp_path: Path) -> Harness:
         stubs / "systemctl",
         """#!/usr/bin/env bash
 printf 'systemctl %s\\n' "$*" >>"$CALL_LOG"
+
+verb=""
+for arg in "$@"; do
+    case $arg in
+    -*) ;;
+    *)
+        verb=$arg
+        break
+        ;;
+    esac
+done
+
+# A read, not a mutation: whether the unit is running right now.
+if [ "$verb" = is-active ]; then
+    if [ "$(cat "$HARNESS_ROOT/service-state" 2>/dev/null)" = active ]; then
+        exit 0
+    fi
+    exit 3
+fi
+
 started=no
 for arg in "$@"; do
     case $arg in
@@ -198,6 +242,18 @@ for arg in "$@"; do
     esac
 done
 if [ "$started" = yes ]; then
+    # Stands in for anything that rewrites config behind the installer's
+    # back, so the post-upgrade hash check has something to catch.
+    if [ -f "$HARNESS_ROOT/tamper-config" ]; then
+        printf '# tampered with\\n' >>"$HARNESS_CONFIG"
+    fi
+    # A run killed between the symlink flip and the restart.
+    if [ -f "$HARNESS_ROOT/kill-on-restart" ]; then
+        rm -f "$HARNESS_ROOT/kill-on-restart"
+        kill -9 "$PPID"
+        exit 0
+    fi
+    printf 'active' >"$HARNESS_ROOT/service-state"
     n=0
     [ -f "$HARNESS_ROOT/restart-count" ] && n=$(cat "$HARNESS_ROOT/restart-count")
     n=$((n + 1))
@@ -216,6 +272,31 @@ exit 0
         stubs / "curl",
         """#!/usr/bin/env bash
 printf 'curl %s\\n' "$*" >>"$CALL_LOG"
+
+url=""
+out=""
+prev=""
+for arg in "$@"; do
+    case $arg in
+    http://* | https://* | file://*) url=$arg ;;
+    esac
+    if [ "$prev" = "-o" ]; then
+        out=$arg
+    fi
+    prev=$arg
+done
+
+# A release artifact download rather than a /health poll.
+case $url in
+*.tar.gz)
+    if [ -f "$HARNESS_ROOT/curl-fail" ]; then
+        exit 22
+    fi
+    cp "$HARNESS_ROOT/uv-artifact.tar.gz" "$out" || exit 23
+    exit 0
+    ;;
+esac
+
 if [ -s "$HARNESS_ROOT/health.json" ]; then
     cat "$HARNESS_ROOT/health.json"
     exit 0
@@ -268,6 +349,12 @@ if [ "$mode" = fail ]; then
     echo "error: no solution found when resolving dependencies" >&2
     exit 1
 fi
+# The build is where a long run is most likely to be interrupted.
+if [ "$mode" = kill ]; then
+    rm -f "$HARNESS_ROOT/uv-mode"
+    kill -9 "$PPID"
+    exit 0
+fi
 project=""
 while [ $# -gt 0 ]; do
     if [ "$1" = --project ]; then
@@ -300,13 +387,15 @@ chmod 0755 "$project/.venv/bin/uvicorn"
             "GIT_COMMITTER_NAME": "test",
             "GIT_COMMITTER_EMAIL": "test@example.invalid",
             "HARNESS_ROOT": str(root),
+            "HARNESS_CONFIG": str(config_dir / "config.yaml"),
             "CALL_LOG": str(call_log),
             "SVTPLAY_ARR_PREFIX": str(prefix),
             "SVTPLAY_ARR_CONFIG_DIR": str(config_dir),
             "SVTPLAY_ARR_UNIT_DIR": str(unit_dir),
             "SVTPLAY_ARR_BIN_DIR": str(bin_dir),
             "SVTPLAY_ARR_REPO": f"file://{remote}",
-            "SVTPLAY_ARR_REF": "main",
+            # SVTPLAY_ARR_REF is deliberately unset: the default path is
+            # "newest vN.N.N tag", and that is what should be under test.
             "SVTPLAY_ARR_EUID": "0",
             "SVTPLAY_ARR_HEALTH_URL": "http://127.0.0.1:9800/health",
             "SVTPLAY_ARR_HEALTH_TIMEOUT": "1",
@@ -350,6 +439,7 @@ chmod 0755 "$project/.venv/bin/uvicorn"
     )
     harness.git("add", "-A")
     harness.git("commit", "-q", "-m", "initial")
+    harness.git("tag", "v0.1.0")
     return harness
 
 
@@ -404,9 +494,32 @@ def test_fresh_install_creates_the_media_group_and_service_user(harness: Harness
     assert "--gid media svtplay" in calls
 
 
-def test_install_reports_a_degraded_filesystem_loudly(harness: Harness):
+def test_a_fresh_install_does_not_cry_wolf_about_same_filesystem(harness: Harness):
+    """Every first install is degraded, so the alarm must not fire on one.
+
+    `dirs_share_filesystem()` is False when the directories do not exist, and
+    the seeded example points at /downloads/incomplete, which never exists on
+    a fresh host. Firing the library-corruption warning on 100% of installs is
+    how it stops being read by the third one.
+    """
     harness.set_health(DEGRADED)
     proc = harness.run()
+
+    assert "same_filesystem is FALSE" not in proc.stderr
+    assert "expected at this point" in proc.stdout
+    assert "wrote" in proc.stdout and "config.yaml" in proc.stdout
+    # It still says what the field would mean if it persists.
+    assert "corrupt library entry" in proc.stdout
+
+
+def test_a_degraded_upgrade_reports_same_filesystem_loudly(harness: Harness):
+    """Once config is the operator's own, false means misconfigured."""
+    harness.run()
+    harness.release_upstream("0.2.0")
+    harness.set_health(DEGRADED)
+    # Already degraded before, so this is not a rollback case.
+    proc = harness.run()
+
     assert "same_filesystem is FALSE" in proc.stderr
     assert "copy-then-delete" in proc.stderr
     assert "corrupt library entry" in proc.stderr
@@ -442,11 +555,11 @@ def test_a_second_run_is_a_no_op(harness: Harness):
     assert harness.config.read_text() == before["config"]
     assert harness.mappings.read_text() == before["mappings"]
 
-    calls = harness.calls()
-    assert "systemctl" not in calls, calls
-    assert "groupadd" not in calls, calls
-    assert "useradd" not in calls, calls
-    assert "uv " not in calls, calls
+    # Nothing that changes the host. `systemctl is-active` is allowed and
+    # expected -- "up to date" is a claim about what is running, and the only
+    # way to check is to ask.
+    assert _mutating_calls(harness) == [], harness.calls()
+    assert "systemctl is-active" in harness.calls()
 
 
 def test_the_release_is_built_where_it_will_live(harness: Harness):
@@ -475,19 +588,68 @@ def test_the_interpreter_uv_installs_is_pinned(harness: Harness):
     assert re.search(r"--python 3\.\d+\b", build), build
 
 
-def test_an_interrupted_release_is_discarded_and_rebuilt(harness: Harness):
-    """A run killed mid-build leaves a directory with no stamp in it."""
+def test_refuses_to_delete_the_release_the_service_is_running_from(harness: Harness):
+    """The stamp is an ordinary dotfile in a tree owned by the service account.
+
+    If it goes missing from the ACTIVE release, treating that release as
+    debris deletes the tree the running process was started from. The process
+    survives on open file handles, so the run would go on to report the old
+    version as still running while `releases/` was empty -- and the service
+    would be gone at the next restart.
+    """
     harness.run()
     release = harness.releases[0]
     (release / ".svtplay-arr-release-ok").unlink()
-    (release / "half-written").write_text("junk")
+
+    proc = harness.run(expect=1)
+
+    assert release.is_dir()
+    assert (release / ".venv" / "bin" / "uvicorn").is_file()
+    assert "is the release the service is running from" in proc.stderr
+    assert "Removing it would take the running service with it" in proc.stderr
+    assert harness.current.resolve() == release.resolve()
+
+
+def test_an_incomplete_inactive_release_is_discarded_and_rebuilt(harness: Harness):
+    harness.run()
+    first = harness.releases[0]
+    sha = harness.release_upstream("0.2.0")
+    stale = harness.prefix / "releases" / sha[:12]
+    stale.mkdir(parents=True)
+    (stale / "half-written").write_text("junk")
 
     proc = harness.run()
 
     assert "discarding an incomplete" in proc.stdout
-    assert (release / ".svtplay-arr-release-ok").is_file()
-    assert not (release / "half-written").exists()
-    assert harness.current.resolve() == release.resolve()
+    assert (stale / ".svtplay-arr-release-ok").is_file()
+    assert not (stale / "half-written").exists()
+    assert harness.current.resolve() == stale.resolve()
+    assert first.is_dir()
+
+
+def test_a_build_killed_mid_way_is_rebuilt_by_the_next_run(harness: Harness):
+    """A real SIGKILL during `uv sync`, not a simulated one.
+
+    This is what the stamp is for, and why it is written after the build
+    rather than before: the killed run leaves a directory that looks finished
+    by name alone.
+    """
+    harness.kill_during_build()
+    killed = harness.run(expect=-9)
+    assert killed.returncode == -9
+
+    assert len(harness.releases) == 1
+    partial = harness.releases[0]
+    assert not (partial / ".svtplay-arr-release-ok").exists()
+    assert not (partial / ".venv").exists()
+    assert not harness.current.exists()
+
+    proc = harness.run()
+
+    assert "discarding an incomplete" in proc.stdout
+    assert (partial / ".svtplay-arr-release-ok").is_file()
+    assert (partial / ".venv" / "bin" / "uvicorn").is_file()
+    assert harness.current.resolve() == partial.resolve()
 
 
 # --------------------------------------------------------------------------
@@ -506,7 +668,7 @@ def _install_then_edit_config(harness: Harness) -> str:
 def test_upgrade_switches_releases_and_reports_both_versions(harness: Harness):
     harness.run()
     first = harness.releases[0]
-    harness.commit_upstream("0.2.0")
+    harness.release_upstream("0.2.0")
     harness.reset_calls()
 
     proc = harness.run()
@@ -525,7 +687,7 @@ def test_upgrade_switches_releases_and_reports_both_versions(harness: Harness):
 def test_upgrade_leaves_config_untouched(harness: Harness):
     edited = _install_then_edit_config(harness)
     config_stat = harness.config.stat()
-    harness.commit_upstream("0.2.0")
+    harness.release_upstream("0.2.0")
 
     proc = harness.run()
 
@@ -538,7 +700,7 @@ def test_upgrade_leaves_config_untouched(harness: Harness):
 def test_upgrade_whose_build_fails_leaves_the_old_version_running(harness: Harness):
     edited = _install_then_edit_config(harness)
     first = harness.releases[0]
-    harness.commit_upstream("0.2.0")
+    harness.release_upstream("0.2.0")
     harness.fail_uv()
     harness.reset_calls()
 
@@ -555,7 +717,7 @@ def test_upgrade_whose_build_fails_leaves_the_old_version_running(harness: Harne
 def test_upgrade_whose_health_check_fails_rolls_back(harness: Harness):
     edited = _install_then_edit_config(harness)
     first = harness.releases[0]
-    harness.commit_upstream("0.2.0")
+    harness.release_upstream("0.2.0")
     # The upgraded service does not come up; the restored one does.
     harness.plan_health("", HEALTHY)
 
@@ -571,7 +733,7 @@ def test_upgrade_whose_health_check_fails_rolls_back(harness: Harness):
 def test_upgrade_that_comes_back_degraded_rolls_back(harness: Harness):
     harness.run()
     first = harness.releases[0]
-    harness.commit_upstream("0.2.0")
+    harness.release_upstream("0.2.0")
     harness.plan_health(DEGRADED, HEALTHY)
 
     proc = harness.run(expect=1)
@@ -585,7 +747,7 @@ def test_upgrade_of_an_already_degraded_service_is_not_rolled_back(harness: Harn
     harness.set_health(DEGRADED)
     harness.run()
     first = harness.releases[0]
-    harness.commit_upstream("0.2.0")
+    harness.release_upstream("0.2.0")
 
     proc = harness.run()
 
@@ -624,7 +786,7 @@ def test_upgrade_migrates_a_pre_release_layout_checkout(harness: Harness):
 def test_prune_keeps_the_requested_number_of_releases(harness: Harness):
     harness.run("--keep", "1")
     first = harness.releases[0]
-    harness.commit_upstream("0.2.0")
+    harness.release_upstream("0.2.0")
 
     harness.run("--keep", "1")
 
@@ -639,18 +801,28 @@ def test_prune_keeps_the_requested_number_of_releases(harness: Harness):
 
 
 MUTATING_STUBS = {"systemctl", "groupadd", "useradd", "chown", "uv"}
+# systemctl is not one verb. Asking whether a unit is running changes nothing,
+# and the installer has to ask.
+SYSTEMCTL_READS = {"is-active", "is-enabled", "show", "status", "cat"}
 
 
 def _mutating_calls(harness: Harness) -> list[str]:
     """Stub invocations that would have changed the host.
 
-    getent and curl are reads; a dry run is allowed to make them.
+    getent and curl are reads; a dry run is allowed to make them, and so is a
+    run that finds there is nothing to do.
     """
-    return [
-        line
-        for line in harness.calls().splitlines()
-        if line.split(" ", 1)[0] in MUTATING_STUBS
-    ]
+    out = []
+    for line in harness.calls().splitlines():
+        parts = line.split()
+        if not parts or parts[0] not in MUTATING_STUBS:
+            continue
+        if parts[0] == "systemctl":
+            verb = next((a for a in parts[1:] if not a.startswith("-")), "")
+            if verb in SYSTEMCTL_READS:
+                continue
+        out.append(line)
+    return out
 
 
 def test_dry_run_changes_nothing(harness: Harness):
@@ -669,7 +841,7 @@ def test_dry_run_changes_nothing(harness: Harness):
 
 def test_dry_run_over_an_installation_changes_nothing(harness: Harness):
     edited = _install_then_edit_config(harness)
-    harness.commit_upstream("0.2.0")
+    harness.release_upstream("0.2.0")
     before = harness.unit.read_text()
     releases_before = [p.name for p in harness.releases]
     harness.reset_calls()
@@ -715,6 +887,352 @@ def test_unresolvable_ref_changes_nothing(harness: Harness):
     proc = harness.run(expect=1, SVTPLAY_ARR_REF="no-such-branch")
     assert "could not resolve no-such-branch" in proc.stderr
     assert harness.releases == []
+
+
+# --------------------------------------------------------------------------
+# Interruption between the flip and the restart
+# --------------------------------------------------------------------------
+
+
+def test_an_interrupted_activation_is_finished_by_the_next_run(harness: Harness):
+    """`current` naming a release is not the same as running it.
+
+    Killed after the symlink flip and before the restart, the host is on the
+    new code by symlink and the old code by process. A re-run that says
+    "nothing to do" leaves it that way for good, because every later run
+    agrees with it.
+    """
+    harness.run()
+    first = harness.releases[0]
+    harness.release_upstream("0.2.0")
+    harness.kill_during_restart()
+
+    killed = harness.run(expect=-9)
+    assert killed.returncode == -9
+
+    second = next(p for p in harness.releases if p != first)
+    assert harness.current.resolve() == second.resolve()
+    assert harness.active_marker.read_text().strip() == first.name
+    harness.reset_calls()
+
+    proc = harness.run()
+
+    assert "Already up to date" not in proc.stdout
+    assert "restart svtplay-arr.service" in harness.calls()
+    assert harness.active_marker.read_text().strip() == second.name
+
+
+def test_a_stopped_service_is_started_by_the_next_run(harness: Harness):
+    harness.run()
+    (harness.root / "service-state").write_text("inactive")
+    harness.reset_calls()
+
+    proc = harness.run()
+
+    assert "Already up to date" not in proc.stdout
+    assert _mutating_calls(harness) != []
+
+
+# --------------------------------------------------------------------------
+# Installing uv
+# --------------------------------------------------------------------------
+
+
+def _uv_target() -> str:
+    env = {k: v for k, v in os.environ.items() if not k.startswith("SVTPLAY_ARR_")}
+    proc = subprocess.run(
+        ["bash", "-c", f'source "{INSTALL_SH}"; uv_target'],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    return proc.stdout.strip()
+
+
+def _path_without_uv() -> str:
+    """A PATH on which `command -v uv` fails, so install_uv actually runs."""
+    kept = [
+        d
+        for d in os.environ.get("PATH", "").split(os.pathsep)
+        if d and not os.access(os.path.join(d, "uv"), os.X_OK)
+    ]
+    return os.pathsep.join(kept)
+
+
+def _publish_fake_uv(harness: Harness, target: str) -> str:
+    """A release artifact shaped like uv's, holding the harness's uv stub."""
+    stage = harness.root / "artifact" / f"uv-{target}"
+    stage.mkdir(parents=True, exist_ok=True)
+    shutil.copy(harness.root / "stubs" / "uv", stage / "uv")
+    (stage / "uv").chmod(0o755)
+    (stage / "uvx").write_text("#!/bin/sh\nexit 0\n")
+    (stage / "uvx").chmod(0o755)
+    tarball = harness.root / "uv-artifact.tar.gz"
+    subprocess.run(
+        ["tar", "-czf", str(tarball), "-C", str(stage.parent), f"uv-{target}"],
+        check=True,
+        capture_output=True,
+    )
+    return hashlib.sha256(tarball.read_bytes()).hexdigest()
+
+
+@pytest.fixture
+def uv_download(harness: Harness):
+    """Drive install_uv for real: no uv on PATH, a local artifact for curl."""
+    target = _uv_target()
+    if not target:
+        pytest.skip("uv publishes no build for this architecture")
+    path = _path_without_uv()
+    if shutil.which("git", path=path) is None:
+        pytest.skip("git shares a directory with uv on this host")
+    digest = _publish_fake_uv(harness, target)
+    return target, path, digest
+
+
+def test_uv_is_downloaded_verified_and_installed(harness: Harness, uv_download):
+    target, path, digest = uv_download
+    bin_dir = Path(harness.env["SVTPLAY_ARR_BIN_DIR"])
+
+    proc = harness.run(
+        SVTPLAY_ARR_UV="", SVTPLAY_ARR_UV_SHA256=digest, PATH=path
+    )
+
+    assert "checksum verified" in proc.stdout
+    assert (bin_dir / "uv").is_file()
+    assert _mode(bin_dir / "uv") == 0o755
+    assert (bin_dir / "uvx").is_file()
+    # And the install went on to use it.
+    assert (harness.releases[0] / ".venv" / "bin" / "uvicorn").is_file()
+
+
+def test_uv_failing_its_pinned_checksum_is_refused(harness: Harness, uv_download):
+    """No override here: the checksum table in the script is what judges it."""
+    target, path, _ = uv_download
+    if not re.search(rf"{re.escape(target)}\)\n\s+printf", INSTALL_SH.read_text()):
+        pytest.skip(f"no pinned checksum for {target}")
+    bin_dir = Path(harness.env["SVTPLAY_ARR_BIN_DIR"])
+
+    proc = harness.run(expect=1, SVTPLAY_ARR_UV="", PATH=path)
+
+    assert "checksum mismatch -- refusing to install" in proc.stderr
+    assert not (bin_dir / "uv").exists()
+    assert harness.releases == []
+    assert not harness.config.exists()
+
+
+def test_uv_download_failure_stops_before_extracting(harness: Harness, uv_download):
+    target, path, _ = uv_download
+    harness.fail_downloads()
+    bin_dir = Path(harness.env["SVTPLAY_ARR_BIN_DIR"])
+
+    proc = harness.run(expect=1, SVTPLAY_ARR_UV="", PATH=path)
+
+    assert "could not download uv" in proc.stderr
+    assert not (bin_dir / "uv").exists()
+    assert harness.releases == []
+
+    # The URL it asked for, and how it asked. A pin nobody checks is not a pin.
+    request = next(
+        line for line in harness.calls().splitlines() if ".tar.gz" in line
+    )
+    assert (
+        f"https://github.com/astral-sh/uv/releases/download/"
+        f"{_pinned_uv_version()}/uv-{target}.tar.gz" in request
+    )
+    assert "--proto =https" in request
+    assert "--tlsv1.2" in request
+
+
+def _pinned_uv_version() -> str:
+    match = re.search(r'readonly UV_VERSION="([^"]+)"', INSTALL_SH.read_text())
+    assert match
+    return match.group(1)
+
+
+# --------------------------------------------------------------------------
+# The guarantees that are only guarantees if they are checked
+# --------------------------------------------------------------------------
+
+
+def test_config_changed_behind_the_installer_is_caught(harness: Harness):
+    """The third layer of the config protection, doing something.
+
+    Layers one and two stop this script writing config. This one is the claim
+    that the files came through the upgrade unchanged whatever the cause, so
+    it needs a change it did not make.
+    """
+    edited = _install_then_edit_config(harness)
+    harness.release_upstream("0.2.0")
+    harness.tamper_with_config_on_restart()
+
+    proc = harness.run(expect=1)
+
+    assert "changed during an upgrade" in proc.stderr
+    assert "This must never happen" in proc.stderr
+    assert harness.config.read_text() != edited  # it really was changed
+
+
+def test_a_rollback_that_does_not_restore_service_says_so(harness: Harness):
+    """The rollback verifies its own work, and reports honestly when it fails."""
+    harness.run()
+    first = harness.releases[0]
+    harness.release_upstream("0.2.0")
+    # Neither the upgrade nor the restored version comes back.
+    harness.plan_health("", "")
+
+    proc = harness.run(expect=1)
+
+    assert "Rollback complete" not in proc.stdout
+    assert "Rollback did not restore service" in proc.stdout
+    assert "did not answer /health" in proc.stderr
+    assert harness.current.resolve() == first.resolve()
+
+
+# --------------------------------------------------------------------------
+# Refusing dangerous targets
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("target", ["/", "/etc", "/opt", "/usr", "/var", "/home"])
+def test_refuses_a_shared_system_directory_as_prefix(harness: Harness, target: str):
+    """`--prefix /opt` is a plausible reading of "install root".
+
+    It would recursively chown every other application under /opt to the
+    service account, as root, and exit 0 without saying anything.
+    """
+    proc = harness.run(expect=1, SVTPLAY_ARR_PREFIX=target)
+    assert f"refusing {target}" in proc.stderr
+    assert "recursively chowns" in proc.stderr
+    assert "--prefix /opt/svtplay-arr" in proc.stderr
+
+
+@pytest.mark.parametrize("target", ["/", "/etc", "/usr/local", "/var/lib"])
+def test_refuses_a_shared_system_directory_as_config_dir(harness: Harness, target: str):
+    """`--config-dir /etc` would take sudoers, the host keys and /etc/ssl."""
+    proc = harness.run(expect=1, SVTPLAY_ARR_CONFIG_DIR=target)
+    assert f"refusing {target}" in proc.stderr
+    assert "--config-dir /etc/svtplay-arr" in proc.stderr
+
+
+def test_refuses_to_adopt_a_directory_that_is_someone_elses(harness: Harness):
+    intruder = harness.root / "opt" / "media-stack"
+    (intruder / "plex").mkdir(parents=True)
+    (intruder / "plex" / "Preferences.xml").write_text("<x/>")
+
+    proc = harness.run(expect=1, SVTPLAY_ARR_PREFIX=str(intruder))
+
+    assert "does not look like an" in proc.stderr
+    assert "svtplay-arr prefix directory" in proc.stderr
+    assert "Refusing to take it over" in proc.stderr
+    assert "plex" in proc.stderr
+    assert (intruder / "plex" / "Preferences.xml").is_file()
+
+
+def test_adopts_an_empty_directory(harness: Harness):
+    empty = harness.root / "opt" / "empty-but-mine"
+    empty.mkdir(parents=True)
+    harness.run(SVTPLAY_ARR_PREFIX=str(empty))
+    assert (empty / "current").is_symlink()
+
+
+@pytest.mark.parametrize("bad", ["relative/path", "/opt/../etc", "/opt/./x"])
+def test_refuses_a_path_that_is_not_plainly_absolute(harness: Harness, bad: str):
+    proc = harness.run(expect=1, SVTPLAY_ARR_PREFIX=bad)
+    assert "must be an absolute path" in proc.stderr
+
+
+def test_the_recursive_chown_is_scoped_to_what_the_script_created(harness: Harness):
+    harness.run()
+    chowns = [c for c in harness.calls().splitlines() if c.startswith("chown")]
+    assert chowns
+    for call in chowns:
+        assert f"-R svtplay:media {harness.prefix}\n" not in call + "\n", call
+        assert not call.endswith(f"-R svtplay:media {harness.prefix}"), call
+    assert any(f"{harness.prefix}/releases" in c for c in chowns)
+    assert any(f"{harness.prefix}/python" in c for c in chowns)
+
+
+@pytest.mark.parametrize(
+    "repo",
+    [
+        "ext::sh -c whoami",
+        "git@github.com:jonasthim/svtplay-arr",
+        "ssh://git@github.com/x/y",
+        "http://example.invalid/x",
+    ],
+)
+def test_refuses_a_repo_url_git_could_execute(harness: Harness, repo: str):
+    proc = harness.run(expect=1, SVTPLAY_ARR_REPO=repo)
+    assert "--repo" in proc.stderr
+    assert harness.releases == []
+
+
+@pytest.mark.parametrize(
+    "flag,value",
+    [
+        ("SVTPLAY_ARR_HEALTH_TIMEOUT", "abc"),
+        ("SVTPLAY_ARR_HEALTH_INTERVAL", "1.5"),
+        ("SVTPLAY_ARR_KEEP_RELEASES", "-1"),
+    ],
+)
+def test_refuses_a_non_numeric_setting_before_doing_anything(
+    harness: Harness, flag: str, value: str
+):
+    """A bad timeout would otherwise trip `set -u` inside wait_for_health.
+
+    That reads as "the service did not answer", and rolls back an upgrade that
+    was fine.
+    """
+    proc = harness.run(expect=1, **{flag: value})
+    assert "is not a whole number" in proc.stderr
+    assert harness.releases == []
+    assert not harness.config.exists()
+
+
+def test_a_healthy_upgrade_is_not_rolled_back_by_a_bad_timeout(harness: Harness):
+    harness.run()
+    first = harness.releases[0]
+    harness.release_upstream("0.2.0")
+
+    proc = harness.run(expect=1, SVTPLAY_ARR_HEALTH_TIMEOUT="abc")
+
+    assert "is not a whole number" in proc.stderr
+    assert "Rolling back" not in proc.stdout
+    assert harness.current.resolve() == first.resolve()
+
+
+# --------------------------------------------------------------------------
+# Which ref a fresh install lands on
+# --------------------------------------------------------------------------
+
+
+def test_the_default_target_is_the_newest_release_tag(harness: Harness):
+    harness.release_upstream("0.2.0")
+    harness.commit_upstream("0.3.0")  # untagged work on main
+
+    proc = harness.run()
+
+    assert "newest release tag: v0.2.0" in proc.stdout
+    assert "installed: 0.2.0" in proc.stdout
+
+
+def test_an_untagged_repository_is_refused_rather_than_installed_from_main(
+    harness: Harness,
+):
+    """A fresh install has no rollback, so it must not land on an in-flight main."""
+    harness.git("tag", "-d", "v0.1.0")
+
+    proc = harness.run(expect=1)
+
+    assert "no vN.N.N tag found" in proc.stderr
+    assert "--ref main" in proc.stderr
+    assert harness.releases == []
+
+
+def test_ref_main_is_still_available_deliberately(harness: Harness):
+    harness.commit_upstream("0.3.0")
+    proc = harness.run("--ref", "main")
+    assert "installed: 0.3.0" in proc.stdout
 
 
 # --------------------------------------------------------------------------

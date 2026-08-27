@@ -57,7 +57,11 @@ SCRIPT_VERSION="1.0.0"
 : "${SVTPLAY_ARR_UNIT_DIR:=/etc/systemd/system}"
 : "${SVTPLAY_ARR_BIN_DIR:=/usr/local/bin}"
 : "${SVTPLAY_ARR_REPO:=https://github.com/jonasthim/svtplay-arr}"
-: "${SVTPLAY_ARR_REF:=main}"
+# Empty means "the newest vN.N.N tag in the repository". A fresh install has
+# no previous release to fall back to, so it must not be pointed at whatever
+# the development branch happens to be at that instant. --ref main is still
+# there for anyone who wants it.
+: "${SVTPLAY_ARR_REF:=}"
 : "${SVTPLAY_ARR_USER:=svtplay}"
 : "${SVTPLAY_ARR_GROUP:=media}"
 : "${SVTPLAY_ARR_UNIT_NAME:=svtplay-arr.service}"
@@ -97,6 +101,13 @@ readonly LISTEN_PORT="9800"
 # below. See install_uv() for why this is not `curl | sh`.
 readonly UV_VERSION="0.12.6"
 
+# The one seam in the download path: it lets a test hold a locally built
+# artifact to a checksum it can know, so the success path is executed rather
+# than only read. Empty in production, where the pinned table below is the
+# only source of truth. It grants nothing that SVTPLAY_ARR_UV -- "use this uv
+# instead" -- does not already grant.
+: "${SVTPLAY_ARR_UV_SHA256:=}"
+
 uv_expected_sha256() {
     case "$1" in
     x86_64-unknown-linux-gnu)
@@ -127,6 +138,10 @@ UNIT_PATH="${SVTPLAY_ARR_UNIT_DIR}/${SVTPLAY_ARR_UNIT_NAME}"
 UNIT_BACKUP="${SVTPLAY_ARR_PREFIX}/.${SVTPLAY_ARR_UNIT_NAME}.previous"
 CONFIG_FILE="${SVTPLAY_ARR_CONFIG_DIR}/config.yaml"
 MAPPINGS_FILE="${SVTPLAY_ARR_CONFIG_DIR}/mappings.yaml"
+# Which release was last started AND seen answering /health. `current` alone
+# cannot say that: a run killed between the symlink flip and the restart
+# leaves `current` naming a release the running process has never been.
+ACTIVE_MARKER="${SVTPLAY_ARR_PREFIX}/.active-release"
 
 # A release directory is only trusted once this file is in it. An interrupted
 # build leaves the directory without it, and the next run discards and
@@ -146,6 +161,7 @@ UNIT_BACKED_UP=false
 ACTIVATED=false      # the symlink flip happened
 CONFIG_HASH_BEFORE=""
 MAPPINGS_HASH_BEFORE=""
+CONFIG_SEEDED=false  # this run wrote config.yaml from the example
 PRE_HEALTH_STATUS=""
 TMP_DIR=""
 
@@ -217,10 +233,16 @@ installation; which one it is is detected, not chosen.
 Options:
   --dry-run             Print every action and change nothing. Does not
                         need root.
-  --ref REF             Branch, tag or commit to install (default: ${SVTPLAY_ARR_REF}).
-  --repo URL            Source repository (default: ${SVTPLAY_ARR_REPO}).
-  --prefix DIR          Install root (default: ${SVTPLAY_ARR_PREFIX}).
+  --ref REF             Branch, tag or commit to install. Default: the
+                        newest vN.N.N tag in the repository, so a fresh
+                        install never lands on an in-flight main.
+  --repo URL            Source repository, https:// or file:/// only
+                        (default: ${SVTPLAY_ARR_REPO}).
+  --prefix DIR          Install root (default: ${SVTPLAY_ARR_PREFIX}). Must be a
+                        directory of its own: this script chowns what is
+                        under it to ${SVTPLAY_ARR_USER}.
   --config-dir DIR      Configuration directory (default: ${SVTPLAY_ARR_CONFIG_DIR}).
+                        Same rule: a directory of its own.
   --unit-dir DIR        systemd unit directory (default: ${SVTPLAY_ARR_UNIT_DIR}).
   --health-timeout N    Seconds to wait for /health (default: ${SVTPLAY_ARR_HEALTH_TIMEOUT}).
   --keep N              Old releases to keep (default: ${SVTPLAY_ARR_KEEP_RELEASES}).
@@ -228,8 +250,148 @@ Options:
   --version             Print the script version.
 
 config.yaml and mappings.yaml are written only when they do not exist. An
-upgrade cannot modify them; the script verifies that it did not.
+upgrade cannot modify them; the script verifies that it did not. Their
+directory's mode and ownership ARE reasserted on every run.
 USAGE
+}
+
+# ---------------------------------------------------------------------------
+# Argument validation
+#
+# --prefix and --config-dir become the target of a recursive chown and a
+# chmod that run as root. `--prefix /opt` is a plausible reading of "install
+# root" and would hand every other application under /opt to the service
+# account; `--config-dir /etc` would take sudoers, the sshd host keys and
+# /etc/ssl with it, and both would exit 0 having said nothing. That is not
+# abuse, it is an ordinary misreading of a plain options table -- so the
+# values are checked before anything runs.
+# ---------------------------------------------------------------------------
+
+# Never a valid target, whatever the flag says.
+readonly RESERVED_PATHS=(
+    / /bin /boot /dev /etc /etc/systemd /home /lib /lib32 /lib64 /libx32
+    /media /mnt /opt /proc /root /run /sbin /srv /sys /tmp /usr /usr/bin
+    /usr/lib /usr/local /usr/local/bin /usr/sbin /usr/share /var /var/lib
+    /var/log /var/run /var/tmp
+)
+
+# Absolute, no "." or ".." components, no trailing or doubled slashes.
+# Prints the cleaned path, or returns 1 (never exits -- the caller is often
+# an assignment, and an exit inside $() would only kill the subshell).
+normalize_path() {
+    local p=$1
+    if [[ $p != /* ]]; then
+        return 1
+    fi
+    while [[ $p == *//* ]]; do
+        p=${p//\/\//\/}
+    done
+    while [[ ${#p} -gt 1 && $p == */ ]]; do
+        p=${p%/}
+    done
+    case $p in
+    */../* | */.. | */./* | */.) return 1 ;;
+    esac
+    printf '%s' "$p"
+}
+
+is_reserved_path() {
+    local candidate=$1 reserved
+    for reserved in "${RESERVED_PATHS[@]}"; do
+        if [[ $candidate == "$reserved" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+dir_is_empty() {
+    local entries
+    entries=$(find "$1" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null || true)
+    [[ -z $entries ]]
+}
+
+# Result of assert_safe_target, so that a failure can `die` in the caller's
+# shell rather than in a command substitution's subshell.
+NORMALIZED_PATH=""
+
+assert_safe_target() {
+    local flag=$1 raw=$2 suggestion=$3 normalized
+    normalized=$(normalize_path "$raw") ||
+        die "${flag}: ${raw} must be an absolute path with no '.' or '..' components"
+    if is_reserved_path "$normalized"; then
+        err "${flag}: refusing ${normalized}."
+        err ""
+        err "This script chmods and recursively chowns the directories it is given"
+        err "to ${SVTPLAY_ARR_USER}:${SVTPLAY_ARR_GROUP}, as root. Pointing it at a shared system"
+        err "directory would hand that directory, and everything already under it,"
+        err "to the service account."
+        err ""
+        die "give it one of its own: ${flag} ${suggestion}"
+    fi
+    NORMALIZED_PATH=$normalized
+}
+
+# Refuse to adopt a directory that already holds someone else's files.
+assert_target_is_ours() {
+    local flag=$1 path=$2 kind=$3
+    if [[ ! -e $path ]]; then
+        return 0
+    fi
+    if [[ ! -d $path ]]; then
+        die "${flag}: ${path} exists and is not a directory"
+    fi
+    if dir_is_empty "$path"; then
+        return 0
+    fi
+    case $kind in
+    prefix)
+        # releases/ and current are this layout; .venv is the hand-built one
+        # that an upgrade migrates.
+        if [[ -d ${path}/releases || -L ${path}/current || -d ${path}/.venv ]]; then
+            return 0
+        fi
+        ;;
+    config)
+        if [[ -f ${path}/config.yaml || -f ${path}/mappings.yaml ]]; then
+            return 0
+        fi
+        ;;
+    esac
+    err "${flag}: ${path} exists, is not empty, and does not look like an"
+    err "svtplay-arr ${kind} directory. Refusing to take it over -- this script"
+    err "chmods and recursively chowns that directory as root."
+    err "It contains: $(find "$path" -mindepth 1 -maxdepth 1 -printf '%f ' 2>/dev/null | head -c 160)"
+    die "point ${flag} somewhere of its own, or clear ${path} first"
+}
+
+# git resolves a remote through helper programs, and some of those transports
+# execute a command taken from the URL itself (ext::sh -c ...). The scheme is
+# therefore restricted here rather than handed to `git clone` as typed.
+validate_repo() {
+    case $SVTPLAY_ARR_REPO in
+    https://?*) ;;
+    file:///?*) ;;
+    *)
+        err "--repo: only https:// and file:/// URLs are accepted."
+        err "git reads some remote URLs as commands to run (ext::sh -c ...), so"
+        err "the scheme is checked rather than passed straight through."
+        die "refusing ${SVTPLAY_ARR_REPO}"
+        ;;
+    esac
+    if [[ $SVTPLAY_ARR_REPO == *"::"* ]]; then
+        die "--repo: ${SVTPLAY_ARR_REPO} contains '::', which git reads as a remote helper"
+    fi
+}
+
+# A non-numeric timeout would otherwise trip `set -u` deep inside
+# wait_for_health, which reads as "the service did not answer" -- and would
+# roll back a perfectly healthy upgrade.
+validate_number() {
+    local flag=$1 value=$2
+    if [[ ! $value =~ ^[0-9]+$ ]]; then
+        die "${flag}: '${value}' is not a whole number"
+    fi
 }
 
 parse_args() {
@@ -284,6 +446,21 @@ parse_args() {
         shift
     done
 
+    validate_repo
+    validate_number --health-timeout "$SVTPLAY_ARR_HEALTH_TIMEOUT"
+    validate_number --health-interval "$SVTPLAY_ARR_HEALTH_INTERVAL"
+    validate_number --keep "$SVTPLAY_ARR_KEEP_RELEASES"
+
+    assert_safe_target --prefix "$SVTPLAY_ARR_PREFIX" /opt/svtplay-arr
+    SVTPLAY_ARR_PREFIX=$NORMALIZED_PATH
+    assert_safe_target --config-dir "$SVTPLAY_ARR_CONFIG_DIR" /etc/svtplay-arr
+    SVTPLAY_ARR_CONFIG_DIR=$NORMALIZED_PATH
+    assert_safe_target --unit-dir "$SVTPLAY_ARR_UNIT_DIR" /etc/systemd/system
+    SVTPLAY_ARR_UNIT_DIR=$NORMALIZED_PATH
+
+    assert_target_is_ours --prefix "$SVTPLAY_ARR_PREFIX" prefix
+    assert_target_is_ours --config-dir "$SVTPLAY_ARR_CONFIG_DIR" config
+
     # --prefix/--config-dir/--unit-dir land after the derived paths were
     # computed from the defaults, so recompute.
     RELEASES_DIR="${SVTPLAY_ARR_PREFIX}/releases"
@@ -294,6 +471,7 @@ parse_args() {
     UNIT_BACKUP="${SVTPLAY_ARR_PREFIX}/.${SVTPLAY_ARR_UNIT_NAME}.previous"
     CONFIG_FILE="${SVTPLAY_ARR_CONFIG_DIR}/config.yaml"
     MAPPINGS_FILE="${SVTPLAY_ARR_CONFIG_DIR}/mappings.yaml"
+    ACTIVE_MARKER="${SVTPLAY_ARR_PREFIX}/.active-release"
 }
 
 # ---------------------------------------------------------------------------
@@ -405,8 +583,12 @@ uv_target() {
 install_uv() {
     local target url sha tarball actual
     target=$(uv_target) || die "no uv build for $(uname -m); install uv yourself and re-run"
-    sha=$(uv_expected_sha256 "$target") ||
-        die "no pinned checksum for uv target ${target}; install uv yourself and re-run"
+    if [[ -n $SVTPLAY_ARR_UV_SHA256 ]]; then
+        sha=$SVTPLAY_ARR_UV_SHA256
+    else
+        sha=$(uv_expected_sha256 "$target") ||
+            die "no pinned checksum for uv target ${target}; install uv yourself and re-run"
+    fi
     url="https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-${target}.tar.gz"
 
     log "uv is not installed; fetching uv ${UV_VERSION} for ${target}"
@@ -519,6 +701,7 @@ seed_config_file() {
     fi
     log "writing ${dest} from $(basename "$src")"
     run install -m 0640 "$src" "$dest"
+    CONFIG_SEEDED=true
 }
 
 seed_config() {
@@ -581,6 +764,20 @@ assert_config_untouched() {
 # Releases
 # ---------------------------------------------------------------------------
 
+# A fresh install has nothing to roll back to, so the default target is the
+# newest release tag rather than the tip of the development branch: a bad
+# main should not be the first thing a stranger meets. Upgrades follow the
+# same rule, which keeps "run the same command again" true.
+latest_release_tag() {
+    local line
+    line=$("$SVTPLAY_ARR_GIT" ls-remote --tags --refs --sort=-v:refname \
+        "$SVTPLAY_ARR_REPO" 'v[0-9]*' 2>/dev/null | head -n1 || true)
+    if [[ -z $line ]]; then
+        return 1
+    fi
+    printf '%s' "${line##*refs/tags/}"
+}
+
 resolve_ref() {
     local line
     line=$("$SVTPLAY_ARR_GIT" ls-remote "$SVTPLAY_ARR_REPO" "$SVTPLAY_ARR_REF" 2>/dev/null |
@@ -642,6 +839,22 @@ fetch_release() {
         return 0
     fi
     if [[ -e $dest ]]; then
+        # prune_releases makes this same comparison before it removes
+        # anything; without it here, a missing stamp on the ACTIVE release
+        # would delete the tree the running service was started from. The
+        # process survives on open file handles, so the script would go on to
+        # report the old version as still running while releases/ was empty
+        # and `current` dangled -- and the service would be gone at the next
+        # restart, or the next reboot.
+        if [[ -L $CURRENT_LINK ]] &&
+            [[ $(readlink -f "$CURRENT_LINK" 2>/dev/null) == "$(readlink -f "$dest" 2>/dev/null)" ]]; then
+            err "${dest} is the release the service is running from, and it has no"
+            err "${RELEASE_STAMP} -- so this script cannot tell whether it is complete."
+            err "Removing it would take the running service with it."
+            err ""
+            err "Install a different ref instead (--ref ...), or stop the service and"
+            die "remove ${dest} by hand once you are sure of what is in it"
+        fi
         log "discarding an incomplete ${dest} left by an earlier run"
         run rm -rf "$dest"
     fi
@@ -680,6 +893,21 @@ build_release() {
         fi
         die "nothing was installed"
     fi
+}
+
+# Scoped to the directories this script itself created, never the prefix as a
+# whole. Validation already refuses a shared prefix; this refuses to make that
+# check the only thing standing between a typo and a recursive root chown of
+# somebody else's application directory. The prefix itself stays root-owned
+# and 0755, which is all the service needs to traverse it.
+set_ownership() {
+    step "Ownership"
+    local -a targets=("$RELEASES_DIR" "$PYTHON_DIR")
+    if [[ -d $UV_CACHE_DIR ]] || $DRY_RUN; then
+        targets+=("$UV_CACHE_DIR")
+    fi
+    log "${SVTPLAY_ARR_USER}:${SVTPLAY_ARR_GROUP} on ${targets[*]}"
+    run "$SVTPLAY_ARR_CHOWN" -R "${SVTPLAY_ARR_USER}:${SVTPLAY_ARR_GROUP}" "${targets[@]}"
 }
 
 activate_release() {
@@ -842,7 +1070,23 @@ report_health() {
     log "/health: ${body}"
     log "status: ${status:-unknown}"
 
-    if [[ $same_fs == "false" ]]; then
+    if [[ $same_fs == "false" ]] && $CONFIG_SEEDED; then
+        # This run wrote config.yaml from the example, so incomplete_dir and
+        # completed_dir are still /downloads/... and do not exist on this host
+        # yet. same_filesystem is false for every fresh install, without
+        # exception -- and a warning that fires every single time is a warning
+        # nobody reads by the third install. The one below has to still mean
+        # something when it fires, so it does not fire here.
+        log ""
+        log "same_filesystem is false, which is expected at this point: this run"
+        log "wrote ${CONFIG_FILE} from the example, and the example's"
+        log "incomplete_dir and completed_dir do not exist on this host yet."
+        log "Setting them is the next step below."
+        log ""
+        log "Check /health again once you have set them and restarted. If it is"
+        log "still false THEN it is the serious one, and it means Sonarr can import"
+        log "a half-copied file as a permanent, corrupt library entry."
+    elif [[ $same_fs == "false" ]]; then
         warn ""
         warn "same_filesystem is FALSE. incomplete_dir and completed_dir are not"
         warn "on one filesystem, so publishing a finished download is no longer an"
@@ -859,6 +1103,30 @@ report_health() {
     if [[ $(json_field "$body" mappings_degraded) == "true" ]]; then
         warn "mappings_degraded is true: mappings.yaml failed to load and the last good table is being served."
     fi
+}
+
+# `current` says which release is meant to be running. This says which one
+# actually got started and answered. They differ exactly when a run was
+# interrupted between the symlink flip and the restart -- in which case the
+# next run has work to do, and must not report itself already up to date.
+record_active_release() {
+    local id=$1
+    if $DRY_RUN; then
+        printf '    would: record %s as the running release in %s\n' "$id" "$ACTIVE_MARKER"
+        return 0
+    fi
+    printf '%s\n' "$id" >"${ACTIVE_MARKER}.new"
+    mv -f "${ACTIVE_MARKER}.new" "$ACTIVE_MARKER"
+}
+
+recorded_active_release() {
+    if [[ -f $ACTIVE_MARKER ]]; then
+        head -n1 "$ACTIVE_MARKER"
+    fi
+}
+
+service_is_active() {
+    "$SVTPLAY_ARR_SYSTEMCTL" is-active --quiet "$SVTPLAY_ARR_UNIT_NAME" >/dev/null 2>&1
 }
 
 # ---------------------------------------------------------------------------
@@ -891,6 +1159,11 @@ rollback() {
 
     local body
     if body=$(wait_for_health); then
+        if [[ -n $PREVIOUS_TARGET ]]; then
+            record_active_release "$(basename "$PREVIOUS_TARGET")"
+        else
+            rm -f "$ACTIVE_MARKER"
+        fi
         step "Rollback complete"
         err "The upgrade failed and was rolled back."
         log "running: ${PREVIOUS_DESC}"
@@ -1007,9 +1280,21 @@ main() {
     PHASE="creating directories"
     ensure_directories
 
-    PHASE="resolving ${SVTPLAY_ARR_REF}"
+    PHASE="resolving the release to install"
     step "Source"
     local sha id release_dir
+    # Resolved out here, not inside resolve_ref, because a value set in a
+    # command substitution never comes back.
+    if [[ -z $SVTPLAY_ARR_REF ]]; then
+        SVTPLAY_ARR_REF=$(latest_release_tag) || {
+            err "no vN.N.N tag found in ${SVTPLAY_ARR_REPO}."
+            err "That is what a fresh install targets by default, so that it never"
+            err "lands on whatever the development branch happens to be."
+            die "pass --ref main to install the development branch deliberately"
+        }
+        log "newest release tag: ${SVTPLAY_ARR_REF}"
+    fi
+    PHASE="resolving ${SVTPLAY_ARR_REF}"
     sha=$(resolve_ref) ||
         die "could not resolve ${SVTPLAY_ARR_REF} in ${SVTPLAY_ARR_REPO}; nothing has changed"
     id=$(release_id "$sha")
@@ -1023,10 +1308,17 @@ main() {
     if [[ -f $UNIT_PATH ]] && [[ $(render_unit) == "$(cat "$UNIT_PATH")" ]]; then
         unit_is_current=true
     fi
+    # "Already up to date" has to mean the service is running this release,
+    # not merely that a symlink names it. A run killed between the flip and
+    # the restart leaves `current` pointing at a release the running process
+    # has never been -- and saying "nothing to do" there leaves the host on
+    # the old code indefinitely, with every later run agreeing.
     if [[ -f "${release_dir}/${RELEASE_STAMP}" ]] &&
         [[ -L $CURRENT_LINK ]] &&
         [[ $(readlink -f "$CURRENT_LINK") == "$(readlink -f "$release_dir")" ]] &&
-        $unit_is_current; then
+        $unit_is_current &&
+        [[ $(recorded_active_release) == "$id" ]] &&
+        service_is_active; then
         step "Already up to date"
         log "${PREVIOUS_DESC} is installed and active; there is nothing to do"
         PHASE="checking health"
@@ -1055,7 +1347,7 @@ main() {
     fi
 
     PHASE="setting ownership"
-    run "$SVTPLAY_ARR_CHOWN" -R "${SVTPLAY_ARR_USER}:${SVTPLAY_ARR_GROUP}" "$SVTPLAY_ARR_PREFIX"
+    set_ownership
 
     PHASE="installing the systemd unit"
     install_unit
@@ -1073,6 +1365,7 @@ main() {
     if $DRY_RUN; then
         printf '    would: poll %s for up to %ss and report what it says\n' \
             "$SVTPLAY_ARR_HEALTH_URL" "$SVTPLAY_ARR_HEALTH_TIMEOUT"
+        record_active_release "$id"
     else
         local body
         if body=$(wait_for_health); then
@@ -1086,6 +1379,8 @@ main() {
             if [[ $MODE == upgrade && $status != "ok" && $PRE_HEALTH_STATUS == "ok" ]]; then
                 rollback "the service came back as '${status}' after the upgrade; it was 'ok' before"
             fi
+            # Only now is this release known to be the one actually serving.
+            record_active_release "$id"
         else
             if [[ $MODE == upgrade ]]; then
                 rollback "${SVTPLAY_ARR_HEALTH_URL} did not answer within ${SVTPLAY_ARR_HEALTH_TIMEOUT}s after the upgrade"
