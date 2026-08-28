@@ -13,6 +13,13 @@ from fastapi.testclient import TestClient
 from svtplay_arr.app import create_app
 from svtplay_arr.config import ConfigError, Settings
 from svtplay_arr.models import Release, SvtEpisode
+from svtplay_arr.sonarr import (
+    REASON_MESSAGES,
+    REASON_REFUSED,
+    REASON_UNAUTHORIZED,
+    SonarrApiError,
+    SonarrStatus,
+)
 from svtplay_arr.store import JobStoreError
 
 
@@ -1106,8 +1113,15 @@ def test_the_activity_view_does_not_change_healths_contract(tmp_path: Path):
     with TestClient(create_app(_settings(tmp_path))) as c:
         body = c.get("/health").json()
 
+    # This set is the whole contract, so every change to it is a deliberate
+    # one made here rather than discovered downstream. `sonarr` was added on
+    # 2026-08-28 alongside the background Sonarr check, on the same terms
+    # `svt` was: purely additive, nothing above it removed, renamed or
+    # retyped, and the two nested blocks are the only place any new field
+    # goes.
     assert set(body) == {
         "status", "same_filesystem", "worker_alive", "active_jobs", "svt",
+        "sonarr",
         "mappings", "mappings_ever_loaded", "mappings_degraded",
     }
 
@@ -1296,3 +1310,303 @@ def test_health_does_not_read_the_store_on_the_event_loop(tmp_path: Path):
     assert resp.status_code == 200
     assert where, "/health never read the store"
     assert set(where) == {"off the loop"}, where
+
+
+# --- The Sonarr check reaches /health and the status strip -----------------
+#
+# The same gap the SVT canary closed, on the dependency that matters more:
+# without Sonarr's air dates the resolver cannot resolve anything at all, so
+# a wrong URL or a rotated key means every search and every RSS poll
+# silently returns nothing -- while every field on /health stayed green,
+# because nothing in this service had ever asked Sonarr a question. These
+# tests are about the wiring: one computation behind both surfaces, and a
+# check whose own death is visible.
+
+
+def _sonarr_returns(monkeypatch, outcome) -> list[int]:
+    """Point the app's real SonarrClient.status at a canned answer.
+
+    Patched on the class `create_app` actually constructs, so the check is
+    exercised through the same client the resolver uses rather than through
+    a stand-in wired up for the test. Returns a list appended to on each
+    call, so "it asked Sonarr exactly once per round" is observable.
+    """
+    calls: list[int] = []
+
+    async def _status(self):
+        calls.append(1)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr("svtplay_arr.sonarr.SonarrClient.status", _status)
+    return calls
+
+
+def _run_a_sonarr_round(app) -> None:
+    """One round of the app's own Sonarr check, synchronously.
+
+    The app's real check -- the object `/health` reports on -- not a second
+    instance built for the test, which is the only way these tests say
+    anything about the wiring.
+    """
+    asyncio.run(app.state.sonarr_canary.run_once())
+
+
+def test_health_carries_the_sonarr_check_and_never_calls_it_healthy_unchecked(
+    tmp_path: Path,
+):
+    # A fresh process has proved nothing about Sonarr. Reporting that as
+    # "ok" would rebuild the exact defect this closes, one level up.
+    with TestClient(create_app(_settings(tmp_path))) as c:
+        sonarr = c.get("/health").json()["sonarr"]
+    assert sonarr["state"] == "unknown"
+    assert sonarr["state"] != "ok"
+    assert sonarr["last_checked"] is None
+    assert sonarr["last_success"] is None
+    assert sonarr["series_count"] is None
+    assert sonarr["alive"] is True
+
+
+def test_an_unchecked_sonarr_does_not_cry_wolf(tmp_path: Path):
+    # Not healthy, and not a degrade for the first interval after a restart
+    # either -- a check that is red on every boot is one operators learn to
+    # read past, which is the failure mode this project has shipped before.
+    with TestClient(create_app(_settings(tmp_path))) as c:
+        body = c.get("/health").json()
+    assert body["sonarr"]["degraded"] is False
+    assert body["status"] == "ok"
+
+
+def test_a_working_sonarr_reports_its_version_and_series_count(
+    tmp_path: Path, monkeypatch,
+):
+    calls = _sonarr_returns(
+        monkeypatch, SonarrStatus(version="4.0.10.2544", series_count=42)
+    )
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as c:
+        _run_a_sonarr_round(app)
+        body = c.get("/health").json()
+        page = c.get("/config").text
+
+    assert calls == [1]
+    assert body["sonarr"]["state"] == "ok"
+    assert body["sonarr"]["version"] == "4.0.10.2544"
+    assert body["sonarr"]["series_count"] == 42
+    assert body["status"] == "ok"
+    # The count on the page is the count /health computed, not a second
+    # tally taken while rendering.
+    assert "Sonarr: ok" in page
+    assert "42 series" in page
+
+
+def test_a_sonarr_that_is_down_turns_the_service_light_red(
+    tmp_path: Path, monkeypatch,
+):
+    # The decision this feature turns on. Unlike one failing mapping row,
+    # Sonarr has no partial failure: nothing resolves, nothing is grabbed,
+    # and no search returns anything.
+    _sonarr_returns(
+        monkeypatch,
+        SonarrApiError(REASON_MESSAGES[REASON_REFUSED], reason=REASON_REFUSED),
+    )
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as c:
+        _run_a_sonarr_round(app)
+        body = c.get("/health").json()
+        page = c.get("/config").text
+
+    assert body["sonarr"]["state"] == "sonarr"
+    assert body["sonarr"]["degraded"] is True
+    assert body["sonarr"]["last_error_reason"] == REASON_REFUSED
+    assert body["status"] == "degraded"
+    assert "Sonarr: FAILING" in page
+    assert 'class="status-chip error"' in page
+
+
+def test_the_config_page_and_health_agree_about_sonarr(
+    tmp_path: Path, monkeypatch,
+):
+    # One computation, two surfaces. Two places deriving one fact and
+    # drifting apart is this codebase's most common defect class, and a
+    # strip that disagreed with /health would be worse than no strip.
+    _sonarr_returns(
+        monkeypatch,
+        SonarrApiError(
+            REASON_MESSAGES[REASON_UNAUTHORIZED], reason=REASON_UNAUTHORIZED
+        ),
+    )
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as c:
+        _run_a_sonarr_round(app)
+        body = c.get("/health").json()
+        page = c.get("/config").text
+
+    assert body["status"] == "degraded"
+    assert "Service: degraded" in page
+    assert "Sonarr: FAILING" in page
+    # The sentence the page shows is the one /health carries, not a second
+    # reading of the same failure.
+    assert body["sonarr"]["last_error"].split(".")[0] in page
+
+
+def test_health_flags_a_dead_sonarr_check_task(tmp_path: Path, monkeypatch):
+    # Same precedent as worker_alive and the SVT canary: a background task
+    # that silently stopped doing its job must not look like one that is
+    # doing it, or this check becomes a second silence rather than the end
+    # of the first.
+    async def _dies_immediately(self):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(
+        "svtplay_arr.canary.SonarrCanary.run_forever", _dies_immediately
+    )
+
+    with TestClient(create_app(_settings(tmp_path))) as c:
+        deadline = time.monotonic() + 2.0
+        body = c.get("/health").json()
+        while body["sonarr"]["alive"] and time.monotonic() < deadline:
+            time.sleep(0.02)
+            body = c.get("/health").json()
+
+        assert body["sonarr"]["alive"] is False
+        assert body["sonarr"]["degraded"] is True
+        assert body["status"] == "degraded"
+
+        page = c.get("/config").text
+        assert "Sonarr: NOT BEING CHECKED" in page
+        assert 'class="status-chip error"' in page
+
+
+def test_health_never_500s_on_a_broken_sonarr_check(tmp_path: Path, monkeypatch):
+    # /health is monitoring infrastructure and must not be able to fail the
+    # thing it monitors.
+    def _boom(self):
+        raise RuntimeError("the Sonarr check's state is on fire")
+
+    monkeypatch.setattr("svtplay_arr.canary.SonarrCanary.status", _boom)
+
+    with TestClient(create_app(_settings(tmp_path))) as c:
+        resp = c.get("/health")
+        assert resp.status_code == 200
+        assert resp.json()["sonarr"]["state"] == "unavailable"
+        assert resp.json()["sonarr"]["degraded"] is True
+        assert resp.json()["status"] == "degraded"
+        assert c.get("/config").status_code == 200
+
+
+def test_a_sonarr_round_that_raises_leaves_the_service_healthy(
+    tmp_path: Path, monkeypatch,
+):
+    async def _boom(self):
+        raise RuntimeError("the Sonarr check is on fire")
+
+    monkeypatch.setattr("svtplay_arr.canary.SonarrCanary.run_once", _boom)
+
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as c:
+        asyncio.run(app.state.sonarr_canary.run_once_guarded())
+        body = c.get("/health").json()
+        assert body["worker_alive"] is True
+        assert body["sonarr"]["alive"] is True
+        assert c.get("/config").status_code == 200
+
+
+def test_the_sonarr_check_never_writes_anything(tmp_path: Path, monkeypatch):
+    # Read-only observation: nothing on disk may move because it ran, and
+    # the job store may not gain a row.
+    _sonarr_returns(
+        monkeypatch, SonarrStatus(version="4.0.10.2544", series_count=3)
+    )
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as c:
+        before = _tree_digest(tmp_path)
+        _run_a_sonarr_round(app)
+        _run_a_sonarr_round(app)
+        assert _tree_digest(tmp_path) == before
+        assert c.get("/health").json()["active_jobs"] == 0
+        assert app.state.job_store.all_active() == []
+
+
+def test_shutdown_cancels_the_sonarr_check_task(tmp_path: Path):
+    # Same lifetime as the worker and the SVT canary, and for the same
+    # concrete reason: it drives the shared httpx client, so it has to be
+    # stopped before the lifespan closes it.
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as c:
+        assert c.get("/health").json()["sonarr"]["alive"] is True
+    assert app.state.sonarr_canary_task.done() is True
+
+
+def test_health_never_exposes_the_api_key_through_the_sonarr_check(
+    tmp_path: Path, monkeypatch,
+):
+    # Every path: unchecked, working, and each classified failure. The key
+    # is what this check authenticates with, so it is the one field with a
+    # real route onto the endpoint external monitoring scrapes.
+    s = _settings(tmp_path)
+    with TestClient(create_app(s)) as c:
+        assert s.sonarr_api_key not in c.get("/health").text
+
+    for reason in REASON_MESSAGES:
+        _sonarr_returns(
+            monkeypatch,
+            SonarrApiError(REASON_MESSAGES[reason], reason=reason),
+        )
+        app = create_app(s)
+        with TestClient(app) as c:
+            _run_a_sonarr_round(app)
+            assert s.sonarr_api_key not in c.get("/health").text, reason
+            assert s.sonarr_api_key not in c.get("/config").text, reason
+
+
+def test_the_status_strip_never_exposes_the_api_key_through_the_check(
+    tmp_path: Path, monkeypatch,
+):
+    # An exception carrying the key in its own message is the realistic way
+    # this breaks: the check's catch-all must report in its own words, not
+    # in the exception's.
+    s = _settings(tmp_path)
+    _sonarr_returns(
+        monkeypatch, RuntimeError(f"X-Api-Key: {s.sonarr_api_key}")
+    )
+    app = create_app(s)
+    with TestClient(app) as c:
+        _run_a_sonarr_round(app)
+        assert s.sonarr_api_key not in c.get("/health").text
+        assert s.sonarr_api_key not in c.get("/config").text
+        assert c.get("/health").json()["sonarr"]["state"] == "sonarr"
+
+
+def test_the_settings_view_can_test_the_apps_own_sonarr_credentials(
+    tmp_path: Path, monkeypatch,
+):
+    # The whole seam, end to end: the Test connection button reaches a real
+    # SonarrClient built from the values that were posted. Every other test
+    # of the control hands the router a fake probe, so this is the one that
+    # would fail if `sonarr_probe` were wired to nothing, or to the client
+    # bound to the booted key rather than to what was submitted.
+    seen: list[str] = []
+
+    async def _status(self):
+        seen.append(self._headers["X-Api-Key"])
+        return SonarrStatus(version="4.0.10.2544", series_count=7)
+
+    monkeypatch.setattr("svtplay_arr.sonarr.SonarrClient.status", _status)
+
+    s = _settings(tmp_path)
+    with TestClient(create_app(s)) as c:
+        r = c.post(
+            "/config/settings/test",
+            data={
+                "sonarr_url": "http://typed.sonarr:8989",
+                "sonarr_api_key": "TYPED-NOT-YET-SAVED",
+            },
+        )
+    assert r.status_code == 200
+    assert seen == ["TYPED-NOT-YET-SAVED"]
+    assert "7 series" in r.text
+    # ...and the key the service booted with is not what was tested, which
+    # is the point: the operator is asking about the value in the form.
+    assert s.sonarr_api_key not in seen

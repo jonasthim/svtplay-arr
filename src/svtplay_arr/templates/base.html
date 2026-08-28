@@ -310,6 +310,25 @@
       color: var(--accent); }
     .secret-toggle:hover { text-decoration: underline; filter: none; }
 
+    /* ---- Test connection --------------------------------------------
+       A form row like any other, so the button lines up under the API key
+       field's control column rather than starting a new visual section.
+       Its result reuses the .error/.notice/.warn message styles -- already
+       contrast-checked and already carrying a distinguishing glyph -- at
+       row rather than page scale, exactly as the mapping Check result and
+       the job rows do. */
+    .sonarr-test .control > .help { margin-top: .4rem; }
+    .sonarr-test-result { margin: .5rem 0 0; padding: .45rem .6rem;
+                          font-size: .8125rem; }
+    /* The settings form's default submit button: present only so that
+       Enter in a field still saves rather than running the Test button
+       above it (see settings.html). Off-screen rather than
+       `display: none`, which browsers are less consistent about honouring
+       for implicit submission. */
+    .default-submit { position: absolute; width: 1px; height: 1px;
+                      padding: 0; margin: -1px; border: 0; overflow: hidden;
+                      clip-path: inset(50%); white-space: nowrap; }
+
     /* ---- Mappings table ---------------------------------------------
        Read as a Sonarr list: a quiet header row, subtle separation
        between rows, a hover state, comfortable padding. */
@@ -573,7 +592,79 @@
       {%- endif %}
     </span>
     {%- endif %}
+    {#- The other fact about the world outside this process, and the one
+        with no partial version. `health.sonarr` is /health's own computed
+        verdict (see canary.SonarrCanary and app.compute_health); this
+        renders it and derives none of it. Guarded the same way the SVT chip
+        is, so a status_provider that predates this check renders the rest
+        of the strip rather than failing.
+
+        Nothing here can carry the API key: `last_error` is one of
+        sonarr.REASON_MESSAGES -- fixed literals -- and the version and
+        count are Sonarr's own answer. #}
+    {%- if health.sonarr %}
+    {%- set sonarr = health.sonarr %}
+    <span class="status-chip{{ ' error' if sonarr.degraded else (' warn' if sonarr.needs_attention or sonarr.state == 'unknown' else '') }}">
+      {%- if not sonarr.alive %}
+      Sonarr: NOT BEING CHECKED &mdash; the background check has died
+      {%- elif sonarr.state == 'unavailable' %}
+      Sonarr: status unavailable
+      {%- elif sonarr.state == 'stale' %}
+      Sonarr: CHECK STALLED &mdash; no check has completed for
+      {{ age.ago(sonarr.last_checked_age_s, plain=true) if sonarr.last_checked_age_s
+         is not none else 'the whole time this service has been up' }}
+      {%- elif sonarr.state == 'sonarr' %}
+      Sonarr: FAILING &mdash; nothing can be grabbed
+      {%- elif sonarr.state == 'unknown' %}
+      Sonarr: not checked yet since restart
+      {%- else %}
+      Sonarr: ok &mdash; {{ sonarr.version }},
+      {{ sonarr.series_count }} series
+      {%- if sonarr.last_success_age_s is not none %},
+      confirmed {{ age.ago(sonarr.last_success_age_s) }}
+      {%- endif %}
+      {%- endif %}
+    </span>
+    {%- endif %}
   </div>
+  {#- Sonarr's own banner, on the same argument as the SVT one below and a
+      shorter one: there is no "worth a look but not urgent" shape here.
+      Without Sonarr's air dates the resolver cannot resolve anything at
+      all, so every finding on this check means nothing is being grabbed
+      right now. It says which failure it is, because a rejected key, a
+      wrong port and a proxy answering in Sonarr's place are three different
+      afternoons. #}
+  {%- if health.sonarr and health.sonarr.needs_attention %}
+  {%- set sonarr = health.sonarr %}
+  <p class="error">
+    {%- if not sonarr.alive %}
+    Nothing is checking Sonarr any more: the background check has died, so a
+    rotated key or a moved container would now go unnoticed. Restart
+    svtplay-arr, and look in its log for what killed it.
+    {%- elif sonarr.state == 'unavailable' %}
+    The Sonarr check could not be read, so nothing here can tell you whether
+    Sonarr is reachable. Check svtplay-arr's log.
+    {%- elif sonarr.state == 'stale' %}
+    No Sonarr check has completed recently, so nothing currently confirms
+    that Sonarr is reachable or that it still accepts this service's API
+    key. Check svtplay-arr's log.
+    {%- else %}
+    <strong>Sonarr is not answering svtplay-arr.</strong> Nothing can be
+    grabbed while that is true: every search and every RSS poll returns
+    nothing, because the air dates episodes are matched against come from
+    Sonarr.
+    {%- if sonarr.last_error %} {{ sonarr.last_error }}{% endif %}
+    {%- if sonarr.last_success_age_s is not none %}
+    Sonarr last answered {{ age.ago(sonarr.last_success_age_s) }}.
+    {%- else %}
+    Sonarr has not answered since this service started &mdash; check the
+    settings, and use <strong>Test connection</strong> under
+    <a href="/config/settings">Settings</a> to try new values before saving
+    them.
+    {%- endif %}
+    {%- endif %}
+  </p>
+  {%- endif %}
   {#- The strip is a headline; a canary with a finding needs to be
       actionable, because this is the warning standing between the operator
       and a month of silently missing episodes. It says which of the two
@@ -827,11 +918,80 @@
         });
       }
 
+      // The Test connection button, enhanced exactly as the mapping Check
+      // control is: same route, same one server-side computation, and the
+      // only difference is an Accept header that asks for the result on its
+      // own instead of the whole page. With script off the button is a
+      // plain submit with a `formaction` and everything below is skipped.
+      //
+      // Worth the enhancement for one reason: the operator is mid-edit with
+      // unsaved values in the form, and a full re-render moves the page
+      // under them. Nothing is lost either way -- the no-JS path posts the
+      // same values back and redisplays them -- but this leaves the caret
+      // where they left it.
+      function initSonarrTest() {
+        document
+          .querySelectorAll("button.sonarr-test-button")
+          .forEach(function (button) {
+            var form = button.form;
+            var result = document.querySelector(".sonarr-test-result");
+            if (!form || !result) { return; }
+
+            button.addEventListener("click", function (evt) {
+              evt.preventDefault();
+              button.disabled = true;
+              result.hidden = false;
+              result.className = "sonarr-test-result";
+              result.textContent = "Testing…";
+              // The whole form, which is what the no-JS POST sends too --
+              // the API key included, because testing the values in the
+              // form is the entire point of the control. It is the same
+              // value this form already posts on every save.
+              fetch(button.getAttribute("formaction"), {
+                method: "POST",
+                headers: { Accept: "application/json" },
+                body: new FormData(form),
+              })
+                .then(function (r) {
+                  // An SSO gateway's JSON 401, or a proxy error body,
+                  // parses as perfectly good JSON. A control whose only job
+                  // is trustworthy signal must not paint a confident
+                  // nothing, so anything that is not this route's own
+                  // success goes to the .catch below.
+                  if (!r.ok) {
+                    throw new Error("test request failed: " + r.status);
+                  }
+                  return r.json();
+                })
+                .then(function (data) {
+                  if (!data || typeof data.message !== "string" ||
+                      typeof data.css_class !== "string") {
+                    throw new Error("response was not a test result");
+                  }
+                  // textContent, never innerHTML -- see initCheckForms.
+                  result.className = "sonarr-test-result " + data.css_class;
+                  result.textContent = data.message;
+                })
+                .catch(function () {
+                  result.className = "sonarr-test-result error";
+                  result.textContent =
+                    "Test failed: could not reach svtplay-arr itself. This " +
+                    "says nothing about Sonarr. Try again, or reload the " +
+                    "page and use the button without JavaScript.";
+                })
+                .finally(function () {
+                  button.disabled = false;
+                });
+            });
+          });
+      }
+
       function init() {
         initCheckForms();
         initMappingFilter();
         initSecretToggles();
         initSweepProgress();
+        initSonarrTest();
       }
 
       if (document.readyState === "loading") {

@@ -1,4 +1,25 @@
-"""Periodic proof that SVT still answers and the parser still works.
+"""Periodic proof that this service's two dependencies still answer.
+
+Two checks live here, and they are deliberately two classes rather than
+one.
+
+`SvtCanary` fans out over the operator's own mappings, staggered, and has
+to tell "every mapping failed" from "one mapping failed" because those two
+findings call for completely different actions. `SonarrCanary` makes one
+request to one endpoint and is binary: Sonarr works or it does not.
+Generalising the first into something that could also do the second would
+mean a class carrying `no_mappings` and `series` states that are
+meaningless for Sonarr, and a probe abstraction whose only shared part is
+"loop, bound the call, record what happened" -- which is exactly the part
+that *is* shared, as `_PeriodicCheck` below.
+
+The alternative -- leaving `SvtCanary` checking Sonarr too -- was rejected
+on the plainest possible grounds: the next person to read the name would be
+wrong about what the class does.
+
+--- The SVT canary --------------------------------------------------------
+
+Periodic proof that SVT still answers and the parser still works.
 
 This project's design is "refuse on doubt, return nothing". That is why the
 media library is safe -- but it is also what makes failure and idleness
@@ -63,6 +84,32 @@ writer, the config writer, the job store, or Sonarr.
 raises costs that probe, a round that raises costs that round, and
 `run_forever` never dies of anything but cancellation. A hanging SVT is
 bounded by a per-probe timeout rather than being allowed to wedge the loop.
+
+--- The Sonarr check ------------------------------------------------------
+
+`SonarrCanary` closes the same gap on the other dependency, and it is the
+more critical of the two: without Sonarr's air dates the resolver cannot
+resolve anything at all, so a wrong URL or a rotated key means every search
+and every RSS poll silently returns nothing -- while `/health` reported
+`ok`, because nothing in this service had ever asked Sonarr a question.
+
+Two recent changes made that worse. The API key is editable through the
+configuration page, so it can be mistyped, saved, and only found out about
+weeks later; and settings need a restart, so there is a real window in
+which the file is right and the running service is not.
+
+**Sonarr down degrades `status`.** Read `DEGRADED_STATES` above before
+disagreeing: `STATE_SERIES` is kept out of that set because one dead
+mapping row does not stop anything else working, and a light that stays red
+over it is a light nobody reads. There is no equivalent here. Sonarr either
+answers or nothing can be grabbed at all, which is precisely what a red
+light is for.
+
+**The page's Test connection button is not this.** They answer different
+questions, and both are worth having: the button tests the values in the
+form, before a save, and says whether they would work; this tests what the
+running service is actually using, hourly, and says whether it still does.
+Between a save and a restart those two are legitimately different answers.
 """
 
 import asyncio
@@ -70,6 +117,7 @@ import logging
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 
+from svtplay_arr.sonarr import REASON_UNKNOWN, SonarrApiError
 from svtplay_arr.svt.client import SvtApiError
 
 log = logging.getLogger(__name__)
@@ -167,6 +215,58 @@ DEGRADED_STATES = frozenset({STATE_STALE, STATE_SVT, STATE_UNAVAILABLE})
 # `/health`'s top-level `status` keys off DEGRADED_STATES above.
 ATTENTION_STATES = DEGRADED_STATES | {STATE_SERIES}
 
+# The last Sonarr check failed: unreachable, unauthenticated, or answering
+# like something that is not Sonarr. `SonarrCanary.status()` carries the
+# reason. Named to mirror `STATE_SVT` -- the dependency itself is the
+# problem, and there is nothing for the operator to fix at the row level
+# because there are no rows.
+STATE_SONARR = "sonarr"
+
+# What turns `/health`'s top-level `status` red for Sonarr.
+#
+# `STATE_SONARR` is in it, unlike SVT's `STATE_SERIES`, and the asymmetry is
+# the point. `STATE_SERIES` is one dead show out of many: everything else
+# still resolves, the operator fixes it when they get to it, and a red light
+# that sits there for a week teaches them to stop looking at it. A Sonarr
+# that is not answering has no partial version -- nothing is grabbed, no
+# search returns anything, and the RSS feed has no air dates to match
+# against. That is what a red light is for.
+#
+# `STATE_UNKNOWN` is absent here for exactly the reason it is absent above:
+# the first interval after a restart knows nothing, and a check that
+# degrades on every boot is one nobody reads. It is still never reported as
+# `ok` -- it is its own state, it renders as its own chip, and an unknown
+# that never resolves becomes `STATE_STALE`, which is in this set.
+SONARR_DEGRADED_STATES = frozenset(
+    {STATE_STALE, STATE_SONARR, STATE_UNAVAILABLE}
+)
+# The same set, and that is the whole difference from SVT: there is no
+# "worth your attention but not worth an alert" shape here, because Sonarr
+# has no equivalent of one show having ended.
+SONARR_ATTENTION_STATES = SONARR_DEGRADED_STATES
+
+# The Sonarr check's own loop constants. Not shared with SVT's, and not
+# offered as a setting either.
+#
+# `svt_canary_interval_minutes` exists because SVT's is an undocumented API
+# this project has no right to hammer, and an operator on a metered or
+# rate-limited connection needs a way to back off without a code change.
+# None of that applies to Sonarr: it is the operator's own service, usually
+# on the same host, and the resolver already calls `all_series()` on every
+# RSS poll -- several times an hour. One more request per hour is not a knob
+# worth adding to config.yaml.
+DEFAULT_SONARR_INTERVAL_S = 3600.0
+# Shorter than SVT's 30s. A mistyped key saved through the settings page is
+# discovered on the restart that applies it, and the whole value of this
+# check is that the operator learns then rather than from episodes that
+# never arrive. One request to a service that is usually on the same host
+# does not need to be held back from startup the way a fan-out over SVT
+# does.
+DEFAULT_SONARR_INITIAL_DELAY_S = 5.0
+# Well inside `DEFAULT_SONARR_INTERVAL_S`, and long enough that a Sonarr
+# doing a library refresh is not reported as down.
+DEFAULT_SONARR_TIMEOUT_S = 15.0
+
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -258,7 +358,102 @@ def unavailable_status() -> dict:
     }
 
 
-class SvtCanary:
+class _PeriodicCheck:
+    """The loop, the clock and the staleness rule both checks share.
+
+    Extracted rather than copied, because this is the part that must not be
+    allowed to differ between them: a monitoring component that can kill its
+    own task replaces one silent failure with another, and two copies of
+    "never dies of anything but cancellation" is two chances to get that
+    wrong. What each check actually *does* -- one endpoint or a fan-out over
+    mappings, one failure shape or two -- lives in the subclass, which is
+    the whole reason there are two subclasses.
+
+    `_WHAT` names the check in log lines, so a message never says "SVT"
+    about a Sonarr round.
+    """
+
+    _WHAT = "check"
+
+    def __init__(
+        self, *, interval_s: float, probe_timeout_s: float,
+        initial_delay_s: float, clock,
+    ):
+        self._interval = max(float(interval_s), _MIN_INTERVAL_S)
+        self._probe_timeout = float(probe_timeout_s)
+        self._initial_delay = max(float(initial_delay_s), 0.0)
+        self._now = clock
+
+        # Startup is the reference staleness is measured from until a round
+        # completes. Without it a check that never manages a single round
+        # would sit at "unknown" forever, which is the one way this feature
+        # could reproduce the silence it exists to remove.
+        self._started_at = self._now()
+
+        # The last *completed* round.
+        self._last_round_at: datetime | None = None
+        # The last round that actually proved the dependency was working.
+        self._last_success_at: datetime | None = None
+
+        # The most recent failure from anywhere in the check, kept outside
+        # any round summary because a failure to even start a round is
+        # exactly when the operator most needs the reason.
+        self._last_error: str | None = None
+        self._last_error_at: datetime | None = None
+
+    def _is_stale(self, now: datetime) -> bool:
+        """Has too long passed with no completed round?
+
+        Ahead of every other branch in both `state()` implementations, so a
+        stale success can never be served as a fresh one.
+        """
+        reference = self._last_round_at or self._started_at
+        stale_after = max(self._interval * _STALE_INTERVALS, _MIN_STALE_AFTER_S)
+        return (now - reference).total_seconds() > stale_after
+
+    async def run_forever(self) -> None:
+        """The loop. Dies only of cancellation.
+
+        `app.py` runs this as a background task and reports its liveness the
+        same way it reports the worker's, because a monitoring task that
+        silently stopped monitoring is the failure this whole module is
+        about, one level in.
+        """
+        if self._initial_delay:
+            await asyncio.sleep(self._initial_delay)
+        while True:
+            await self.run_once_guarded()
+            await asyncio.sleep(self._interval)
+
+    async def run_once_guarded(self) -> None:
+        """One round with the loop's own net around it. Never raises.
+
+        `run_once` is already guarded internally, so this is the net under
+        that -- a check able to kill its own task would replace one silent
+        failure with another. It is a named method rather than a `try` in
+        the loop so the "a failing round costs nothing but that round"
+        property can be exercised directly, on the app's real check,
+        without a test reaching into the loop.
+
+        `CancelledError` is a `BaseException` and passes straight through,
+        so shutdown still works.
+        """
+        try:
+            await self.run_once()
+        except Exception:
+            log.exception("%s round failed; retrying next tick", self._WHAT)
+
+    async def run_once(self) -> None:  # pragma: no cover - overridden
+        raise NotImplementedError
+
+    def _record_error(self, message: str | None, at: datetime | None = None) -> None:
+        if not message:
+            return
+        self._last_error = message
+        self._last_error_at = at or self._now()
+
+
+class SvtCanary(_PeriodicCheck):
     """Checks the operator's own mappings against SVT, on a slow loop.
 
     `mappings_provider` is a zero-argument callable returning the current
@@ -283,20 +478,16 @@ class SvtCanary:
         initial_delay_s: float = DEFAULT_INITIAL_DELAY_S,
         clock=_utcnow,
     ):
+        super().__init__(
+            interval_s=interval_s,
+            probe_timeout_s=probe_timeout_s,
+            initial_delay_s=initial_delay_s,
+            clock=clock,
+        )
         self._mappings_provider = mappings_provider
         self._svt = svt
-        self._interval = max(float(interval_s), _MIN_INTERVAL_S)
-        self._probe_timeout = float(probe_timeout_s)
         self._concurrency = max(int(concurrency), 1)
         self._spacing = max(float(spacing_s), 0.0)
-        self._initial_delay = max(float(initial_delay_s), 0.0)
-        self._now = clock
-
-        # Startup is the reference staleness is measured from until a round
-        # completes. Without it a canary that never manages a single round
-        # would sit at "unknown" forever, which is the one way this feature
-        # could reproduce the silence it exists to remove.
-        self._started_at = self._now()
 
         # Per-mapping state, keyed by tvdb_id. Rebuilt from the current
         # mapping rows on every round, so a deleted mapping stops being
@@ -307,33 +498,17 @@ class SvtCanary:
         # end of the round. Reading a half-finished round would let the
         # "all failing" / "one failing" distinction -- the whole point of
         # the report -- be decided by which probes happened to be done.
-        self._last_round_at: datetime | None = None
         self._checked = 0
         self._failing = 0
         self._episodes_seen = 0
-
-        # The most recent error from anywhere: a probe, or the mapping read
-        # that precedes them. Kept outside the round summary because a
-        # failure to even start a round is exactly when the operator most
-        # needs the reason.
-        self._last_error: str | None = None
-        self._last_error_at: datetime | None = None
-
-        # The last time *any* mapping resolved, i.e. the last moment SVT and
-        # the parser were both demonstrably working.
-        self._last_success_at: datetime | None = None
 
     # --- Reporting --------------------------------------------------------
 
     def state(self) -> str:
         now = self._now()
-        reference = self._last_round_at or self._started_at
-        stale_after = max(self._interval * _STALE_INTERVALS, _MIN_STALE_AFTER_S)
-        if (now - reference).total_seconds() > stale_after:
+        if self._is_stale(now):
             # Checked once and then never again is the same problem as never
-            # checked at all: nothing current is known about SVT. This is
-            # ahead of every other branch so a stale success can never be
-            # served as a fresh one.
+            # checked at all: nothing current is known about SVT.
             return STATE_STALE
         if self._last_round_at is None:
             return STATE_UNKNOWN
@@ -447,37 +622,7 @@ class SvtCanary:
 
     # --- Running ----------------------------------------------------------
 
-    async def run_forever(self) -> None:
-        """The loop. Dies only of cancellation.
-
-        `app.py` runs this as a background task and reports its liveness the
-        same way it reports the worker's, because a monitoring task that
-        silently stopped monitoring is the failure this whole module is
-        about, one level in.
-        """
-        if self._initial_delay:
-            await asyncio.sleep(self._initial_delay)
-        while True:
-            await self.run_once_guarded()
-            await asyncio.sleep(self._interval)
-
-    async def run_once_guarded(self) -> None:
-        """One round with the loop's own net around it. Never raises.
-
-        `run_once` is already guarded internally, so this is the net under
-        that -- a canary able to kill its own task would replace one silent
-        failure with another. It is a named method rather than a `try` in
-        the loop so the "a failing round costs nothing but that round"
-        property can be exercised directly, on the app's real canary,
-        without a test reaching into the loop.
-
-        `CancelledError` is a `BaseException` and passes straight through,
-        so shutdown still works.
-        """
-        try:
-            await self.run_once()
-        except Exception:
-            log.exception("SVT canary round failed; retrying next tick")
+    _WHAT = "SVT canary"
 
     async def run_once(self) -> None:
         """One full round over the current mappings. Never raises."""
@@ -605,11 +750,181 @@ class SvtCanary:
             )
         return True, count, None
 
-    def _record_error(self, message: str | None, at: datetime | None = None) -> None:
-        if not message:
+
+def sonarr_unavailable_status() -> dict:
+    """What `app.compute_health` reports when `SonarrCanary.status()` failed.
+
+    Degraded, for the same reason as `unavailable_status` above: the check
+    not being readable is not the same as the check having nothing to say
+    yet, and only one of those resolves on its own.
+    """
+    return {
+        "state": STATE_UNAVAILABLE,
+        "degraded": True,
+        "needs_attention": True,
+        "last_checked_age_s": None,
+        "last_success_age_s": None,
+        "last_checked": None,
+        "last_success": None,
+        "last_error": None,
+        "last_error_reason": None,
+        "last_error_at": None,
+        "version": None,
+        "series_count": None,
+    }
+
+
+class SonarrCanary(_PeriodicCheck):
+    """Checks that Sonarr is there, is Sonarr, and is *this* Sonarr.
+
+    `sonarr` is the shared `SonarrClient` -- the same instance the resolver
+    matches against, built from the settings the service actually booted
+    with. That is deliberate and is what makes this check different from the
+    configuration page's Test connection button: the button answers "would
+    these values work", this answers "is what is running still working".
+    Between a settings save and the restart that applies it, those two
+    questions have different correct answers, and both are worth having.
+
+    Only `SonarrClient.status()` is ever called. It reads
+    `/api/v3/system/status` and the series list, and writes nothing --
+    there is no Sonarr endpoint in this class's reach that could.
+    """
+
+    _WHAT = "Sonarr check"
+
+    def __init__(
+        self,
+        sonarr,
+        *,
+        interval_s: float = DEFAULT_SONARR_INTERVAL_S,
+        probe_timeout_s: float = DEFAULT_SONARR_TIMEOUT_S,
+        initial_delay_s: float = DEFAULT_SONARR_INITIAL_DELAY_S,
+        clock=_utcnow,
+    ):
+        super().__init__(
+            interval_s=interval_s,
+            probe_timeout_s=probe_timeout_s,
+            initial_delay_s=initial_delay_s,
+            clock=clock,
+        )
+        self._sonarr = sonarr
+        # The last round's verdict, swapped in as a unit at the end of it.
+        self._ok: bool | None = None
+        self._last_error_reason: str | None = None
+        # From the last check that *worked*. Kept across a later failure for
+        # the same reason `last_success` is: "answered an hour ago with 42
+        # series, failing now" and "never answered" are different situations.
+        self._version: str | None = None
+        self._series_count: int | None = None
+
+    # --- Reporting --------------------------------------------------------
+
+    def state(self) -> str:
+        now = self._now()
+        if self._is_stale(now):
+            return STATE_STALE
+        if self._last_round_at is None:
+            # Nothing has been checked since this process started. Not
+            # healthy, and never rendered as such -- see the module
+            # docstring and SONARR_DEGRADED_STATES.
+            return STATE_UNKNOWN
+        return STATE_OK if self._ok else STATE_SONARR
+
+    def status(self) -> dict:
+        """This check's contribution to `/health`, and through it to the
+        configuration page's status strip.
+
+        One computation, two surfaces -- `app.compute_health` calls this
+        once and both render its result verbatim. Nothing re-derives any of
+        it.
+
+        Carries no URL and no key. `last_error` is one of
+        `sonarr.REASON_MESSAGES`, which are fixed literals; `version` and
+        `series_count` come from Sonarr's own answer.
+        """
+        now = self._now()
+        state = self.state()
+        return {
+            "state": state,
+            "degraded": state in SONARR_DEGRADED_STATES,
+            "needs_attention": state in SONARR_ATTENTION_STATES,
+            "last_checked_age_s": _age_s(self._last_round_at, now),
+            "last_success_age_s": _age_s(self._last_success_at, now),
+            "last_checked": _iso(self._last_round_at),
+            "last_success": _iso(self._last_success_at),
+            "last_error": self._last_error,
+            # The machine-readable half of the same fact, so a monitoring
+            # setup can branch on "the key was rejected" without matching on
+            # prose. One of sonarr.REASON_*.
+            "last_error_reason": self._last_error_reason,
+            "last_error_at": _iso(self._last_error_at),
+            # What the last working check saw. The count is the one that
+            # says which Sonarr answered rather than merely that one did.
+            "version": self._version,
+            "series_count": self._series_count,
+        }
+
+    # --- Running ----------------------------------------------------------
+
+    async def run_once(self) -> None:
+        """One check. Never raises.
+
+        Bounded by `wait_for` on top of whatever timeout the shared httpx
+        client carries: this runs on the same event loop as the download
+        worker and the routes, and a Sonarr that accepts a connection and
+        then says nothing must cost this round its timeout and nothing else.
+        """
+        now = self._now()
+        try:
+            result = await asyncio.wait_for(
+                self._sonarr.status(), timeout=self._probe_timeout
+            )
+        except TimeoutError:
+            self._fail(
+                now,
+                f"Sonarr did not answer within {self._probe_timeout:g}s.",
+                "timeout",
+            )
             return
-        self._last_error = message
-        self._last_error_at = at or self._now()
+        except SonarrApiError as exc:
+            # `str(exc)` is one of REASON_MESSAGES -- a fixed literal with
+            # no URL and no key in it. See sonarr.py's module docstring for
+            # why the message is built there rather than here.
+            self._fail(now, str(exc), exc.reason)
+            return
+        except Exception as exc:
+            # Broad, for the reason every guard in this module is broad: a
+            # monitoring component must not be able to fail the thing it
+            # monitors. The message is this module's own words about a
+            # non-Sonarr exception rather than the exception's, so an
+            # unexpected type cannot smuggle anything into a rendered page.
+            log.warning(
+                "Sonarr check failed unexpectedly (%s)",
+                type(exc).__name__,
+                exc_info=True,
+            )
+            self._fail(
+                now,
+                "The Sonarr check failed unexpectedly. Check svtplay-arr's log.",
+                REASON_UNKNOWN,
+            )
+            return
+
+        self._ok = True
+        self._version = result.version
+        self._series_count = result.series_count
+        self._last_round_at = now
+        self._last_success_at = now
+
+    def _fail(self, now: datetime, message: str, reason: str) -> None:
+        self._ok = False
+        self._last_error_reason = reason
+        self._record_error(message, at=now)
+        # A failure still *completes* a round: something is known about
+        # Sonarr, and it is bad. Not completing here would let the state
+        # drift to `stale` and report "nothing is checking Sonarr" over a
+        # check that is running perfectly and finding a real problem.
+        self._last_round_at = now
 
 
 def _age_s(when: datetime | None, now: datetime) -> float | None:

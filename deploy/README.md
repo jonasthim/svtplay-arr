@@ -62,7 +62,9 @@ service:
     #  "mappings_degraded": false,
     #  "svt": {"state": "ok", "degraded": false, "alive": true,
     #          "checked": 3, "failing": 0, "episodes_seen": 41,
-    #          "last_success": "2026-08-27T09:00:00+00:00", ...}}
+    #          "last_success": "2026-08-27T09:00:00+00:00", ...},
+    #  "sonarr": {"state": "ok", "degraded": false, "alive": true,
+    #             "version": "4.0.10.2544", "series_count": 42, ...}}
 
 If `same_filesystem` is `false`, `status` is `"degraded"`. Fix the mount
 layout before proceeding — do not add the indexer/download client to Sonarr
@@ -109,6 +111,43 @@ configuration page either way.
 
 `svt_canary_interval_minutes` in `config.yaml` (default 60) is how to slow the
 check down; it is not on the settings page.
+
+The `sonarr` block is the same check on the other dependency, and it existed
+nowhere until 2026-08-28: `/health` reported `ok` through a completely wrong
+`sonarr_url` or a mistyped `sonarr_api_key`, because nothing in this service
+had ever asked Sonarr a question. That matters more than the SVT gap, not
+less — the resolver matches SVT episodes against *Sonarr's* air dates, so
+with Sonarr unreachable every search and every RSS poll returns nothing.
+
+Once an hour it calls `/api/v3/system/status` and the series list, and
+reports:
+
+- `"state": "ok"` — with `version` and `series_count`. **Check the count**:
+  reachable and authenticated are both satisfied by a Sonarr that simply is
+  not the one this service is meant to feed, and the size of the library is
+  the only field that tells those apart.
+- `"state": "sonarr"` — the last check failed. `last_error_reason` says which
+  shape (`unauthorized`, `refused`, `unreachable`, `tls`, `not_sonarr`,
+  `bad_url`, `timeout`, `http`, `connect`, `unknown`) and `last_error` is a
+  sentence saying what to go and change. Each of those is a different
+  afternoon.
+- `"state": "unknown"` — nothing checked since this process started.
+  Deliberately not `ok`, and it becomes `"stale"` (and degraded) if no check
+  ever completes.
+- `"alive": false` — the check's own background task has died.
+
+Unlike SVT's `series`, **every one of those degrades `status`**. There is no
+"one show ended" equivalent here: Sonarr answers or nothing can be grabbed at
+all, which is what a red light is for. There is no interval setting either —
+that escape hatch exists for SVT because its API is unofficial and this
+project has no right to hammer it, and none of that applies to your own
+Sonarr, which the resolver already calls several times an hour.
+
+The configuration page's **Settings → Test connection** button is the
+on-demand half of the same thing. It tests the values *currently in the
+form*, before you save them and before the restart that would apply them, so
+you can find out that a key is wrong while you still have it on the
+clipboard. It writes nothing.
 
 **If the NFS export squashes identities, do not `chown` anything under this
 mount.** An export configured with `mapall_user` / `mapall_group` (or

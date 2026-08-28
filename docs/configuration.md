@@ -650,6 +650,88 @@ timeout, so a slow or hanging SVT costs one check and can neither stall the
 loop nor affect downloads. See `svt_canary_interval_minutes` above to slow it
 down further.
 
+## Is Sonarr still working?
+
+The same gap, on the dependency that matters more. Before 2026-08-28 nothing
+in this service ever asked Sonarr a question outside serving a request, so
+`/health` reported `ok` through a completely wrong `sonarr_url` or a mistyped
+`sonarr_api_key` — and the only symptom was that episodes stopped arriving.
+The resolver matches SVT episodes against *Sonarr's* air dates, so with
+Sonarr unreachable every search and every RSS poll silently returns nothing.
+
+Two things made that worse. The API key is editable through the
+configuration page, so it can be mistyped and saved; and settings need a
+restart, so there is a real window where the file is right and the running
+service is not.
+
+There are now two answers, because there are two questions.
+
+### The background check: is what is running still working?
+
+`SonarrCanary` (`src/svtplay_arr/canary.py`) calls `/api/v3/system/status`
+and the series list once an hour, using the settings the service actually
+booted with, and reports under `sonarr` on `/health` and as the **Sonarr**
+chip on every configuration-page view:
+
+- `ok`, with the version and `series_count`. **Look at the count.** Reachable
+  and authenticated are both satisfied by a Sonarr that is simply not the one
+  this service is meant to feed — a second instance, a test container, a
+  restored backup — and the size of the library is the only field that tells
+  those apart.
+- `sonarr` — the last check failed. `last_error_reason` says which shape and
+  `last_error` says what to change.
+- `unknown` — nothing checked since this process started. Deliberately not
+  reported as `ok`; it becomes `stale` (and degraded) if no check ever
+  completes.
+- `alive: false` — the check's own background task has died, reported the way
+  `worker_alive` is and for the same reason.
+
+**Every one of those degrades the top-level `status`**, unlike SVT's `series`
+shape. There is no "one show ended" equivalent: Sonarr answers or nothing can
+be grabbed at all.
+
+There is no interval setting. `svt_canary_interval_minutes` exists because
+SVT's API is unofficial and this project has no right to hammer it; your own
+Sonarr is a different case, and the resolver already calls it several times an
+hour on every RSS poll.
+
+### The Test connection button: would these values work?
+
+**Settings → Test connection** answers the other question, on demand. It
+tests **the values currently in the form** — not the file, and not what the
+service booted with — because that is what you mean when you click it: you
+have just typed a key and want to know before saving it. The file could not
+answer that until after a save, and after a save it still could not, because
+settings need a restart. An unmodified form holds exactly the effective
+on-disk values, so testing it unchanged *is* testing the file.
+
+(One exception, mirroring `Settings.load`: where `$SONARR_API_KEY` is set, the
+environment beats the file after any restart, so that is the key tested — and
+the result says so.)
+
+It reports the version and the series count on success, and on failure says
+which of these it was, because they send you somewhere different:
+
+| Reason | What to change |
+| --- | --- |
+| `bad_url` | The URL is not an `http://`/`https://` address at all |
+| `unreachable` | The hostname does not resolve *from the server* |
+| `refused` | Nothing is listening on that port |
+| `tls` | The certificate will not verify |
+| `connect` | The connection failed for some other reason — firewall, container network, VPN |
+| `timeout` | Something accepted the connection and said nothing |
+| `unauthorized` | Sonarr rejected the key |
+| `not_sonarr` | Something answered and it is not Sonarr's API — a proxy, a login page, a missing base path |
+| `http` | Sonarr answered with an unexpected status |
+
+It writes nothing — two GETs against Sonarr and no more — and it works with
+JavaScript off, as an ordinary form post that re-renders the page with the
+result and everything you typed still in the boxes.
+
+The API key never appears in the result, in an error message, in a log line,
+in `/health` or on the status strip. The messages are fixed sentences with
+nothing substituted into them but an HTTP status code.
+
 ## How saves through the configuration page behave
 
 Worth knowing whichever way you edit, because the two files interact.

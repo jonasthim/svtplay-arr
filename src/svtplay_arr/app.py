@@ -35,13 +35,18 @@ from fastapi import FastAPI
 from svtplay_arr.api.config_ui import build_config_router
 from svtplay_arr.api.newznab import build_newznab_router
 from svtplay_arr.api.sab import build_sab_router
-from svtplay_arr.canary import SvtCanary, unavailable_status
+from svtplay_arr.canary import (
+    SonarrCanary,
+    SvtCanary,
+    sonarr_unavailable_status,
+    unavailable_status,
+)
 from svtplay_arr.config import Settings
 from svtplay_arr.downloader import SvtplayDlDownloader
 from svtplay_arr.mappings import ReloadingMappingTable
 from svtplay_arr.models import Job, JobStatus
 from svtplay_arr.resolver import Resolver
-from svtplay_arr.sonarr import SonarrClient
+from svtplay_arr.sonarr import SonarrClient, SonarrStatus
 from svtplay_arr.store import JobStore, JobStoreError
 from svtplay_arr.svt.client import SvtClient
 from svtplay_arr.worker import Worker
@@ -124,6 +129,23 @@ def create_app(settings: Settings) -> FastAPI:
         svt_client,
         interval_s=max(1, settings.svt_canary_interval_minutes) * 60.0,
     )
+    # ...and the one thing that knows whether Sonarr is still there. Same
+    # gap, on the dependency that matters more: without Sonarr's air dates
+    # the resolver cannot resolve anything at all, so a rotated key or a
+    # container that moved means every search and every RSS poll silently
+    # returns nothing while every field on /health stays green.
+    #
+    # Handed the *same* `sonarr_client` the resolver matches against --
+    # built from the settings this process actually booted with -- so it
+    # reports on what is running rather than on what is on disk. The
+    # configuration page's Test connection button answers the other
+    # question; see SonarrCanary's docstring for why both are worth having.
+    #
+    # No interval setting, unlike SVT's: that escape hatch exists because
+    # SVT's is an unofficial API this project has no right to hammer, and
+    # none of that applies to the operator's own Sonarr -- which the
+    # resolver already calls several times an hour on every RSS poll.
+    sonarr_canary = SonarrCanary(sonarr_client)
 
     # Set by the lifespan below once the background tasks are created, and
     # read by /health via `nonlocal`. Plain module-level variables would leak
@@ -132,6 +154,7 @@ def create_app(settings: Settings) -> FastAPI:
     # own worker and its own canary.
     worker_task: asyncio.Task | None = None
     canary_task: asyncio.Task | None = None
+    sonarr_task: asyncio.Task | None = None
 
     def compute_health() -> dict:
         """The one computation behind both `/health` and the config page's
@@ -201,6 +224,22 @@ def create_app(settings: Settings) -> FastAPI:
             svt["degraded"] = True
             svt["needs_attention"] = True
 
+        # The other dependency, and the one nothing checked until now.
+        # Everything the `svt` block above says about why a background check
+        # is needed applies here more strongly, because there is no partial
+        # failure: Sonarr answers or nothing is grabbed. So unlike SVT's
+        # `series` state, every attention-worthy Sonarr state also reaches
+        # the top-level `status` below -- see SONARR_DEGRADED_STATES.
+        try:
+            sonarr = sonarr_canary.status()
+        except Exception:
+            log.exception("/health: could not read the Sonarr check's status")
+            sonarr = sonarr_unavailable_status()
+        sonarr["alive"] = sonarr_task is not None and not sonarr_task.done()
+        if not sonarr["alive"]:
+            sonarr["degraded"] = True
+            sonarr["needs_attention"] = True
+
         same_fs = settings.dirs_share_filesystem()
         status = (
             "ok"
@@ -209,6 +248,7 @@ def create_app(settings: Settings) -> FastAPI:
                 and worker_alive
                 and not mappings["degraded"]
                 and not svt["degraded"]
+                and not sonarr["degraded"]
             )
             else "degraded"
         )
@@ -222,6 +262,11 @@ def create_app(settings: Settings) -> FastAPI:
             # into an existing field: Sonarr health-check setups may poll
             # this endpoint, so every key above keeps its name and type.
             "svt": svt,
+            # Is Sonarr reachable, does it accept our key, and is it the
+            # Sonarr this service was pointed at? Added, never folded into
+            # an existing field, for the same contract reason as `svt`
+            # above: every key that was here before keeps its name and type.
+            "sonarr": sonarr,
             # How many series the feed is currently offering. Zero is not
             # itself reported as degraded -- a fresh install legitimately
             # has no mappings yet -- but it is the number to look at when
@@ -274,6 +319,20 @@ def create_app(settings: Settings) -> FastAPI:
         ]
         return {"active": active, "history": history[:_ACTIVITY_HISTORY_LIMIT]}
 
+    async def probe_sonarr(url: str, api_key: str) -> SonarrStatus:
+        """Check one set of Sonarr credentials, on demand.
+
+        A throwaway `SonarrClient` over the app's shared `httpx` client:
+        the client object is just a base URL and a header, so building one
+        per click costs nothing and opens no new connection pool. Raises
+        `SonarrApiError`, which is what the caller renders.
+
+        Read-only by construction -- `SonarrClient.status()` issues two
+        GETs and this function has no access to the config writer, the
+        mapping writer or the job store.
+        """
+        return await SonarrClient(url, api_key, http).status()
+
     async def _stop(task: asyncio.Task, what: str) -> None:
         """Cancel a background task and await it, whatever state it is in.
 
@@ -294,7 +353,7 @@ def create_app(settings: Settings) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        nonlocal worker_task, canary_task
+        nonlocal worker_task, canary_task, sonarr_task
         tasks: list[tuple[asyncio.Task, str]] = []
         try:
             # Must run before any job is dispatched: this is what removes
@@ -314,6 +373,12 @@ def create_app(settings: Settings) -> FastAPI:
             canary_task = asyncio.create_task(canary.run_forever())
             tasks.append((canary_task, "SVT canary"))
             app.state.svt_canary_task = canary_task
+            # Same lifetime and the same reason: it drives the shared
+            # `http` client, so it has to be cancelled and awaited before
+            # that client is closed below.
+            sonarr_task = asyncio.create_task(sonarr_canary.run_forever())
+            tasks.append((sonarr_task, "Sonarr check"))
+            app.state.sonarr_canary_task = sonarr_task
         except Exception:
             # Both of these were opened by create_app, before this lifespan
             # was entered, so nothing else will ever release them if startup
@@ -365,6 +430,11 @@ def create_app(settings: Settings) -> FastAPI:
     # what makes "the canary task died" observable from outside.
     app.state.svt_canary = canary
     app.state.svt_canary_task = None
+    # Exposed for the same reason as the SVT canary above: a test drives one
+    # round of the *app's own* Sonarr check -- the object /health reports on
+    # -- rather than waiting out its startup delay and then an hour.
+    app.state.sonarr_canary = sonarr_canary
+    app.state.sonarr_canary_task = None
     # The mapping table is passed alongside the resolver (which reads the
     # same instance) because the Newznab module needs `series_title` for
     # its `q` filter and must not reach into the resolver's internals.
@@ -402,6 +472,18 @@ def create_app(settings: Settings) -> FastAPI:
             # from -- there is one canary, and nothing re-derives its
             # findings.
             mapping_state_provider=canary.per_mapping,
+            # What the Test connection button calls. A bare async callable
+            # taking the values the operator just typed, so the config UI
+            # module never constructs a SonarrClient, never touches httpx,
+            # and cannot accidentally test something other than what was
+            # submitted. It shares this app's one HTTP client rather than
+            # opening a second pool per click.
+            #
+            # Deliberately *not* the `sonarr_client` the router already
+            # holds: that one is bound to the key the service booted with,
+            # which after a save and before a restart is exactly the value
+            # the operator is trying to find out about.
+            sonarr_probe=probe_sonarr,
         )
     )
 

@@ -339,7 +339,8 @@ Then, in another terminal:
 curl localhost:9800/health
 # {"status":"ok","same_filesystem":true,"worker_alive":true,"active_jobs":0,
 #  "mappings":1,"mappings_ever_loaded":true,"mappings_degraded":false,
-#  "svt":{"state":"unknown","degraded":false,"alive":true, ...}}
+#  "svt":{"state":"unknown","degraded":false,"alive":true, ...},
+#  "sonarr":{"state":"unknown","degraded":false,"alive":true, ...}}
 
 curl 'localhost:9800/api/?t=caps'      # must contain tvdbid in supportedParams
 ```
@@ -353,6 +354,16 @@ actually have, so a change at SVT that empties the feed is reported instead of
 looking like an idle week. `"state":"unknown"` right after a restart is
 correct — nothing has been checked yet, and it deliberately does not claim to
 be `ok`. See [docs/configuration.md](docs/configuration.md#is-svt-still-working).
+
+The `sonarr` block is the same idea on the other dependency, and the more
+critical one: without Sonarr's air dates nothing resolves at all, so a wrong
+URL or a rotated key means every search and every RSS poll silently returns
+nothing. It reports the version and the number of series Sonarr can see —
+that count is what tells you whether you are pointed at the *right* Sonarr —
+and unlike one failing mapping it does set `status` to `"degraded"`, because
+Sonarr either works or nothing is grabbed at all. The configuration page's
+**Test connection** button answers the other half: whether the values you
+have just typed would work, before you save them.
 
 </details>
 

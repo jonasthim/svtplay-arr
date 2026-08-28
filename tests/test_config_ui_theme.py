@@ -250,3 +250,20 @@ def test_pending_is_distinguishable_from_plain_warn():
     pending_rule = re.search(r"(?:^|\n)\s*\.pending\s*\{([^}]*)\}", css)
     assert pending_rule, "no standalone .pending rule"
     assert "font-weight: 600" in pending_rule.group(1) or "700" in pending_rule.group(1)
+
+
+def test_the_sonarr_surfaces_declare_no_colour_of_their_own():
+    # The Sonarr chip on the status strip and the Test connection result
+    # both reuse `.status-chip` and the `.error`/`.notice`/`.warn` message
+    # styles, whose token pairs are pinned above in both palettes. Their own
+    # rules may set geometry and nothing else -- a `color:` or a
+    # `background:` here would be a fifth state colour that no contrast test
+    # covers, on the two surfaces an operator reads to decide whether the
+    # service is working.
+    css = _css()
+    for selector in (r"\.sonarr-test-result", r"\.sonarr-test \.control > \.help"):
+        rule = re.search(selector + r"\s*\{([^}]*)\}", css)
+        assert rule, f"no {selector} rule found"
+        decl = rule.group(1)
+        assert "color:" not in decl, decl
+        assert "background" not in decl, decl

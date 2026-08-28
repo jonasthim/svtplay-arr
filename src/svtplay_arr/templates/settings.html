@@ -9,6 +9,18 @@
 Mappings apply immediately &mdash; see <a href="/config/mappings">Mappings</a>.</p>
 <form method="post" action="/config/settings">
   <input type="hidden" name="expected_mtime" value="{{ config_mtime }}">
+  {%- if sonarr_test_enabled %}
+  {# The form's default button, and the only reason it exists: implicit
+     submission (Enter in a text field) activates the *first* submit button
+     in tree order, and the Test connection control below sits earlier in
+     the form than Save settings does. Without this, pressing Enter in any
+     field would run a connection test instead of saving -- a silent change
+     to what this form has always done. Removed from the tab order and from
+     the accessibility tree; the visible Save button at the foot of the
+     form is the one anyone actually reaches. #}
+  <button type="submit" class="default-submit" tabindex="-1"
+          aria-hidden="true">Save settings</button>
+  {%- endif %}
   {% for section_name, section_fields in sections %}
   <fieldset class="settings-section">
     <legend>{{ section_name }}</legend>
@@ -88,6 +100,48 @@ Mappings apply immediately &mdash; see <a href="/config/mappings">Mappings</a>.<
       </div>
     </div>
     {% endfor %}
+    {#- The Test connection control, in whichever section actually holds the
+        API key rather than in one named here -- the section list lives in
+        config.py and this must not be a second copy of it that can drift.
+
+        A submit button with its own `formaction`, so with JavaScript off it
+        is an ordinary form POST that re-renders this view with the result
+        and with everything typed still in the boxes. `formnovalidate`
+        because a test is not a save: it must work on a half-filled form,
+        which is exactly when it is most useful. #}
+    {%- if (sonarr_test_enabled or sonarr_test) and section_fields
+           | selectattr('key', 'equalto', 'sonarr_api_key') | list %}
+    <div class="field sonarr-test">
+      <div class="sonarr-test-label" aria-hidden="true"></div>
+      <div class="control">
+        {#- No button where nothing could answer it -- a router built with no
+            probe (as most tests are) gets the result element and no control,
+            which is what lets a POST straight to the route still explain
+            itself. Same rule as the Show/Hide toggle: a control that cannot
+            do anything is worse than none, because its silence reads as an
+            answer. #}
+        {%- if sonarr_test_enabled %}
+        <button type="submit" class="sonarr-test-button"
+                formaction="/config/settings/test"
+                formnovalidate>Test connection</button>
+        {%- endif %}
+        <p class="help">Checks the values in <em>this form</em> &mdash; before
+          you save them, and before the restart that would apply them:
+          whether anything answers, whether it is Sonarr, whether it accepts
+          this key, and how many series it can see. Nothing is written. The
+          <strong>Sonarr</strong> chip on every view reports the same thing
+          for the settings the running service actually started with, which
+          between a save and a restart is a different answer.</p>
+        {#- Always present, hidden until there is something to say, so the
+            script has one element to patch and the no-JS path has one to
+            fill in. Its class carries the outcome from `_sonarr_test`'s own
+            dict; neither path decides that for itself. #}
+        <p class="sonarr-test-result{{ ' ' ~ sonarr_test.css_class if sonarr_test }}"
+           aria-live="polite"
+           {{ '' if sonarr_test else 'hidden' }}>{{ sonarr_test.message if sonarr_test }}</p>
+      </div>
+    </div>
+    {%- endif %}
     </div>
   </fieldset>
   {% endfor %}

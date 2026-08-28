@@ -531,9 +531,19 @@ unconditional `complete()`.
 [`src/svtplay_arr/app.py`](../src/svtplay_arr/app.py).
 
 `/health` reports the filesystem check, whether the worker task is alive, the
-active job count, and the mapping table's state. It never returns a 500: a
-store error is reported as a degraded-but-200 response, because this is
-Sonarr-facing infrastructure too.
+active job count, the mapping table's state, and — under `svt` and `sonarr` —
+the two background checks on the world outside this process. It never returns
+a 500: a store error is reported as a degraded-but-200 response, because this
+is Sonarr-facing infrastructure too.
+
+Everything except those two blocks reports on *this* service, which is why
+both were added: an SVT format change, or a rotated Sonarr key, could empty
+the feed with every other field still green. `SvtCanary` and `SonarrCanary`
+are siblings rather than one class, because what they do differs everywhere
+that matters — a staggered fan-out over the operator's mappings with two
+failure shapes, against one request to one endpoint with none — and only the
+loop is shared, as `_PeriodicCheck`. A class named `SvtCanary` that also
+checked Sonarr would be a name that lies.
 
 The configuration page's status strip and `/health` are computed by **one
 function**, `compute_health()`, which both call and render verbatim. This

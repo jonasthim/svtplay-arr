@@ -17,6 +17,8 @@ import pytest
 
 from svtplay_arr.canary import (
     ATTENTION_STATES,
+    SONARR_DEGRADED_STATES,
+    STATE_SONARR,
     DEGRADED_STATES,
     STATE_NO_MAPPINGS,
     STATE_OK,
@@ -25,13 +27,37 @@ from svtplay_arr.canary import (
     STATE_SVT,
     STATE_UNAVAILABLE,
     STATE_UNKNOWN,
+    SonarrCanary,
     SvtCanary,
+    sonarr_unavailable_status,
     unavailable_status,
+)
+from svtplay_arr.sonarr import (
+    REASON_BAD_URL,
+    REASON_HTTP,
+    REASON_MESSAGES,
+    REASON_NOT_SONARR,
+    REASON_REFUSED,
+    REASON_TLS,
+    REASON_UNAUTHORIZED,
+    REASON_UNREACHABLE,
+    SonarrApiError,
+    SonarrStatus,
 )
 from svtplay_arr.models import Mapping, SvtEpisode
 from svtplay_arr.svt.client import SvtApiError
 
 _T0 = datetime(2026, 8, 27, 9, 0, 0, tzinfo=timezone.utc)
+
+
+def _sonarr_error(reason: str) -> SonarrApiError:
+    """A SonarrApiError exactly as `SonarrClient` would raise it.
+
+    Built through the same message table the client uses rather than with a
+    message of its own, so a test cannot pass against wording no real
+    failure would ever carry.
+    """
+    return SonarrApiError(REASON_MESSAGES[reason], reason=reason)
 
 
 class Clock:
@@ -684,3 +710,249 @@ async def test_a_clock_step_backwards_never_produces_a_negative_age():
 
     (row,) = c.per_mapping()
     assert row["last_checked_age_s"] == 0.0
+
+
+# --- The Sonarr check -------------------------------------------------------
+#
+# A sibling class, not a second mode of SvtCanary: see the module docstring
+# in canary.py. These are about the check in isolation; its wiring into
+# `/health` and the status strip is exercised in test_app.py, where the
+# "one computation, two surfaces" property actually lives.
+
+
+class FakeSonarr:
+    """Stands in for `SonarrClient`, offering *only* `status()`.
+
+    Every other method is absent by construction, so a check that ever grew
+    a second Sonarr call -- or reached for anything that writes -- fails
+    with an AttributeError rather than quietly doing more than it claims.
+    """
+
+    def __init__(self, result=None, error=None, hang=False):
+        self.result = result
+        self.error = error
+        self.hang = hang
+        self.calls = 0
+
+    async def status(self):
+        self.calls += 1
+        if self.hang:
+            await asyncio.sleep(3600)
+        if self.error is not None:
+            raise self.error
+        return self.result or SonarrStatus(version="4.0.10.2544", series_count=42)
+
+
+def _sonarr_canary(sonarr, clock=None, **over):
+    kwargs = {"initial_delay_s": 0.0, "clock": clock or Clock()}
+    kwargs.update(over)
+    return SonarrCanary(sonarr, **kwargs)
+
+
+def test_a_sonarr_check_that_has_never_run_is_not_reported_as_healthy():
+    # The defect this whole feature removes, one level up: a fresh process
+    # has proved nothing about Sonarr, and saying "ok" would be a claim it
+    # cannot make.
+    s = _sonarr_canary(FakeSonarr()).status()
+    assert s["state"] == STATE_UNKNOWN
+    assert s["state"] != STATE_OK
+    assert s["last_checked"] is None
+    assert s["last_success"] is None
+    assert s["version"] is None
+    assert s["series_count"] is None
+
+
+def test_a_sonarr_check_that_has_never_run_does_not_cry_wolf_either():
+    # Not healthy, and not a degrade for the first interval after a restart
+    # -- the same balance DEGRADED_STATES strikes for SVT, and for the same
+    # reason: a check that is red on every boot is one nobody reads.
+    s = _sonarr_canary(FakeSonarr()).status()
+    assert s["degraded"] is False
+    assert s["needs_attention"] is False
+
+
+async def test_a_working_sonarr_reports_its_version_and_series_count():
+    c = _sonarr_canary(FakeSonarr())
+    await c.run_once()
+    s = c.status()
+    assert s["state"] == STATE_OK
+    assert s["degraded"] is False
+    assert s["version"] == "4.0.10.2544"
+    assert s["series_count"] == 42
+    assert s["last_success"] == _T0.isoformat()
+    assert s["last_error"] is None
+
+
+async def test_a_sonarr_that_is_down_degrades_the_service():
+    # The decision the brief turns on, and the one place this differs from
+    # STATE_SERIES: Sonarr has no partial failure. Nothing resolves, nothing
+    # is grabbed, and no search returns anything.
+    c = _sonarr_canary(FakeSonarr(error=_sonarr_error(REASON_REFUSED)))
+    await c.run_once()
+    s = c.status()
+    assert s["state"] == STATE_SONARR
+    assert s["degraded"] is True
+    assert s["needs_attention"] is True
+    assert STATE_SONARR in SONARR_DEGRADED_STATES
+
+
+async def test_the_reason_reaches_the_report_as_well_as_the_sentence():
+    # A monitoring setup must be able to branch on "the key was rejected"
+    # without matching on prose, and the operator needs the prose.
+    c = _sonarr_canary(FakeSonarr(error=_sonarr_error(REASON_UNAUTHORIZED)))
+    await c.run_once()
+    s = c.status()
+    assert s["last_error_reason"] == REASON_UNAUTHORIZED
+    assert s["last_error"] == REASON_MESSAGES[REASON_UNAUTHORIZED]
+    assert s["last_error_at"] == _T0.isoformat()
+
+
+async def test_every_failure_shape_arrives_distinguishably():
+    # Each of these sends the operator somewhere completely different, and
+    # collapsing any two of them into "Sonarr could not be reached" is what
+    # makes the report worthless.
+    for reason in (
+        REASON_BAD_URL, REASON_UNREACHABLE, REASON_REFUSED, REASON_TLS,
+        REASON_UNAUTHORIZED, REASON_NOT_SONARR, REASON_HTTP,
+    ):
+        c = _sonarr_canary(FakeSonarr(error=_sonarr_error(reason)))
+        await c.run_once()
+        s = c.status()
+        assert s["last_error_reason"] == reason, reason
+        assert s["state"] == STATE_SONARR, reason
+
+
+async def test_a_failure_keeps_what_the_last_working_check_saw():
+    # "Answered an hour ago with 42 series, failing now" and "never
+    # answered" are different situations and only one of them means the
+    # settings were always wrong.
+    clock = Clock()
+    sonarr = FakeSonarr()
+    c = _sonarr_canary(sonarr, clock=clock)
+    await c.run_once()
+    clock.advance(3600)
+    sonarr.error = _sonarr_error(REASON_REFUSED)
+    await c.run_once()
+
+    s = c.status()
+    assert s["state"] == STATE_SONARR
+    assert s["version"] == "4.0.10.2544"
+    assert s["series_count"] == 42
+    assert s["last_success"] == _T0.isoformat()
+    assert s["last_success_age_s"] == 3600.0
+
+
+async def test_a_failing_check_is_never_reported_as_a_stalled_one():
+    # A failure completes a round. If it did not, a check that is running
+    # perfectly and finding a real problem would drift to `stale` and start
+    # claiming nothing is checking Sonarr at all.
+    clock = Clock()
+    c = _sonarr_canary(
+        FakeSonarr(error=_sonarr_error(REASON_REFUSED)), clock=clock
+    )
+    await c.run_once()
+    clock.advance(60)
+    assert c.status()["state"] == STATE_SONARR
+
+
+async def test_a_check_that_stops_completing_goes_stale_and_degrades():
+    clock = Clock()
+    c = _sonarr_canary(FakeSonarr(), clock=clock, interval_s=3600.0)
+    await c.run_once()
+    assert c.status()["state"] == STATE_OK
+    clock.advance(3 * 3600.0 + 1)
+    s = c.status()
+    assert s["state"] == STATE_STALE
+    assert s["degraded"] is True
+    # ...and the last confirmed success is still reported, because "Sonarr
+    # worked at 09:00 and nothing has checked since" is a different sentence
+    # from "Sonarr is broken".
+    assert s["last_success"] == _T0.isoformat()
+
+
+async def test_a_hanging_sonarr_costs_the_round_its_timeout_and_no_more():
+    # A Sonarr that accepts the connection and then says nothing must not be
+    # able to wedge the loop the download worker and every route share.
+    c = _sonarr_canary(FakeSonarr(hang=True), probe_timeout_s=0.01)
+    await asyncio.wait_for(c.run_once(), timeout=2.0)
+    s = c.status()
+    assert s["state"] == STATE_SONARR
+    assert s["last_error_reason"] == "timeout"
+
+
+async def test_a_round_that_raises_something_unexpected_costs_only_that_round():
+    class Exploding:
+        async def status(self):
+            raise RuntimeError("boom")
+
+    c = _sonarr_canary(Exploding())
+    await c.run_once_guarded()
+    s = c.status()
+    assert s["state"] == STATE_SONARR
+    assert s["last_error_reason"] == "unknown"
+    # This module's own words, not the exception's: an unexpected type must
+    # not be able to smuggle its message onto a rendered page.
+    assert "boom" not in s["last_error"]
+
+
+async def test_the_sonarr_check_never_reports_the_api_key():
+    # The constraint the feature turns on. Every path: success, every
+    # classified failure, a timeout, and an unexpected exception that
+    # happens to be carrying the key in its own message.
+    key = "sekrit-sonarr-api-key"
+
+    class Leaky:
+        async def status(self):
+            raise RuntimeError(f"X-Api-Key: {key}")
+
+    checks = [_sonarr_canary(FakeSonarr()), _sonarr_canary(Leaky()),
+              _sonarr_canary(FakeSonarr(hang=True), probe_timeout_s=0.01)]
+    checks += [
+        _sonarr_canary(FakeSonarr(error=_sonarr_error(r)))
+        for r in REASON_MESSAGES
+    ]
+    for c in checks:
+        await c.run_once_guarded()
+        assert key not in repr(c.status())
+
+
+async def test_the_sonarr_check_calls_nothing_but_status():
+    sonarr = FakeSonarr()
+    c = _sonarr_canary(sonarr)
+    await c.run_once()
+    await c.run_once()
+    assert sonarr.calls == 2
+
+
+def test_the_unavailable_report_is_degraded_and_claims_nothing():
+    s = sonarr_unavailable_status()
+    assert s["state"] == STATE_UNAVAILABLE
+    assert s["degraded"] is True
+    assert s["needs_attention"] is True
+    assert s["version"] is None
+    assert s["series_count"] is None
+    # Same keys as a real report, so nothing rendering it has to branch on
+    # which of the two it was handed.
+    assert set(s) == set(_sonarr_canary(FakeSonarr()).status())
+
+
+async def test_run_forever_survives_a_round_that_raises():
+    class Exploding:
+        def __init__(self):
+            self.calls = 0
+
+        async def status(self):
+            self.calls += 1
+            raise RuntimeError("boom")
+
+    sonarr = Exploding()
+    c = _sonarr_canary(sonarr, interval_s=0.01)
+    task = asyncio.create_task(c.run_forever())
+    for _ in range(200):
+        await asyncio.sleep(0.01)
+        if sonarr.calls >= 2:
+            break
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert sonarr.calls >= 2, "the loop died on the first failing round"

@@ -57,6 +57,7 @@ from svtplay_arr.mappings import (
     remove_mapping,
 )
 from svtplay_arr.models import SOURCE_AUTO, JobStatus
+from svtplay_arr.sonarr import REASON_UNKNOWN, SonarrApiError
 from svtplay_arr.svt.client import SvtApiError, derive_slug
 from svtplay_arr.yamlio import ConcurrentModification, read_with_mtime
 
@@ -116,6 +117,23 @@ _CHECK_CSS_CLASS = {
     "error": "error",
     "unknown_mapping": "error",
 }
+
+# The same idea for the Sonarr Test connection control: one dict, read by
+# both the no-JS full-page re-render and the JSON the fetch consumes, so
+# they cannot paint the same outcome different colours.
+_SONARR_TEST_CSS_CLASS = {
+    "ok": "notice",
+    "failed": "error",
+    "incomplete": "warn",
+    "unavailable": "warn",
+}
+
+# How long the Test control waits for Sonarr. Shorter than the shared httpx
+# client's own 30s, because this one is bounded by a human sitting in front
+# of a page that has not finished loading -- and every route here is
+# `async def`, so an unbounded await would hold the event loop's attention
+# on one click for half a minute.
+_SONARR_TEST_TIMEOUT_S = 10.0
 
 
 async def _check_slug(svt, slug: str) -> dict:
@@ -216,6 +234,138 @@ async def _check_slug(svt, slug: str) -> dict:
             "title and an episode against Sonarr yourself before trusting "
             "this mapping."
         ),
+    }
+
+
+async def _sonarr_test(probe, url: str, api_key: str) -> dict:
+    """The one computation behind the Test connection control.
+
+    Both of its response paths -- the no-JS form POST that re-renders the
+    settings view, and the JS fetch that patches one line -- call this and
+    render its result verbatim, exactly as the mapping Check control does.
+
+    **It tests the values in the form, not the values in the file**, and
+    that is the deliberate choice. The operator clicks this having just
+    typed a key, to find out whether it is right *before* saving it; the
+    file cannot answer that until after a save, and since settings need a
+    restart the file is not what the service is running either. An
+    unmodified form renders exactly the effective on-disk values, so
+    testing the form with nothing changed is testing the file. What the
+    *running* service is using is a third question, and the background
+    `SonarrCanary` is what answers it.
+
+    The form already posts the key on every save, so reading it here is no
+    new exposure.
+
+    The one place the submitted value is overridden is `$SONARR_API_KEY`:
+    `Settings.load` gives the environment precedence over the file, so on
+    such a deployment the typed value is not what any restart would use.
+    Testing it would report on a value that can never take effect. The
+    precedence is mirrored rather than re-decided, and the result says
+    which key was actually used.
+
+    Read-only: two GETs against Sonarr and nothing else. It never touches
+    config.yaml, mappings.yaml or the job store.
+
+    Never raises. A check that could turn a page render into a 500 would be
+    a worse control than no control.
+    """
+    if probe is None:
+        return _sonarr_test_result(
+            "unavailable",
+            "Connection testing is not available in this deployment.",
+        )
+
+    url = (url or "").strip()
+    env_key = os.environ.get("SONARR_API_KEY") or ""
+    # Mirrors Settings.load and save_settings: the environment wins.
+    key = env_key.strip() or (api_key or "").strip()
+    used_env = bool(env_key.strip())
+    if not url or not key:
+        # Refused before any request: there is nothing to test, and saying
+        # "Sonarr rejected the key" about a blank field would send the
+        # operator to Sonarr for a problem that is on this page.
+        return _sonarr_test_result(
+            "incomplete",
+            "Fill in both the Sonarr URL and the API key, then test again. "
+            "Nothing was sent.",
+        )
+
+    try:
+        status = await asyncio.wait_for(
+            probe(url, key), timeout=_SONARR_TEST_TIMEOUT_S
+        )
+    except TimeoutError:
+        # `asyncio.TimeoutError` is this same builtin on 3.11+. A Sonarr
+        # that accepts the connection and then says nothing must not hold a
+        # page render open -- this is the bound that stops it.
+        return _sonarr_test_result(
+            "failed",
+            f"Sonarr did not answer within {_SONARR_TEST_TIMEOUT_S:g} seconds. "
+            "It may be starting up, overloaded, or behind something that is "
+            "silently dropping the connection.",
+            reason="timeout",
+        )
+    except SonarrApiError as exc:
+        # `str(exc)` is one of `sonarr.REASON_MESSAGES` -- a fixed literal
+        # naming the failure shape, with no URL and no key in it. Nothing
+        # here re-derives what went wrong; see sonarr.py.
+        return _sonarr_test_result("failed", str(exc), reason=exc.reason)
+    except Exception:
+        # A check must not be the one control that can 500. This module's
+        # own words rather than the exception's, so an unexpected type
+        # cannot smuggle its message -- or anything it is carrying -- onto
+        # the page.
+        log.warning("Sonarr connection test failed unexpectedly", exc_info=True)
+        return _sonarr_test_result(
+            "failed",
+            "The connection test failed unexpectedly. Check svtplay-arr's log.",
+            reason=REASON_UNKNOWN,
+        )
+
+    count = getattr(status, "series_count", None)
+    version = getattr(status, "version", None)
+    which_key = (
+        " (using $SONARR_API_KEY, which overrides the value in this form)"
+        if used_env else ""
+    )
+    if count == 0:
+        # Not a failure. A Sonarr with an empty library is correctly
+        # configured -- but it is also what the wrong Sonarr looks like, so
+        # the wording says both rather than picking one.
+        message = (
+            f"Sonarr {version} answered and accepted the key{which_key}, and "
+            "reports 0 series in its library. That is correct for a new "
+            "Sonarr, and is also what pointing at the wrong one looks like: "
+            "there is nothing here for svtplay-arr to map to yet."
+        )
+    else:
+        message = (
+            f"Sonarr {version} answered and accepted the key{which_key}, and "
+            f"reports {count} series in its library. Check that number "
+            "against the Sonarr you meant -- a different Sonarr answers this "
+            "just as happily."
+        )
+    return _sonarr_test_result(
+        "ok", message, version=version, series_count=count
+    )
+
+
+def _sonarr_test_result(
+    outcome: str, message: str, *, reason: str | None = None,
+    version: str | None = None, series_count: int | None = None,
+) -> dict:
+    """One shape for every outcome, so the two response paths and the JS
+    that consumes the JSON all branch on the same keys."""
+    return {
+        "outcome": outcome,
+        "css_class": _SONARR_TEST_CSS_CLASS.get(outcome, "error"),
+        # Which failure shape, for anything that wants to branch without
+        # matching on prose. One of `sonarr.REASON_*`, or None on success.
+        "reason": reason,
+        "version": version,
+        "series_count": series_count,
+        "message": message,
     }
 
 
@@ -386,7 +536,7 @@ def _recent_jobs(activity, limit: int = _STATUS_RECENT_LIMIT) -> list | None:
 def build_config_router(
     config_path: Path, mappings_path: Path, svt, sonarr, booted=None,
     status_provider=None, activity_provider=None,
-    mapping_state_provider=None,
+    mapping_state_provider=None, sonarr_probe=None,
 ) -> APIRouter:
     """`booted` is the `Settings` the service actually started with.
 
@@ -410,6 +560,15 @@ def build_config_router(
     on), and a provider that raises is caught and rendered as "status
     unavailable" rather than a 500 -- the config page must be at least as
     forgiving as `/health` itself.
+
+    `sonarr_probe`, if given, is `async (url, api_key) -> SonarrStatus`
+    raising `SonarrApiError` -- what the Test connection button calls. A
+    bare callable rather than a client, for the same reason as every other
+    seam here: this module builds no HTTP client and holds no Sonarr
+    knowledge of its own. Optional, and absent it the button is not
+    rendered at all, because a control that cannot do anything is worse
+    than no control (the same argument the Show/Hide button is built by
+    script rather than by the server).
 
     `mapping_state_provider`, if given, is a zero-argument callable
     returning `SvtCanary.per_mapping()` -- one dict per mapping saying when
@@ -748,7 +907,8 @@ def build_config_router(
         )
 
     async def _settings_view(
-        request: Request, error=None, notice=None, submitted=None
+        request: Request, error=None, notice=None, submitted=None,
+        sonarr_test=None,
     ):
         errors = [error] if error else []
         try:
@@ -796,6 +956,15 @@ def build_config_router(
                 # Drives the warning beside the API key field. Without it a
                 # save on an env-overridden deployment looks like it worked.
                 "env_overrides_api_key": _env_overrides_api_key(),
+                # Whether to render the Test connection control at all. A
+                # router built without a probe (as most tests are) gets a
+                # page with no button rather than a button that cannot
+                # answer.
+                "sonarr_test_enabled": sonarr_probe is not None,
+                # Set only by the no-JS test POST below. No view fills this
+                # in itself and no GET passes one, which is what keeps the
+                # control from ever firing on a page load.
+                "sonarr_test": sonarr_test,
                 **chrome,
             },
         )
@@ -965,6 +1134,41 @@ def build_config_router(
                 "apply (mappings apply immediately; settings do not)."
             )
         return await _settings_view(request, notice=notice)
+
+    @router.post("/settings/test", response_class=HTMLResponse)
+    async def test_sonarr_connection(request: Request):
+        """The Test connection control.
+
+        Strictly on demand, and read-only: this route is the only place
+        `sonarr_probe` is ever called, it writes nothing, and no GET can
+        reach it.
+
+        A second submit button in the settings form, via `formaction`, so
+        with JavaScript off it is an ordinary form POST that re-renders the
+        settings view with the result -- and with the operator's typed
+        values still in the boxes, because they have not saved yet and this
+        must not be the thing that loses their work.
+
+        Two response shapes over one computation, exactly as the mapping
+        Check control does it: a request asking for JSON (the fetch
+        enhancement sets `Accept: application/json` itself) gets the result
+        dict alone, anything else gets the whole page. Both render
+        `_sonarr_test`'s return value verbatim.
+        """
+        form = dict(await request.form())
+        submitted = {
+            f.key: str(form[f.key]) for f in SETTING_FIELDS if f.key in form
+        }
+        result = await _sonarr_test(
+            sonarr_probe,
+            submitted.get("sonarr_url", ""),
+            submitted.get("sonarr_api_key", ""),
+        )
+        if "application/json" in request.headers.get("accept", ""):
+            return JSONResponse(result)
+        return await _settings_view(
+            request, submitted=submitted, sonarr_test=result
+        )
 
     @router.get("/mappings/new", response_class=HTMLResponse)
     async def new_mapping(request: Request):
