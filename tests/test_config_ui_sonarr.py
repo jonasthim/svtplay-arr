@@ -26,6 +26,7 @@ import asyncio
 import html as html_mod
 import inspect
 import re
+import threading
 from pathlib import Path
 
 import pytest
@@ -402,12 +403,31 @@ def test_a_hanging_sonarr_does_not_hang_the_page(tmp_path: Path, monkeypatch):
     # Every route here is `async def`, so an unbounded await holds the event
     # loop the download worker runs on. A Sonarr that accepts the connection
     # and then says nothing must cost this click its timeout and no more.
+    #
+    # Run on a thread with a deadline of its own, deliberately: without the
+    # bound in `_sonarr_test` this request never returns, and a test that
+    # merely awaited it would wedge the whole run instead of failing. The
+    # thread is left behind if that happens -- it is a daemon, and a hung
+    # run is what this exists to prevent.
     monkeypatch.setattr(
         "svtplay_arr.api.config_ui._SONARR_TEST_TIMEOUT_S", 0.05
     )
-    r = _client(tmp_path, sonarr_probe=Probe(hang=True)).post(
-        "/config/settings/test", data=_form(tmp_path)
+    client = _client(tmp_path, sonarr_probe=Probe(hang=True))
+    done: list = []
+
+    def _post():
+        done.append(
+            client.post("/config/settings/test", data=_form(tmp_path))
+        )
+
+    thread = threading.Thread(target=_post, daemon=True)
+    thread.start()
+    thread.join(timeout=10.0)
+    assert not thread.is_alive(), (
+        "the render never returned -- the Sonarr call is unbounded"
     )
+
+    (r,) = done
     assert r.status_code == 200
     assert "did not answer within" in _result_text(r.text)
 
