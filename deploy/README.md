@@ -91,10 +91,9 @@ because a hardcoded slug rots — and reports:
   fixed by editing one row. This one deliberately leaves `status` at `"ok"`
   — see below.
 - `"state": "unresolvable"` — every mapping resolved on SVT, and at least one
-  of them returns a full episode list that can **never** match anything Sonarr
-  has. `unresolvable_series` names each one, with a `reason` (`no_ordinals` or
-  `no_air_date`) and a sentence saying which. Like `series`, this deliberately
-  leaves `status` at `"ok"` — see below.
+  of them can **never** produce a grab. `unresolvable_series` names each one,
+  with a `reason` and a sentence saying which. Like `series`, this
+  deliberately leaves `status` at `"ok"` — see below.
 - `"state": "unknown"` — nothing has been checked since this process started.
   Deliberately *not* reported as `ok`, and it becomes `"stale"` (and degraded)
   if no check ever completes.
@@ -127,11 +126,24 @@ why the check now asks a second question of each mapping and reports it:
     #             "svt_slug": "uppdrag-granskning", "reason": "no_ordinals",
     #             "note": "This mapping can never match anything. ..."}]}
 
-Zero matches is deliberately **not** the condition. Three shapes produce zero
+Three reasons, because each sends you somewhere different:
+
+| `reason` | What it means | What to do |
+| --- | --- | --- |
+| `no_ordinals` | No episode SVT lists carries an episode number, so every one is refused before any date is compared. | Nothing can fix it. Remove the row, or keep it knowing it is inert. |
+| `no_air_date` | The numbers are there and no episode agrees with a Sonarr episode on both number and air date. | Check the row points at the right programme, and check `air_date_tolerance_days`. |
+| `not_in_sonarr` | Sonarr's library has no series with this row's `tvdb_id`. | Remove the row, or add the series back to Sonarr. |
+
+Zero matches is deliberately **not** the condition. Two shapes produce zero
 matches and are not broken — Sonarr has no aired episode for the series yet,
-every SVT episode is still upcoming, or Sonarr has no such series at all —
-and none of them is reported. Only "SVT has available episodes, Sonarr has
-aired episodes, and no pair of them agrees" is.
+and every SVT episode is still upcoming — and neither is reported. Both are
+"nothing to compare *yet*".
+
+The **Check** button on the Mappings view answers the same question. It
+re-runs both halves live for one row: the slug, and whether its episodes can
+match anything Sonarr has. It shares the verdict with the background check,
+so it cannot tell you a row is fine while the page beside it says the row
+resolves nothing.
 
 The comparison costs one Sonarr episode-list read per mapping per round, plus
 one series-list read for the whole round, spread out at the same pace as the
