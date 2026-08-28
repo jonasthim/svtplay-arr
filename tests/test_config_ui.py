@@ -2,7 +2,7 @@ import asyncio
 import html as html_mod
 import os
 import re
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -18,6 +18,7 @@ from svtplay_arr.models import SonarrEpisode, SvtEpisode, SvtSearchHit
 from svtplay_arr.sonarr import (
     REASON_MESSAGES,
     REASON_REFUSED,
+    REASON_UNAUTHORIZED,
     SonarrApiError,
 )
 from svtplay_arr.svt.client import SvtApiError, derive_slug
@@ -2560,6 +2561,12 @@ def test_check_says_so_when_the_slug_works_and_the_mapping_cannot_match(
     assert "3 episode" in payload["message"]
 
 
+# The colour a finding wears. Named so the "must stay quiet" assertions
+# compare against the shipped value rather than a literal that a rename
+# would leave silently true.
+_CHECK_WARN = "warn"
+
+
 def _numberless(n: int) -> list[SvtEpisode]:
     """The `uppdrag-granskning` shape: real episodes, no episode numbers."""
     return [
@@ -2572,51 +2579,149 @@ def _numberless(n: int) -> list[SvtEpisode]:
     ]
 
 
-@pytest.mark.parametrize("reason", ["no_ordinals", "not_in_sonarr"])
-def test_check_and_the_page_cannot_disagree_about_one_mapping(
-    tmp_path: Path, reason: str,
-):
-    """Every reason, not just the one that was easiest to reach for.
+class _EpisodesRefused:
+    """A Sonarr that lists the series and then refuses the episode call.
 
-    The two surfaces are one function apart -- `canary.check_resolvability`
-    -- so the row's verdict and the button's verdict have to be the same
-    *sentence*, not two renderings of a shared intention. Asserting only
-    the reason code would let this pass while Check said something of its
-    own, which is exactly the drift a shared implementation is for: a
-    mutation that restated the missing-series verdict in Check's own words
-    passed the whole suite before this test named that reason too.
+    Distinct from a Sonarr that cannot be reached at all: the series
+    lookup succeeds, so the verdict comes from `check_resolvability`
+    itself rather than from `_check_match`'s own guard, which is what makes
+    the `sonarr_unavailable` note comparable between the two surfaces.
+    """
+
+    series = list(_DEFAULT_SERIES)
+
+    async def all_series(self):
+        return self.series
+
+    async def series_id_for_tvdb(self, tvdb_id):
+        return SONARR_SERIES_ID
+
+    async def episodes(self, series_id):
+        raise SonarrApiError(
+            REASON_MESSAGES[REASON_UNAUTHORIZED], reason=REASON_UNAUTHORIZED
+        )
+
+
+def _upcoming(n: int) -> list[SvtEpisode]:
+    """Episodes SVT lists and has not released: a show between seasons."""
+    return [
+        SvtEpisode(
+            svt_id=f"ep{i}", title=f"{i}. Episode", url=f"/video/ep{i}/s/avsnitt-{i}",
+            ordinal=i, published=date(2026, 12, 1), available=False,
+            duration_s=1800,
+        )
+        for i in range(1, n + 1)
+    ]
+
+
+# Every verdict Check can reach, and what produces it. The two surfaces are
+# one function apart -- `canary.check_resolvability` -- so each of these has
+# to arrive at the page as the *same sentence*, not as two renderings of a
+# shared intention.
+#
+# `sonarr_unavailable` here is the episode call failing, not the series
+# lookup: the lookup's own failure is `_check_match`'s guard and has no
+# shared sentence to compare against. Those three branches are pinned
+# separately, below.
+_VERDICTS = {
+    "no_ordinals": (
+        lambda: _numberless(3),
+        lambda: _matching_sonarr(_sonarr_episodes(3, date(2026, 8, 20))),
+    ),
+    "no_air_date": (
+        lambda: _dated_episodes(3, date(2026, 8, 20)),
+        lambda: _matching_sonarr(_sonarr_episodes(3, date(2025, 8, 20))),
+    ),
+    "not_in_sonarr": (
+        lambda: _dated_episodes(3, date(2026, 8, 20)),
+        lambda: FakeSonarr(series=[]),
+    ),
+    "nothing_available": (
+        lambda: _upcoming(3),
+        lambda: _matching_sonarr(_sonarr_episodes(3, date(2026, 8, 20))),
+    ),
+    "nothing_aired": (
+        lambda: _dated_episodes(3, date(2026, 8, 20)),
+        lambda: _matching_sonarr([]),
+    ),
+    "sonarr_unavailable": (
+        lambda: _dated_episodes(3, date(2026, 8, 20)),
+        _EpisodesRefused,
+    ),
+}
+
+
+def _shared_verdict(sonarr, episodes):
+    """What `canary.check_resolvability` says about the same two lists.
+
+    Built from a *fresh* client, so the route's own call counts are not
+    disturbed, and with the clock the route reads rather than a local one.
     """
     from svtplay_arr.canary import check_resolvability
 
-    sonarr_eps = _sonarr_episodes(3, date(2026, 8, 20))
-    if reason == "no_ordinals":
-        episodes = _numberless(3)
-        sonarr = _matching_sonarr(sonarr_eps)
-        series_id = SONARR_SERIES_ID
-    else:
-        episodes = _dated_episodes(3, date(2026, 8, 20))
-        sonarr = FakeSonarr(series=[])
-        series_id = None
+    async def go():
+        series_id = await sonarr.series_id_for_tvdb(288649)
+        return await check_resolvability(
+            sonarr, episodes, tvdb_id=288649, series_id=series_id,
+            slug="gift-vid-forsta-ogonkastet",
+            tolerance_days=Settings.air_date_tolerance_days,
+            today=datetime.now(timezone.utc).date(), timeout_s=5.0,
+        )
+
+    return asyncio.run(go())
+
+
+@pytest.mark.parametrize("reason", sorted(_VERDICTS))
+def test_check_and_the_page_cannot_disagree_about_one_mapping(
+    tmp_path: Path, reason: str,
+):
+    """Every verdict, not just the ones that were easiest to reach for.
+
+    Asserting only the reason code would let this pass while Check said
+    something of its own, which is exactly the drift a shared
+    implementation is for: a mutation that restated the missing-series
+    verdict in Check's own words passed the whole suite before this test
+    named that reason, and a mutation that shortened the `no_air_date`
+    sentence passed before it named that one. That sentence is the only
+    place the configured `air_date_tolerance_days` reaches the operator, so
+    a shortened copy costs them the lever.
+    """
+    make_episodes, make_sonarr = _VERDICTS[reason]
+    episodes = make_episodes()
 
     payload = _client(
-        tmp_path, svt=FakeSvt(episodes=episodes), sonarr=sonarr,
+        tmp_path, svt=FakeSvt(episodes=episodes), sonarr=make_sonarr(),
     ).post(
         "/config/mappings/288649/check", headers={"Accept": "application/json"}
     ).json()
 
-    # The verdict the background check would reach for the same two lists,
-    # computed straight from the shared function.
-    background = asyncio.run(check_resolvability(
-        _matching_sonarr(sonarr_eps), episodes,
-        tvdb_id=288649, series_id=series_id,
-        slug="gift-vid-forsta-ogonkastet",
-        tolerance_days=Settings.air_date_tolerance_days,
-        today=date(2026, 8, 27), timeout_s=5.0,
-    ))
+    shared = _shared_verdict(make_sonarr(), episodes)
 
-    assert background.reason == reason
-    assert payload["unresolvable_reason"] == background.reason
-    assert background.note in payload["message"]
+    assert shared.reason == reason
+    assert shared.note in payload["message"]
+    assert payload["resolves"] == shared.resolves
+    assert payload["unresolvable_reason"] == (
+        shared.reason if shared.is_finding else None
+    )
+
+
+def test_the_no_air_date_sentence_carries_the_configured_tolerance(
+    tmp_path: Path,
+):
+    # The one reason whose sentence names an actionable number. Without it
+    # the operator is told the dates disagree and never learns that the
+    # window they disagree by is a setting they can widen.
+    payload = _client(
+        tmp_path, svt=FakeSvt(episodes=_dated_episodes(3, date(2026, 8, 20))),
+        sonarr=_matching_sonarr(_sonarr_episodes(3, date(2025, 8, 20))),
+    ).post(
+        "/config/mappings/288649/check", headers={"Accept": "application/json"}
+    ).json()
+
+    assert payload["unresolvable_reason"] == "no_air_date"
+    assert (
+        f"{Settings.air_date_tolerance_days} day" in payload["message"]
+    ), payload["message"]
 
 
 def test_check_confirms_the_matching_half_when_it_does_resolve(tmp_path: Path):
@@ -2689,27 +2794,131 @@ def test_check_does_not_read_as_an_all_clear_when_sonarr_cannot_be_asked(
     assert "SECRET-KEY-VALUE" not in payload["message"]
 
 
-def test_check_says_plainly_when_there_is_nothing_to_compare_yet(
-    tmp_path: Path,
+@pytest.mark.parametrize("reason", ["nothing_available", "nothing_aired"])
+def test_check_never_cries_wolf_over_a_shape_that_is_not_broken(
+    tmp_path: Path, reason: str,
 ):
-    # A series between seasons, or one Sonarr has only just added. Not a
-    # finding, and deliberately not coloured as one -- a control that cried
-    # wolf here would be the same noise the finding exists to avoid, on the
-    # button the operator pressed on purpose. It still says so plainly.
-    client = _client(
-        tmp_path, svt=FakeSvt(episodes=_dated_episodes(3, date(2026, 8, 20))),
-        sonarr=_matching_sonarr([]),
-    )
+    """The two must-stay-quiet shapes, on the control pressed deliberately.
 
-    payload = client.post(
+    A series between seasons (every SVT episode still upcoming), and one
+    Sonarr has only just added (nothing aired). Neither is a mapping that
+    can never work, and reporting either as one is the false alarm this
+    whole feature is built to avoid -- worse here than on the page, because
+    the operator asked this question on purpose and gets the answer in
+    isolation.
+
+    Both were undefended: `nothing_aired` had a guard, `nothing_available`
+    had none, and painting it as `resolves_nothing`/`warn` passed the whole
+    suite. The verdict is the shared function's, so the canary-side
+    exclusion tests protect the *decision*; these protect how Check
+    *renders* it, which is a separate thing that can drift on its own.
+    """
+    make_episodes, make_sonarr = _VERDICTS[reason]
+    payload = _client(
+        tmp_path, svt=FakeSvt(episodes=make_episodes()), sonarr=make_sonarr(),
+    ).post(
         "/config/mappings/288649/check", headers={"Accept": "application/json"}
     ).json()
 
-    assert payload["outcome"] == "found"
-    assert payload["css_class"] == "notice"
+    # Never the finding, never its colour, and never claimed as resolving.
+    assert payload["outcome"] != "resolves_nothing"
+    assert payload["css_class"] != _CHECK_WARN
+    assert payload["resolves"] is None
+    assert payload["unresolvable_reason"] is None
+    assert "can never match" not in payload["message"]
+    # ...and it does not read as an all-clear either: the second half is
+    # explicitly unsettled, with the reason it could not be settled.
+    assert "was not settled" in payload["message"]
+    assert "Nothing to compare yet" in payload["message"]
+
+
+# The three ways the matching half can fail, and the rule they share: the
+# message is this module's own words plus Sonarr's fixed literals, never the
+# exception's. The generic `except Exception` branches were both correct and
+# both unexercised -- mutating either to append `{exc}` passed the whole
+# suite -- which is one refactor "for debuggability" away from putting an
+# httpx message, request headers and all, into a JSON body on an
+# internet-reachable page.
+
+_LEAKY = "X-Api-Key: SECRET-KEY-VALUE and a stack trace"
+
+
+@pytest.mark.parametrize(
+    "failing_call", ["series_id_for_tvdb", "episodes"],
+)
+def test_an_unexpected_sonarr_failure_never_reaches_the_page(
+    tmp_path: Path, failing_call: str,
+):
+    class Leaky:
+        series = list(_DEFAULT_SERIES)
+
+        async def all_series(self):
+            return self.series
+
+        async def series_id_for_tvdb(self, tvdb_id):
+            if failing_call == "series_id_for_tvdb":
+                raise RuntimeError(_LEAKY)
+            return SONARR_SERIES_ID
+
+        async def episodes(self, series_id):
+            raise RuntimeError(_LEAKY)
+
+    client = _client(
+        tmp_path, svt=FakeSvt(episodes=_dated_episodes(3, date(2026, 8, 20))),
+        sonarr=Leaky(),
+    )
+    payload = client.post(
+        "/config/mappings/288649/check", headers={"Accept": "application/json"}
+    ).json()
+    html = client.post("/config/mappings/288649/check").text
+
+    assert payload["outcome"] == "match_unchecked"
     assert payload["resolves"] is None
     assert "was not settled" in payload["message"]
-    assert "no aired episode" in payload["message"]
+    # Not the key, and not the exception's text at all -- asserting only on
+    # the key would still pass a message that appended `{exc}` from an
+    # exception that happened not to carry one.
+    for rendered in (repr(payload), html):
+        assert "SECRET-KEY-VALUE" not in rendered
+        assert "stack trace" not in rendered
+    # ...and it still says where to look instead.
+    assert "log" in payload["message"].lower()
+
+
+def test_a_hanging_sonarr_does_not_stall_the_check(tmp_path: Path):
+    # The route is bounded on both Sonarr calls. Without that, Check on a
+    # page an operator opened because something is already wrong would hang
+    # the render on the dependency that is wrong.
+    import svtplay_arr.api.config_ui as config_ui_module
+
+    class Hanging:
+        series = list(_DEFAULT_SERIES)
+
+        async def all_series(self):
+            return self.series
+
+        async def series_id_for_tvdb(self, tvdb_id):
+            await asyncio.sleep(3600)
+
+        async def episodes(self, series_id):
+            await asyncio.sleep(3600)
+
+    original = config_ui_module._CHECK_SONARR_TIMEOUT_S
+    config_ui_module._CHECK_SONARR_TIMEOUT_S = 0.01
+    try:
+        payload = _client(
+            tmp_path,
+            svt=FakeSvt(episodes=_dated_episodes(3, date(2026, 8, 20))),
+            sonarr=Hanging(),
+        ).post(
+            "/config/mappings/288649/check",
+            headers={"Accept": "application/json"},
+        ).json()
+    finally:
+        config_ui_module._CHECK_SONARR_TIMEOUT_S = original
+
+    assert payload["outcome"] == "match_unchecked"
+    assert "did not answer" in payload["message"]
 
 
 def test_a_failed_slug_check_costs_no_sonarr_request(tmp_path: Path):

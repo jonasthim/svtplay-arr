@@ -1396,12 +1396,29 @@ async def test_a_hanging_sonarr_costs_one_probe_and_not_the_round():
     assert s["unresolvable"] == 0
 
 
-async def test_a_sonarr_that_raises_something_unexpected_says_this_modules_words():
+@pytest.mark.parametrize("failing_call", ["all_series", "episodes"])
+async def test_a_sonarr_that_raises_something_unexpected_says_this_modules_words(
+    failing_call: str,
+):
+    """Both generic guards, not just the one that was easy to reach.
+
+    An httpx exception chains to a `RequestError` carrying the whole
+    `Request` -- headers included -- so anything that renders an
+    exception's own text is one refactor from printing the API key. Only
+    the `all_series` guard was exercised; mutating the `episodes` one to
+    append `{exc}` passed the whole suite.
+    """
     key = "sekrit-sonarr-api-key"
+    boom = f"X-Api-Key: {key} at line 42 of somewhere"
 
     class Leaky:
         async def all_series(self):
-            raise RuntimeError(f"X-Api-Key: {key}")
+            if failing_call == "all_series":
+                raise RuntimeError(boom)
+            return [{"tvdbId": 1, "id": 1001}]
+
+        async def episodes(self, series_id):
+            raise RuntimeError(boom)
 
     svt = FakeSvt(results={"show-1": _episodes(3)})
     c = _canary([_mapping(1)], svt, sonarr=Leaky(), tolerance_days=1)
@@ -1409,8 +1426,72 @@ async def test_a_sonarr_that_raises_something_unexpected_says_this_modules_words
 
     s = c.status()
     assert s["resolvability_unknown"] == 1
-    assert key not in repr(s)
-    assert key not in repr(c.per_mapping())
+    assert s["unresolvable"] == 0
+    # Not the key, and not the exception's text at all: asserting only on
+    # the key would still pass a message that appended `{exc}` from an
+    # exception that happened not to be carrying one.
+    for rendered in (repr(s), repr(c.per_mapping())):
+        assert key not in rendered
+        assert "line 42" not in rendered
+    # ...and it still says where to look instead.
+    assert "log" in _row(c)["resolvability_note"].lower()
+
+
+async def test_a_verdict_never_outlives_the_round_that_earned_it():
+    """`_merge`'s own stated invariant, which nothing was holding up.
+
+    `last_success` and `episode_count` are high-water marks on purpose --
+    "worked an hour ago" and "never worked" are different situations. The
+    resolvability verdict is the opposite: it is a claim about *now*, and
+    carrying a `False` across a round that looked at nothing leaves an
+    accusation standing over evidence nobody gathered.
+
+    It also breaks the page in a specific, confusing way: `unresolvable`
+    is this round's counter, so `/health` would report 0 and render no
+    banner while the table still showed the amber chip -- the two
+    derivations of one fact disagreeing, which is the defect class this
+    project watches for hardest.
+    """
+    svt = FakeSvt(results={"show-1": _episodes(3)})
+    sonarr = FakeSonarrLibrary({1: _aired(3, first=date(2025, 8, 20))})
+    c = _canary([_mapping(1)], svt, sonarr=sonarr, tolerance_days=1)
+    await c.run_once()
+    assert c.status()["unresolvable"] == 1
+    assert _row(c)["resolves"] is False
+
+    # ...and now Sonarr goes away, so this round knows nothing.
+    sonarr.series_error = _sonarr_error(REASON_REFUSED)
+    await c.run_once()
+
+    s = c.status()
+    row = _row(c)
+    assert s["unresolvable"] == 0
+    assert s["resolvability_unknown"] == 1
+    # The row must agree with the count. A stale False here is the chip
+    # and the banner telling two different stories.
+    assert row["resolves"] is None
+    assert row["unresolvable_reason"] is None
+    # The SVT half's own high-water marks are untouched by that: they are
+    # a different kind of claim and keep their previous values.
+    assert row["ok"] is True
+    assert row["episode_count"] == 3
+
+
+async def test_a_verdict_is_also_dropped_when_svt_itself_fails():
+    # Same invariant from the other side: an SVT failure means there was
+    # no episode list to compare, so the previous verdict is not evidence
+    # about this round either.
+    svt = FakeSvt(results={"show-1": _episodes(3)})
+    sonarr = FakeSonarrLibrary({1: _aired(3, first=date(2025, 8, 20))})
+    c = _canary([_mapping(1)], svt, sonarr=sonarr, tolerance_days=1)
+    await c.run_once()
+    assert _row(c)["resolves"] is False
+
+    svt.results["show-1"] = SvtApiError("404", status_code=404)
+    await c.run_once()
+
+    assert c.status()["unresolvable"] == 0
+    assert _row(c)["resolves"] is None
 
 
 async def test_no_sonarr_client_leaves_resolvability_undetermined():
