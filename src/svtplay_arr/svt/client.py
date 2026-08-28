@@ -279,14 +279,44 @@ def _details_page_query(alias: str) -> str:
 
     Every field here is read by `episodes_from_details_page`; nothing is
     requested speculatively. In particular `item.number` is *not* asked
-    for. It exists, it is populated for every episode of shows the old
-    scraper could not derive an ordinal for at all, and adopting it is the
-    obvious next step -- but it is also populated for specials, where the
-    scraper correctly produced `None`, and `resolver.py::_recent_for`
-    states that as an assumption it relies on. Changing the ordinal is a
-    safety decision that deserves its own change and its own tests, not a
-    side effect of changing transport. So the ordinal keeps coming from
-    `heading` and `urls.svtplay` via `_ordinal`, exactly as before.
+    for, and that is now a settled decision rather than a deferral --
+    investigated against the live API on 2026-08-28 across seven shows and
+    234 episodes, and rejected. Do not adopt it. The short version:
+
+    `number` is not this episode's position in the run the page shows. It
+    is its index inside an SVT-internal season grouping that
+    `detailsPageByPath` does not expose and whose boundaries cut across the
+    selections it does. On `agenda` a single `productionPeriod` selection
+    interleaves four such groupings, so four different available episodes
+    carry `number == 1` -- one of them titled "Agenda special". On
+    `uppdrag-granskning` 47 of 59 available episodes share a `number` with
+    another, because the `2026` and `Sommar 2026` selections both number
+    theirs 1..9; among the five carrying `number == 1` is "The last eel",
+    the English-language version of episode 27.
+
+    And nothing in the response separates a special from a numbered
+    episode. `positionInSeason` is empty for every episode that would gain
+    an ordinal (and non-empty only where `_ordinal` already agrees, so it
+    gates in exactly zero). `selectionType`, `listPresentation` and
+    `presentationHint` are identical for a season and for a one-off
+    special filed as one. `numberOfEpisodesInSeason` is inconsistent.
+    `analyticsIdentifiers.viewId` carries a season slot that reads
+    `sasong 0` for gvfo's special -- and `0` for all 36 of Agenda's
+    episodes and for a genuine numbered episode of Uppdrag granskning, so
+    it refuses real content on two shows of seven. `Episode.parent`
+    returns the series; there is no `Season` type in the graph.
+
+    So the ordinal keeps coming from `heading` and `urls.svtplay` via
+    `_ordinal`. The cost is real and is not being hidden: shows grouped by
+    `productionPeriod` resolve nothing at all, today and for the
+    foreseeable future. That is the cheaper failure. An ordinal that is
+    absent leaves an episode Wanted; an ordinal that is wrong writes a
+    permanent filename, because Sonarr runs `renameEpisodes=False`.
+
+    Full evidence, including what would make this worth revisiting (a
+    typed `episodeType`, a reachable `Season`, or `positionInSeason`
+    becoming populated), is in
+    `docs/design/2026-08-28-svt-episode-ordinals.md`.
 
     `exclude: [clips, related]` rather than `include:` because `include`
     and `addExtras` cannot be combined ("addExtras and include cannot be

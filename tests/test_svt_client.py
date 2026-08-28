@@ -252,13 +252,28 @@ def test_the_shipped_query_asks_for_upcoming_episodes():
 
 
 def test_the_shipped_query_does_not_ask_for_item_number():
-    """The Stage 1 boundary, pinned in the one place it is visible.
+    """Do not delete this as redundant. It is not redundant.
 
-    `item.number` would give an ordinal to shows `_ordinal` cannot handle at
-    all -- and to specials, where the scraper correctly gave None and
-    `resolver.py::_recent_for` relies on it. Adopting it is a safety change
-    with its own tests. Asking for it here would make the client look like
-    it had already decided.
+    `item.number` was investigated live on 2026-08-28 and rejected: it is an
+    index into a hidden season grouping, it is ambiguous on every show it
+    would unlock, and no field in the response separates a special from a
+    numbered episode. See `_details_page_query`'s docstring and
+    `docs/design/2026-08-28-svt-episode-ordinals.md`.
+
+    This assertion is the *only* thing in the suite that catches the
+    tempting form of that change. Adopting `number` wholesale fails
+    thirteen tests, so nobody would ship it. But adding it as a *fallback*
+    behind `_ordinal` -- which cannot alter any ordinal that exists today,
+    and so looks obviously safe -- fails this test and nothing else. It
+    cannot fail a response-driven test, because no captured fixture
+    contains `number`: the shipped query does not ask for it, so under that
+    mutation `item.get("number")` is None on every recorded episode while
+    production behaviour changes on three real shows. Verified by mutation:
+    1 failed, 1034 passed.
+
+    `test_the_query_asks_for_every_field_the_reader_actually_reads` is the
+    complementary half and does not cover this. It catches reading a field
+    the query does not request; this catches requesting it at all.
     """
     assert "number" not in _details_page_query("qtest")
 

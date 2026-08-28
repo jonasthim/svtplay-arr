@@ -387,7 +387,7 @@ def test_back_catalogue_episodes_stop_carrying_an_invented_year():
 
 
 def test_uppdrag_granskning_still_has_no_ordinals_and_still_will_not_resolve():
-    """Change 3, and it is deliberately *not* a change yet.
+    """Change 3, and it is deliberately not a change -- now permanently.
 
     The brief for this migration expected Uppdrag granskning to start
     resolving. It does not, and it must not: that show is grouped by
@@ -396,12 +396,24 @@ def test_uppdrag_granskning_still_has_no_ordinals_and_still_will_not_resolve():
     `episode_matches` signal 2 refuses every one of them, exactly as it
     does today.
 
-    `item.number` is populated for all 61 and would unlock the show. It is
-    also populated for specials, where the scraper correctly gave None, and
-    `resolver.py::_recent_for` states that as an assumption it relies on.
-    Adopting it is a safety decision with its own tests, not a side effect
-    of changing transport. This test is the marker that it has not happened
-    yet; it is meant to be rewritten by the change that does it.
+    This test was originally written as a marker, "meant to be rewritten by
+    the change that does it". That change was investigated against the live
+    API on 2026-08-28 and **rejected**, so this is no longer a marker: it
+    is the assertion that a rejected change stayed rejected.
+
+    `item.number` is populated for all 61, but it is not this episode's
+    position in the run the page shows -- it indexes a hidden season
+    grouping that cuts across the selections, so `2026` and `Sommar 2026`
+    both number their episodes 1..9 and 47 of the show's 59 available
+    episodes end up sharing a number. Among the five carrying `number == 1`
+    is "The last eel", the English-language version of episode 27. No field
+    in the response separates a special from a numbered episode; the
+    candidates and why each fails are in
+    `docs/design/2026-08-28-svt-episode-ordinals.md`.
+
+    So this show resolves nothing, and that is the intended trade: an
+    absent ordinal leaves an episode Wanted, a wrong one writes a permanent
+    filename.
     """
     episodes = _details("uppdrag-granskning")
 
@@ -470,7 +482,14 @@ def test_extracts_ordinal_from_an_avsnitt_slug(gvfo):
 
 def test_a_special_still_has_no_ordinal(gvfo):
     """`item.number` says 1 for this one. `_ordinal` says None, which is
-    what the scraper said and what `_recent_for` relies on. See
+    what the scraper said and what `_recent_for` relies on.
+
+    Live probing on 2026-08-28 found nothing in the response that marks it
+    as a special. It sits in a `season` selection of its own whose
+    `selectionType`, `listPresentation` and `presentationHint` are
+    identical to the two real runs beside it; only the editor-typed
+    selection name differs. Giving it an ordinal would make it eligible to
+    claim a regular episode on air date alone. See
     `test_uppdrag_granskning_still_has_no_ordinals...` above."""
     special = next(e for e in gvfo if e.svt_id == "KBMY9zX")
     assert special.title == "Gift vid första ögonkastet - Vad hände sen?"

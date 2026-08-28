@@ -234,6 +234,21 @@ Neither signal works alone: two episodes of the worked example share an air
 date, so date alone is ambiguous, and SVT's season labelling makes any rule
 that reads it walk straight into the trap.
 
+**Some shows have no ordinal at all, and so resolve nothing.** The ordinal is
+read from `/avsnitt-N` in the play URL or a leading `N.` in the episode
+heading. Shows whose episodes are titled by subject rather than number —
+`uppdrag-granskning` and `agenda` are the ones checked — carry neither, so
+signal 2 refuses every episode of them. Mapped, they will simply never
+produce a release, which looks identical to a show with nothing new.
+
+SVT's own `item.number` would fill that gap, and it is deliberately not used.
+It indexes a season grouping SVT does not expose, it is ambiguous on exactly
+those shows, and nothing in the response distinguishes a special from a
+numbered episode — so adopting it would put an ordinal on specials and let
+one claim a regular episode on air date alone, writing a permanently wrong
+filename. The full measurement is in
+[`2026-08-28-svt-episode-ordinals.md`](design/2026-08-28-svt-episode-ordinals.md).
+
 ### Exactly when `resolve()` returns nothing
 
 All of these produce `None` and leave the episode Wanted. Each one logs its
