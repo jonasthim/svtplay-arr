@@ -204,6 +204,11 @@ the same rule, which is what keeps "run the same command again" meaningful.
 `--ref main` installs the development branch if you want it, and
 `--ref v1.2.3` pins an exact release.
 
+If you mean to deploy a **specific** release, pass `--ref vX.Y.Z` explicitly:
+the default is deliberately the newest tag at the moment the installer runs,
+so a plain re-run some time after "deploy v1.2.3" was decided can land a
+later tag instead.
+
 ### How uv is installed
 
 `install.sh` does not run `curl https://astral.sh/uv/install.sh | sh`. That

@@ -799,23 +799,56 @@ release_id() { printf '%s' "${1:0:12}"; }
 
 # pyproject.toml has no static version field to read any more -- three
 # releases shipped with one nobody remembered to bump, which is the whole
-# defect this replaces (see pyproject.toml's [tool.hatch.version] comment).
-# `git describe` reads the same tag the Python package's own version is
-# built from, straight out of the full clone fetch_release() already made:
-# the tag itself on an exact release (0.3.0), or that tag plus how far HEAD
-# has moved past it (0.3.0-4-g<sha>) on anything else -- which is exactly
-# the "honestly distinguishable from a release" shape a build in between
-# tags should report. "unknown" only if $dir turns out not to be a git
-# checkout at all, which nothing this script does produces.
+# defect PEP 440-via-hatch-vcs replaced (see pyproject.toml's
+# [tool.hatch.version] comment). The first fix here was `git describe`
+# against the checkout fetch_release() clones -- correct in isolation, and
+# what shipped as v0.3.1. It was still wrong in production: set_ownership()
+# runs on *every* install and upgrade, and it chowns every release directory
+# -- .git included -- to the service account. By the next run, this
+# script's own `git`, running as root, refuses to touch a directory root
+# does not own ("detected dubious ownership in repository"), and the
+# `2>/dev/null` this function already had swallowed the reason, leaving
+# only "unknown". `/health`, uv's own install line and a bare
+# `importlib.metadata.version()` all kept working through the same
+# upgrades, because none of them ask git anything -- they read the
+# venv's installed distribution metadata, which ownership never touches.
 #
-# The leading "v" this project's tags use (v0.1.0, v0.2.0, ...) is stripped
-# so this reads like the version hatch-vcs reports at /health, which drops
-# it too (PEP 440 has no "v" prefix) -- one tag, two tools, the same number
-# in both places rather than a cosmetic mismatch an operator has to learn
-# to ignore.
+# So that is what this asks first: the venv's own interpreter, reporting
+# its own installed "svtplay-arr" distribution. It is what every other
+# working consumer already reads, it describes what is actually installed
+# rather than what git believes was meant to be, and it cannot disagree
+# with /health because it is the same call /health makes.
+#
+# `git describe` is kept as a fallback, tried only when the venv can't
+# answer -- no interpreter (a release directory left half-built by an
+# interrupted run) or no "svtplay-arr" distribution recorded in it. In
+# that case the checkout is the only version information left on disk, and
+# `-c safe.directory` is passed explicitly so the same ownership mismatch
+# that broke the first fix cannot take the fallback out too. The leading
+# "v" this project's tags use (v0.1.0, v0.2.0, ...) is stripped so this
+# reads like the version hatch-vcs reports (PEP 440 has no "v" prefix).
+#
+# "unknown" is left for when neither source has anything to say: no venv,
+# and $dir is not a git checkout either.
 project_version() {
-    local dir=$1 v
-    v=$("$SVTPLAY_ARR_GIT" -C "$dir" describe --tags --always --dirty 2>/dev/null || true)
+    local dir=$1 python=$1/.venv/bin/python v
+
+    if [[ -x $python ]]; then
+        v=$("$python" -c '
+import importlib.metadata as m, sys
+try:
+    print(m.version("svtplay-arr"))
+except m.PackageNotFoundError:
+    sys.exit(1)
+' 2>/dev/null || true)
+        if [[ -n $v ]]; then
+            printf '%s' "$v"
+            return 0
+        fi
+    fi
+
+    v=$("$SVTPLAY_ARR_GIT" -c "safe.directory=${dir}" -C "$dir" \
+        describe --tags --always --dirty 2>/dev/null || true)
     [[ $v == v[0-9]* ]] && v=${v#v}
     printf '%s' "${v:-unknown}"
 }

@@ -386,6 +386,40 @@ fi
 mkdir -p "$project/.venv/bin"
 printf '#!/bin/sh\\nexit 0\\n' >"$project/.venv/bin/uvicorn"
 chmod 0755 "$project/.venv/bin/uvicorn"
+
+# A real interpreter plus a real installed-distribution record, so
+# project_version's primary path -- reading importlib.metadata through the
+# venv it belongs to -- is exercised as written, the same as a real `uv
+# sync` leaves behind, rather than skipped in favour of the git fallback
+# every test used to fall through to.
+python3 -m venv --without-pip --symlinks "$project/.venv" >/dev/null 2>&1
+if [ -x "$project/.venv/bin/python3" ]; then
+    exact=$(git -C "$project" describe --tags --exact-match 2>/dev/null || true)
+    if [ -n "$exact" ]; then
+        ver=${exact#v}
+    else
+        # No exact tag: the shape hatch-vcs's default scheme actually
+        # produces for an in-between-releases build -- the next version
+        # with a .devN+g<sha> suffix, per pyproject.toml's
+        # [tool.hatch.version] comment -- not raw `git describe` output.
+        last_tag=$(git -C "$project" describe --tags --abbrev=0 2>/dev/null || true)
+        sha=$(git -C "$project" rev-parse --short HEAD 2>/dev/null || true)
+        if [ -n "$last_tag" ]; then
+            count=$(git -C "$project" rev-list "${last_tag}..HEAD" --count 2>/dev/null || echo 0)
+            base=${last_tag#v}
+            IFS=. read -r maj min pat <<<"$base"
+            ver="${maj}.${min}.$((pat + 1)).dev${count}+g${sha}"
+        else
+            count=$(git -C "$project" rev-list HEAD --count 2>/dev/null || echo 0)
+            ver="0.0.0.dev${count}+g${sha}"
+        fi
+    fi
+    purelib=$("$project/.venv/bin/python3" -c \
+        'import sysconfig; print(sysconfig.get_path("purelib"))')
+    mkdir -p "$purelib/svtplay_arr-$ver.dist-info"
+    printf 'Metadata-Version: 2.1\\nName: svtplay-arr\\nVersion: %s\\n' "$ver" \\
+        >"$purelib/svtplay_arr-$ver.dist-info/METADATA"
+fi
 """,
     )
 
@@ -486,6 +520,12 @@ def test_fresh_install_produces_a_running_release(harness: Harness):
     assert "Next steps" in proc.stdout
     assert "Rename Episodes OFF" in proc.stdout
     assert "/config" in proc.stdout
+
+    # A fresh install has a real version to report from the moment it is
+    # built -- "unknown" is for when there is genuinely nothing installed,
+    # not for the thing this run just installed.
+    assert "installed: 0.1.0" in proc.stdout
+    assert "unknown" not in proc.stdout
 
 
 def test_fresh_install_seeds_config_with_the_right_modes(harness: Harness):
@@ -1301,14 +1341,198 @@ def test_ref_main_is_still_available_deliberately(harness: Harness):
     # untagged -- one commit past v0.1.0 -- and nothing here ever tags it
     # v0.3.0. project_version no longer reads that field (see its own
     # comment in install.sh for why trusting it is the defect this project
-    # shipped twice); it reports what git actually knows, honestly
-    # distinguishable from a tagged release rather than echoing an aspired
-    # version that was never true of this exact commit.
+    # shipped twice); it reports what the installed distribution actually
+    # says, in the honestly-not-a-release .devN+g<sha> shape hatch-vcs
+    # itself produces for a build in between tags, rather than echoing an
+    # aspired version that was never true of this exact commit.
     harness.commit_upstream("0.3.0")
     sha = harness.git("rev-parse", "--short", "HEAD").strip()
     proc = harness.run("--ref", "main")
-    assert f"installed: 0.1.0-1-g{sha}" in proc.stdout
+    assert f"installed: 0.1.1.dev1+g{sha}" in proc.stdout
     assert "installed: 0.3.0" not in proc.stdout
+
+
+# --------------------------------------------------------------------------
+# Version reporting
+# --------------------------------------------------------------------------
+#
+# v0.3.1 replaced project_version()'s static `version =` read (three
+# releases shipped with a number nobody remembered to bump) with
+# `git describe`. That still shipped broken: set_ownership() chows every
+# release directory -- .git included -- to the service account on every
+# run, install included, so by the *next* run this script's own `git`,
+# running as root, is refused ("detected dubious ownership in repository")
+# and the function's own `2>/dev/null` swallowed the reason, leaving
+# "unknown" everywhere an operator actually looks. /health, uv's install
+# line and a bare `importlib.metadata.version()` all kept working, because
+# none of them ask git anything.
+#
+# The tests below drive the installer end to end and read what it prints,
+# not project_version() in isolation, because reading the package metadata
+# directly is exactly the check that missed this the first time.
+
+
+def test_before_and_after_survive_git_describe_being_refused(
+    harness: Harness, tmp_path: Path
+):
+    """Stands in for a real install's git refusing `describe` against a
+    release directory it does not own, the "dubious ownership" failure
+    set_ownership()'s chown produces in production. Every other git
+    subcommand this script uses (clone, ls-remote, checkout) still works --
+    only `describe` fails, the same selective failure ownership causes."""
+    git_stub = tmp_path / "git-describe-refused"
+    _write_exec(
+        git_stub,
+        """#!/usr/bin/env bash
+for arg in "$@"; do
+    if [ "$arg" = describe ]; then
+        echo "fatal: detected dubious ownership in repository at '...'" >&2
+        exit 128
+    fi
+done
+exec git "$@"
+""",
+    )
+    harness.run(SVTPLAY_ARR_GIT=str(git_stub))
+    harness.release_upstream("0.2.0")
+    harness.reset_calls()
+
+    proc = harness.run(SVTPLAY_ARR_GIT=str(git_stub))
+
+    assert "before: 0.1.0" in proc.stdout
+    assert "after:  0.2.0" in proc.stdout
+    assert "unknown" not in proc.stdout
+
+
+def test_currently_installed_survives_git_describe_being_refused(
+    harness: Harness, tmp_path: Path
+):
+    git_stub = tmp_path / "git-describe-refused"
+    _write_exec(
+        git_stub,
+        """#!/usr/bin/env bash
+for arg in "$@"; do
+    if [ "$arg" = describe ]; then
+        exit 128
+    fi
+done
+exec git "$@"
+""",
+    )
+    harness.run(SVTPLAY_ARR_GIT=str(git_stub))
+    harness.reset_calls()
+
+    proc = harness.run(SVTPLAY_ARR_GIT=str(git_stub))
+
+    assert "currently installed: 0.1.0" in proc.stdout
+    assert "unknown" not in proc.stdout
+
+
+def test_currently_installed_falls_back_to_git_when_the_venv_has_no_svtplay_arr(
+    harness: Harness,
+):
+    """A release directory can survive with its venv half-built -- disk
+    trouble mid-`uv sync`, or a manual poke -- while the checkout that built
+    it is still intact. The dist-info this project's own build would have
+    left behind is what's missing here; the fallback must still find a real
+    version in the checkout rather than give up."""
+    harness.run()
+    release = harness.releases[0]
+    for dist_info in (release / ".venv").glob("**/svtplay_arr-*.dist-info"):
+        shutil.rmtree(dist_info)
+    harness.reset_calls()
+
+    proc = harness.run()
+
+    assert "currently installed: 0.1.0" in proc.stdout
+    assert "unknown" not in proc.stdout
+
+
+def _project_version(dir_: Path, git: str = "git") -> str:
+    """Calls project_version() directly, the way _uv_target() below calls
+    uv_target() -- sourcing the script defines the function without running
+    main()."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("SVTPLAY_ARR_")}
+    env["SVTPLAY_ARR_GIT"] = git
+    proc = subprocess.run(
+        ["bash", "-c", f'source "{INSTALL_SH}"; project_version "$1"', "_", str(dir_)],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    return proc.stdout.strip()
+
+
+def _fabricate_venv(release: Path, version: str) -> None:
+    subprocess.run(
+        ["python3", "-m", "venv", "--without-pip", str(release / ".venv")],
+        check=True,
+        capture_output=True,
+    )
+    python = release / ".venv" / "bin" / "python3"
+    purelib = subprocess.run(
+        [str(python), "-c", 'import sysconfig; print(sysconfig.get_path("purelib"))'],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    dist_info = Path(purelib) / f"svtplay_arr-{version}.dist-info"
+    dist_info.mkdir(parents=True)
+    (dist_info / "METADATA").write_text(
+        f"Metadata-Version: 2.1\nName: svtplay-arr\nVersion: {version}\n"
+    )
+
+
+def test_project_version_reads_the_installed_distribution(tmp_path: Path):
+    release = tmp_path / "release"
+    _fabricate_venv(release, "9.9.9")
+    assert _project_version(release) == "9.9.9"
+
+
+def test_project_version_does_not_need_git_when_the_venv_answers(tmp_path: Path):
+    """The primary source really is primary: git here is not even a usable
+    binary, and the version still comes back from the venv."""
+    release = tmp_path / "release"
+    _fabricate_venv(release, "9.9.9")
+    assert _project_version(release, git=str(tmp_path / "no-such-git")) == "9.9.9"
+
+
+def test_project_version_falls_back_to_git_describe(tmp_path: Path):
+    release = tmp_path / "release"
+    release.mkdir()
+    subprocess.run(["git", "init", "-q", str(release)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(release), "config", "user.email", "test@example.invalid"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(release), "config", "user.name", "test"], check=True
+    )
+    (release / "f").write_text("x")
+    subprocess.run(
+        ["git", "-C", str(release), "add", "-A"], check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "-C", str(release), "commit", "-q", "-m", "x"], check=True
+    )
+    subprocess.run(
+        ["git", "-C", str(release), "tag", "v1.2.3"], check=True, capture_output=True
+    )
+    assert _project_version(release) == "1.2.3"
+
+
+def test_project_version_is_unknown_with_neither_a_venv_nor_a_git_checkout(
+    tmp_path: Path,
+):
+    nothing = tmp_path / "nothing-here"
+    nothing.mkdir()
+    assert _project_version(nothing) == "unknown"
+
+
+def test_project_version_is_unknown_for_a_release_directory_that_does_not_exist(
+    tmp_path: Path,
+):
+    assert _project_version(tmp_path / "does-not-exist") == "unknown"
 
 
 # --------------------------------------------------------------------------
