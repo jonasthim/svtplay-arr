@@ -12,6 +12,7 @@ right show*; the canary state says *this mapping stopped resolving on SVT*.
 Both can be true of the same row at once, and neither implies the other.
 """
 
+import html as html_mod
 import re
 from pathlib import Path
 
@@ -111,7 +112,16 @@ def _row(html: str) -> str:
 
 
 def _text(html: str) -> str:
-    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html)).strip()
+    """Rendered text, tags stripped and entities resolved.
+
+    Unescaped because the templates escape what they render: a sentence
+    carrying an apostrophe -- every one of the resolvability notes does --
+    arrives as `&#39;` and would never be found by a test comparing against
+    the string the computation actually produced.
+    """
+    return re.sub(
+        r"\s+", " ", html_mod.unescape(re.sub(r"<[^>]+>", " ", html))
+    ).strip()
 
 
 # --- A dead mapping is visible without pressing Check ------------------
@@ -592,7 +602,7 @@ def _unresolvable(**over) -> dict:
     return row
 
 
-def test_the_banner_names_the_show_and_says_why(tmp_path: Path):
+def _banner(tmp_path: Path, rows, **over) -> str:
     cfg, maps = _paths(tmp_path)
     app = FastAPI()
     app.include_router(
@@ -600,15 +610,80 @@ def test_the_banner_names_the_show_and_says_why(tmp_path: Path):
             cfg, maps, FakeSvt(), FakeSonarr(),
             status_provider=lambda: _sample_health(_sample_svt(
                 state="unresolvable", needs_attention=True,
-                unresolvable=1, unresolvable_series=[_unresolvable()],
+                unresolvable=len(rows), unresolvable_series=rows, **over,
             )),
         )
     )
-    body = TestClient(app).get("/config").text
+    return _text(TestClient(app).get("/config").text)
 
-    assert "resolves nothing" in _text(body).lower()
+
+def test_the_banner_names_the_show_and_says_why(tmp_path: Path):
+    body = _banner(tmp_path, [_unresolvable()])
+
+    assert "resolves nothing" in body.lower()
     assert TITLE in body
-    assert NOTE in _text(body)
+    assert NOTE in body
+
+
+# The note each reason carries, in the shipped wording, so a banner
+# assertion cannot pass against a sentence no real finding produces.
+_NOTES = {
+    "no_ordinals": NOTE,
+    "no_air_date": (
+        "This mapping can never match anything as it stands. SVT's episodes "
+        "for 'x' carry episode numbers, and none of them agrees with a "
+        "Sonarr episode on both number and air date within 1 day."
+    ),
+    "not_in_sonarr": (
+        "This mapping can never match anything. Sonarr's library has no "
+        "series with tvdb id 288649."
+    ),
+}
+
+
+@pytest.mark.parametrize("reason", sorted(_NOTES))
+def test_the_banner_asserts_only_what_every_reason_shares(
+    tmp_path: Path, reason: str,
+):
+    """The lead sentence is shared; the three causes are not.
+
+    It used to assert the `no_air_date` story for all of them -- "Sonarr
+    has aired episodes to match against, but not one pair of them agrees".
+    For a row whose series Sonarr does not have that is simply false: there
+    are no aired episodes and no pair to disagree. It also sent the
+    operator to compare air dates, which is the exact wrong turn a separate
+    reason code was added to prevent, while the row's own note contradicted
+    it two lines below.
+
+    Nothing caught it, because this test only ever built a `no_ordinals`
+    row. So it is parametrised, and the assertion is about the claim rather
+    than about wording that happens to be there today.
+    """
+    body = _banner(tmp_path, [_unresolvable(reason=reason, note=_NOTES[reason])])
+
+    # The row's own cause is always shown...
+    assert _NOTES[reason] in body
+    # ...and the shared lead never claims a cause of its own. Any of these
+    # is a statement about air dates or aired episodes, and only one of the
+    # three reasons is about either.
+    lead = body[: body.index(_NOTES[reason])]
+    for claim in ("aired episode", "air date", "not one pair", "agrees"):
+        assert claim not in lead.lower(), f"the lead claims {claim!r}"
+
+
+def test_the_banner_lead_still_says_what_is_actually_shared(tmp_path: Path):
+    # The counter-test to the one above: stripping the lead back until it
+    # asserts nothing would also pass it. Whatever the reason, all three
+    # findings do share that SVT answers, that nothing has been grabbed,
+    # and that this is invisible from everything else on the page.
+    body = _banner(tmp_path, [_unresolvable(reason="not_in_sonarr",
+                                            note=_NOTES["not_in_sonarr"])])
+    lead = body[: body.index(_NOTES["not_in_sonarr"])].lower()
+
+    assert "resolves nothing" in lead
+    assert "svt answers" in lead
+    assert "nothing has ever been grabbed" in lead
+    assert "series with nothing new" in lead
 
 
 def test_a_failing_row_and_an_unresolvable_row_are_both_reported(

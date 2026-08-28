@@ -745,20 +745,30 @@
       It is the loudest surface this finding gets, because it is the only
       one: from the feed, from Sonarr, and from the SVT check above, a
       mapping that resolves nothing is indistinguishable from a series with
-      nothing new. Each row names its own reason -- one is unfixable and
-      one is a wrong mapping or too tight a tolerance, and guessing which
-      is exactly what the operator should not have to do. #}
+      nothing new.
+
+      **The lead states only what every reason has in common**, and each row
+      carries its own cause. It used to assert the `no_air_date` story --
+      "Sonarr has aired episodes to match against, but not one pair of them
+      agrees" -- for all of them, which is simply false for a row whose
+      series Sonarr does not have: there are no aired episodes and no pair
+      to disagree. Worse, it sent the operator to compare air dates, the
+      precise wrong turn a separate reason code exists to prevent, and the
+      row's own note contradicted it two lines below. A shared sentence may
+      only say what is shared. #}
   {%- if health.svt and health.svt.unresolvable %}
   {%- set svt = health.svt %}
   <p class="warn">
     <strong>{{ svt.unresolvable }} of your {{ svt.checked }} mapping{{ '' if
     svt.checked == 1 else 's' }} resolve{{ 's' if svt.unresolvable == 1 else '' }}
     nothing.</strong> SVT answers for {{ 'it' if svt.unresolvable == 1 else 'them' }}
-    and lists episodes, and Sonarr has aired episodes to match against, but
-    not one pair of them agrees &mdash; so nothing has ever been grabbed for
+    and lists episodes, which is why nothing above says anything is wrong
+    &mdash; and not one of those episodes can be matched to an episode
+    Sonarr has, so nothing has ever been grabbed for
     {{ 'this show' if svt.unresolvable == 1 else 'these shows' }} and nothing
-    will be. That looks exactly like a series with nothing new, which is why
-    it is worth saying out loud.
+    will be until something changes. That looks exactly like a series with
+    nothing new, which is why it is worth saying out loud. Each row says
+    what is in the way, and they are not the same thing:
     {% for u in svt.unresolvable_series %}
     <br><strong>{{ u.series_title }} ({{ u.svt_slug }})</strong> &mdash; {{ u.note }}
     {%- endfor %}
