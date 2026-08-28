@@ -10,10 +10,16 @@ Cache-busting quirk: the SVT CDN was observed on 2026-08-24 returning a
 the one requested. A structural check (an `errors` block, or a missing
 `data` block) does not catch this, because the swapped body is itself
 perfectly well-formed JSON for some other query. So every GraphQL request
-here carries a cache-buster query param *and* a per-request field alias
-(`q<nonce>: search(...)`), and `_graphql` requires the response's `data`
-block to echo that exact alias before trusting anything in it. A response
-for the wrong query simply won't have the alias we asked for.
+here carries a per-request field alias (`q<nonce>: search(...)`), and
+`_graphql` requires the response's `data` block to echo that exact alias
+before trusting anything in it. A response for the wrong query simply
+won't have the alias we asked for.
+
+The alias is *also* the cache-buster, and it travels in `variables`, not
+as a query parameter. The CDN keys on `(path, ua, variables)` and on
+nothing else -- see the comment in `_graphql` for the measurements. A `cb`
+query param, which is what this module sent until 2026-08-28, is not part
+of that key and never busted anything.
 
 Quality resolution quirk: `/video/{svt_id}` does NOT carry `resolution` or
 `bitrate` fields on its `videoReferences` entries (despite earlier
@@ -168,8 +174,25 @@ class SvtClient:
         params = {
             "ua": self._ua_param,
             "query": query,
-            "variables": json.dumps(variables),
-            "cb": _cache_buster(),
+            # The nonce rides *inside* `variables`, and the alias is what it
+            # is set to. Measured live 2026-08-28: the CDN's cache key is
+            # `(path, ua, variables)` -- the query document is not in it and
+            # neither is a `cb` query parameter, so the one this used to
+            # send bought exactly nothing. Two different query texts with
+            # identical variables were served each other's bodies; a `cb`
+            # param varied across three requests changed nothing; an extra,
+            # *undeclared* variable (which the server silently ignores) got
+            # a fresh body 3/3, against a fixed-value control that did not.
+            #
+            # Setting it to the alias rather than to a second independent
+            # nonce is deliberate: the alias is already unique per request,
+            # and putting it in the cache key means a cached body can only
+            # ever be one that asked for the same alias -- so the echo check
+            # below and the cache-buster become one mechanism instead of two
+            # that have to agree. Before this, the buster did not work at
+            # all and the echo check therefore failed *closed* on any repeat
+            # of the same query within the 20s TTL: a spurious SvtApiError.
+            "variables": json.dumps({**variables, "cb": alias}),
         }
         try:
             r = await self._http.get(
@@ -217,7 +240,12 @@ def _alias() -> str:
 
 
 def _cache_buster() -> str:
-    """The SVT CDN was observed serving a cached body for a different query."""
+    """A per-request nonce for the `/video/{svt_id}` REST endpoint.
+
+    GraphQL does not use this: its cache key is `(path, ua, variables)`, so
+    its nonce has to be a variable and the alias serves as one. See
+    `_graphql`.
+    """
     return str(int(time.time() * 1000))
 
 

@@ -11,21 +11,17 @@ Run explicitly with:
 
     uv run pytest -m integration -v
 
-**Leave at least 60 seconds between runs**, or `test_real_search_finds_the_show`
-will fail with "response did not echo requested alias". That is not a bug in
-this repository -- it is the SVT CDN quirk `svt/client.py` documents,
-measured on 2026-08-24: the GraphQL response carries
-`cache-control: public, max-age=60`, and the cache key includes `variables`
-but ignores both `query` and the `cb` cache-buster. Repeat the *same* search
-term inside that minute and the CDN replays the previous response, whose
-embedded field alias is the previous request's -- which is exactly what
-`_graphql`'s alias check exists to catch, so it raises rather than trusting
-it. A different search term is served fresh, which is why
-`svtplay-arr-suggest-mappings` (one distinct title per series) is unaffected
-in practice, and why the resolver never sees this at all (it uses the show
-page and the video endpoint, not GraphQL). Sending the query by POST instead
-of GET was observed to sidestep the cache entirely, if this is ever worth
-fixing properly.
+This file used to carry a "leave at least 60 seconds between runs" warning,
+because a repeated search inside the CDN's TTL failed with "response did not
+echo requested alias". That was real, and it was our bug, not SVT's: the
+cache key is `(path, ua, variables)`, so the `cb` *query parameter* the
+client used to send was not in it and busted nothing, and the second request
+got the first's body -- carrying the first's field alias, which the alias
+check then correctly refused. Since 2026-08-28 the nonce travels inside
+`variables` instead, which is in the key.
+`test_real_repeated_search_is_not_served_a_stale_body` below is what proves
+that live, and it is deliberately the *same* term twice in a row: run this
+file back to back as fast as you like.
 
 Known-good values, verified live on 2026-08-24:
   - "Gift vid första ögonkastet" has SVT series id `jpmQD3q`.
@@ -75,6 +71,22 @@ async def test_real_search_finds_the_show():
     async with httpx.AsyncClient(timeout=30) as http:
         hits = await SvtClient(http).search_series("gift vid första ögonkastet")
     assert any(h.svt_id == "jpmQD3q" for h in hits)
+
+
+async def test_real_repeated_search_is_not_served_a_stale_body():
+    """Two identical searches, back to back, well inside the 20s CDN TTL.
+
+    Before the nonce moved into `variables` the second of these raised
+    "response did not echo requested alias" every time -- fail-safe, but a
+    spurious error, and it meant the alias check was firing on our own
+    cache-busting failure rather than on the CDN swap it was built for.
+    """
+    async with httpx.AsyncClient(timeout=30) as http:
+        client = SvtClient(http)
+        first = await client.search_series("uppdrag granskning")
+        second = await client.search_series("uppdrag granskning")
+    assert first and second
+    assert [h.svt_id for h in first] == [h.svt_id for h in second]
 
 
 async def test_real_quality_resolution():

@@ -44,16 +44,48 @@ async def test_search_returns_series_hits():
     assert "<em>" not in hits[0].name  # search highlighting stripped
 
 
-async def test_search_sends_cache_buster():
+async def test_cache_buster_travels_inside_variables():
+    """The SVT CDN keys on (path, ua, variables) -- not on the query text,
+    and not on a `cb` query parameter. Measured live 2026-08-28: varying a
+    `cb` param changed nothing, and the same body came back; varying an
+    (undeclared, therefore server-ignored) variable did serve a fresh one,
+    3/3, against a fixed-value control that did not. So the nonce is only a
+    cache-buster where it is here. A mutation moving it back out to a query
+    param must fail this."""
     seen = {}
 
     def handler(request):
-        seen["url"] = str(request.url)
+        seen["params"] = request.url.params
+        seen["variables"] = json.loads(request.url.params["variables"])
         alias = _alias_of(request)
         return httpx.Response(200, json={"data": {alias: []}})
 
     await _client(handler).search_series("x")
-    assert "cb=" in seen["url"]
+    assert "cb" in seen["variables"], "the nonce is not in the CDN's cache key"
+    assert seen["variables"]["cb"]
+    assert "cb" not in seen["params"], (
+        "a `cb` query param is not in the cache key and buys nothing"
+    )
+
+
+async def test_repeated_identical_calls_send_different_variables():
+    """Two searches for the *same* term must still differ in `variables`,
+    or the second is served the first's cached body -- which, since the
+    body carries the first request's field alias, fails the alias check and
+    raises. That is what used to happen for any repeat inside the 20s TTL."""
+    seen = []
+
+    def handler(request):
+        seen.append(json.loads(request.url.params["variables"]))
+        alias = _alias_of(request)
+        return httpx.Response(200, json={"data": {alias: []}})
+
+    client = _client(handler)
+    await client.search_series("same term")
+    await client.search_series("same term")
+
+    assert seen[0]["q"] == seen[1]["q"] == "same term"
+    assert seen[0] != seen[1], "the CDN would serve the second one the first's body"
 
 
 async def test_search_sends_term_as_graphql_variable_not_interpolated():
@@ -71,7 +103,7 @@ async def test_search_sends_term_as_graphql_variable_not_interpolated():
     term = 'weird" term \\'
     await _client(handler).search_series(term)
     assert term not in seen["query"]
-    assert seen["variables"] == {"q": term}
+    assert seen["variables"]["q"] == term
 
 
 async def test_graphql_errors_raise():
