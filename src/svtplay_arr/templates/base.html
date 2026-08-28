@@ -101,6 +101,11 @@
                     display: flex; align-items: center; }
     .brand { margin: 0; font-size: 1rem; font-weight: 700;
              letter-spacing: .02em; color: var(--topbar-fg); }
+    /* What /health calls "version" -- the same fact, not a second copy of
+       it. Small and dimmed on purpose: an operator glancing at this page
+       is here for the status strip below, not this. */
+    .brand-version { margin-left: .5rem; font-size: .75rem;
+                      font-weight: 400; color: var(--topbar-fg); opacity: .6; }
     .page { max-width: 58rem; margin: 0 auto; padding: 1.25rem 1rem 0; }
 
     /* ---- View nav ---------------------------------------------------
@@ -493,7 +498,17 @@
 </head>
 <body>
   <header class="topbar">
-    <div class="topbar-inner"><h1 class="brand">svtplay-arr</h1></div>
+    <div class="topbar-inner">
+      <h1 class="brand">svtplay-arr</h1>
+      {#- Same fact /health's `version` reports, rendered rather than
+          derived: see _status_strip_context's docstring for why this page
+          only ever renders health facts. Guarded so a status_provider that
+          predates this (or one that failed) leaves the brand alone rather
+          than rendering nothing or the word "None". #}
+      {%- if health and health.version %}
+      <span class="brand-version">{{ health.version }}</span>
+      {%- endif %}
+    </div>
   </header>
   {# Server-rendered links, one per view, in one order defined once in
      config_ui.VIEWS -- there is no client-side routing here and no build

@@ -54,6 +54,40 @@ def test_health_reports_ok(tmp_path: Path):
         assert body["same_filesystem"] is True
 
 
+def test_health_reports_the_running_version(tmp_path: Path):
+    # pyproject.toml has no static version any more (see version.py and its
+    # own docstring for why): the version in this response has to be the
+    # one hatch-vcs baked into this package's own installed metadata, not a
+    # guess or a hardcoded expectation that could drift from it the same
+    # way the old static field did.
+    from importlib.metadata import version as installed_version
+
+    with TestClient(create_app(_settings(tmp_path))) as c:
+        body = c.get("/health").json()
+    assert body["version"] == installed_version("svtplay-arr")
+    assert body["version"] != "0.1.0"  # the number that was false for two releases
+
+
+def test_health_reports_the_version_as_unknown_rather_than_500ing(
+    tmp_path: Path, monkeypatch
+):
+    # A monitoring endpoint must not crash because its own version lookup
+    # failed -- same rule every other field in compute_health follows. An
+    # install whose dist-info went missing gets an honest "unknown", never
+    # a wrong number and never a 500.
+    from importlib.metadata import PackageNotFoundError
+
+    def _boom(name):
+        raise PackageNotFoundError(name)
+
+    monkeypatch.setattr("svtplay_arr.version._installed_version", _boom)
+
+    with TestClient(create_app(_settings(tmp_path))) as c:
+        resp = c.get("/health")
+    assert resp.status_code == 200
+    assert resp.json()["version"] == "unknown"
+
+
 def test_health_flags_split_filesystem(tmp_path: Path):
     s = _settings(tmp_path)
     s.completed_dir = Path("/proc")
@@ -489,6 +523,7 @@ def test_config_page_and_health_agree(tmp_path: Path, monkeypatch):
             health = c.get("/health").json()
             page = c.get("/config").text
             assert f"Service: {health['status']}" in page
+            assert health["version"] in page
             assert ("Worker: alive" in page) == health["worker_alive"]
             assert ("Worker: dead" in page) == (not health["worker_alive"])
             mcount = health["mappings"] if health["mappings"] is not None else "?"
@@ -1118,11 +1153,14 @@ def test_the_activity_view_does_not_change_healths_contract(tmp_path: Path):
     # 2026-08-28 alongside the background Sonarr check, on the same terms
     # `svt` was: purely additive, nothing above it removed, renamed or
     # retyped, and the two nested blocks are the only place any new field
-    # goes.
+    # goes. `version` was added the same way, alongside deriving it from the
+    # git tag instead of a hand-maintained pyproject.toml field -- see
+    # version.py.
     assert set(body) == {
         "status", "same_filesystem", "worker_alive", "active_jobs", "svt",
         "sonarr",
         "mappings", "mappings_ever_loaded", "mappings_degraded",
+        "version",
     }
 
 

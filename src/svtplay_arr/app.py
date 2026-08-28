@@ -49,6 +49,7 @@ from svtplay_arr.resolver import Resolver
 from svtplay_arr.sonarr import SonarrClient, SonarrStatus
 from svtplay_arr.store import JobStore, JobStoreError
 from svtplay_arr.svt.client import SvtClient
+from svtplay_arr.version import service_version
 from svtplay_arr.worker import Worker
 
 log = logging.getLogger(__name__)
@@ -257,6 +258,14 @@ def create_app(settings: Settings) -> FastAPI:
             "same_filesystem": same_fs,
             "worker_alive": worker_alive,
             "active_jobs": active_jobs,
+            # What an operator reading /health or the config page's footer
+            # is running -- previously visible only by reading the
+            # installer's own log or shelling in. "unknown" rather than a
+            # missing key or a 500 if the installed package's own metadata
+            # cannot be read; see version.py for why that is honest rather
+            # than a guess. Added, never folded into an existing field, on
+            # the same contract every other addition here keeps.
+            "version": service_version(),
             # Is SVT still there, does the parser still work, and do the
             # operator's own mappings still resolve? Added, never folded
             # into an existing field: Sonarr health-check setups may poll
