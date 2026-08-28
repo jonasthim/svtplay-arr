@@ -6,7 +6,12 @@ from pathlib import Path
 import httpx
 import pytest
 
-from svtplay_arr.svt.client import SvtApiError, SvtClient, derive_slug
+from svtplay_arr.svt.client import (
+    SvtApiError,
+    SvtClient,
+    _details_page_query,
+    derive_slug,
+)
 
 FIX = Path(__file__).parent / "fixtures/svt"
 
@@ -218,6 +223,45 @@ def _details_client(page, seen=None) -> SvtClient:
     return _client(handler)
 
 
+def test_the_shipped_query_asks_for_upcoming_episodes():
+    """`addExtras: [upcoming]` is not optional and no fixture can prove it.
+
+    Without it `associatedContent` returns only *available* episodes -- the
+    first query run during the spike came back with 13 of a show's 27 and no
+    upcoming module at all. Unaired episodes would then be absent rather
+    than refused, which fails safe by accident (the resolver has nothing to
+    offer either way) but leaves nothing able to tell "not yet published"
+    from "does not exist", and quietly changes what SVT is asked for.
+
+    Every other property of this query is exercised by a captured response.
+    This one is a property of the *request*, so the recorded body cannot
+    fail when it is dropped -- a mutation run confirmed it survives the
+    whole offline suite. Hence a text assertion, which is the only kind
+    available here.
+
+    `include` is deliberately not used: SVT rejects it alongside `addExtras`
+    ("addExtras and include cannot be combined"), which is why the noise is
+    dropped with `exclude` instead.
+    """
+    query = _details_page_query("qtest")
+
+    assert "addExtras:[upcoming]" in query
+    assert "exclude:[clips,related]" in query
+    assert "include:" not in query
+
+
+def test_the_shipped_query_does_not_ask_for_item_number():
+    """The Stage 1 boundary, pinned in the one place it is visible.
+
+    `item.number` would give an ordinal to shows `_ordinal` cannot handle at
+    all -- and to specials, where the scraper correctly gave None and
+    `resolver.py::_recent_for` relies on it. Adopting it is a safety change
+    with its own tests. Asking for it here would make the client look like
+    it had already decided.
+    """
+    assert "number" not in _details_page_query("qtest")
+
+
 async def test_list_episodes_builds_episodes_from_the_details_page():
     page = _page(_selection(_teaser()))
 
@@ -266,7 +310,11 @@ async def test_list_episodes_marks_an_upcoming_selection_unavailable():
     fetched late."""
     page = _page(
         _selection(
-            _teaser(svt_id="egWP26b", overlay={"heading": "Söndag"}),
+            # Deliberately no overlay: this pins the selection on its own.
+            # With one there, the other signal alone would carry the test
+            # and dropping this one would go unnoticed -- which is exactly
+            # what a mutation run found.
+            _teaser(svt_id="egWP26b", overlay=None),
             selection_type="upcoming",
         )
     )
@@ -299,7 +347,7 @@ async def test_list_episodes_never_reports_an_episode_available_on_one_signal():
     way."""
     page = _page(
         _selection(_teaser()),
-        _selection(_teaser(overlay={"heading": "Kommer"}), selection_type="upcoming"),
+        _selection(_teaser(overlay=None), selection_type="upcoming"),
     )
 
     eps = await _details_client(page).list_episodes("x")
