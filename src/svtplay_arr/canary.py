@@ -164,7 +164,7 @@ _MIN_STALE_AFTER_S = 900.0
 _MIN_INTERVAL_S = 0.05
 # How many failing series are named in `status()`. The full per-mapping
 # breakdown belongs in the mappings view, which reads `per_mapping()`; the
-# headline needs enough to tell a re-slugged show from a broken parser.
+# headline needs enough to tell a re-slugged show from a broken SVT.
 _MAX_REPORTED_FAILURES = 5
 
 # No round has completed since this process started. Not healthy, not yet a

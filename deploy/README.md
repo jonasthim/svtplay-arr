@@ -84,9 +84,8 @@ returns nothing, Sonarr grabs nothing, and no existing check notices. Once an
 hour the canary re-checks the mappings you actually have — no hardcoded show,
 because a hardcoded slug rots — and reports:
 
-- `"state": "svt"` — **none** of your mappings resolved. That points at SVT or
-  at this service's page parser, not at any one show. Nothing will be grabbed
-  until it is fixed.
+- `"state": "svt"` — **none** of your mappings resolved. That points at SVT
+  itself, not at any one show. Nothing will be grabbed until it is fixed.
 - `"state": "series"` — some resolved and some did not. Those shows have
   ended, been re-slugged, or moved; `failing_series` names them and each is
   fixed by editing one row. This one deliberately leaves `status` at `"ok"`

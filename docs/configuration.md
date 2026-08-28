@@ -555,8 +555,9 @@ If SVT changes what its API returns, the listing finds no episodes, the resolver
 returns nothing, the feed goes empty, and Sonarr grabs nothing. Every other
 field on `/health` keeps saying `ok`, because every other field is about *this*
 process: the worker, the job store, the mappings table, the filesystem. None of
-them has ever known whether SVT is there. The page parser is a pattern scan
-over an undocumented API, so it breaking is a *when*, not an *if*.
+them has ever known whether SVT is there. The episode listing reads an
+undocumented API with no stability guarantee, so it breaking is a *when*, not
+an *if*.
 
 The canary closes that gap. Roughly once an hour it re-checks **the mappings
 you actually have** — not a hardcoded show, because a hardcoded show ends, gets
@@ -568,12 +569,17 @@ It reads and never writes. The only call it makes is the same read-only episode
 listing the resolver already makes, and it never touches `mappings.yaml`,
 `config.yaml`, the job store, or Sonarr.
 
-### A page that answers with no episodes counts as a failure
+### A show that answers with no episodes counts as a failure
 
-This is the point of the whole thing. When SVT's format changes the request
-still succeeds — HTTP 200, a real page — and there is simply nothing in it the
-parser recognises. Counting that as "SVT answered, so we are fine" would report
-`ok` through precisely the outage the check exists to catch.
+This is the point of the whole thing, and it covers the one break that does
+*not* announce itself. A field vanishing from SVT's API now comes back as a
+named error — svtplay-arr asks for its fields by name, so SVT says which one
+it no longer has, and the canary reports that by name on its next round. What
+stays silent is a *semantic* change: the response is still valid and no longer
+means what it did. Then the request still succeeds — HTTP 200, a real
+answer — with simply nothing in it svtplay-arr recognises as an episode.
+Counting that as "SVT answered, so we are fine" would report `ok` through
+precisely the outage the check exists to catch.
 
 ### The two failure shapes
 

@@ -1,4 +1,5 @@
 import json
+import logging
 import re
 from datetime import date
 from pathlib import Path
@@ -392,13 +393,29 @@ async def test_list_episodes_raises_when_a_selection_is_truncated():
     assert "11" in str(excinfo.value)
 
 
-async def test_list_episodes_raises_when_the_page_cannot_say_how_many_there_are():
-    """A missing `totalSize` is the truncation check going blind, not a
-    reason to trust whatever arrived."""
+async def test_list_episodes_keeps_going_when_it_cannot_check_for_truncation(caplog):
+    """A *missing* `totalSize` is logged and the items are taken as
+    complete. A *mismatched* one still raises, above.
+
+    The asymmetry is the point. Truncation is per-selection and partial:
+    one show loses some episodes and everything else still works. Refusing
+    on a total we cannot read would be global and total -- SVT making
+    `totalSize` nullable, or moving `itemsPaginated`, would fail every
+    selection of every mapping at once, empty the feed, and get the indexer
+    rejected by Sonarr for returning nothing in the configured categories.
+    That is the failure this project has shipped once, and the one the
+    operator can do nothing about.
+
+    The log line is the only trace: episodes still come back, so the canary
+    sees a healthy show and cannot report this.
+    """
     page = _page({"selectionType": "season", "items": [_teaser()]})
 
-    with pytest.raises(SvtApiError):
-        await _details_client(page).list_episodes("x")
+    with caplog.at_level(logging.WARNING, logger="svtplay_arr.svt.client"):
+        eps = await _details_client(page).list_episodes("x")
+
+    assert [e.svt_id for e in eps] == ["KZmQ5JY"]
+    assert "totalSize" in caplog.text
 
 
 async def test_list_episodes_returns_empty_for_a_show_offering_nothing():

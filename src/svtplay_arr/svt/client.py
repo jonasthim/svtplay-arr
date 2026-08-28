@@ -1,4 +1,4 @@
-"""Client for the three SVT surfaces this project talks to.
+"""Client for the two SVT surfaces this project talks to.
 
 This is the only module in the project that knows SVT exists: the Contento
 GraphQL endpoint (series search *and* episode listing) and the per-video
@@ -61,6 +61,7 @@ broken instead of silently blank.
 """
 
 import json
+import logging
 import re
 import time
 import uuid
@@ -75,6 +76,8 @@ GRAPHQL = "https://api.svt.se/contento/graphql"
 VIDEO = "https://api.svt.se/video/{svt_id}"
 UA_PARAM = "svtplaywebb-play-render-prod-client"
 BROWSER_UA = "Mozilla/5.0"
+
+log = logging.getLogger(__name__)
 
 # SVT files not-yet-published episodes in a selection of their own. This is
 # one of the two independent availability signals; see
@@ -350,18 +353,32 @@ def _refuse_a_truncated_selection(selection: dict) -> None:
     totalSize` every time -- 119 episodes of one show arrived in a single
     response. If SVT ever imposes a default cap, the episodes past it
     become unreachable with nothing to say so, which is exactly the silent
-    miss the canary was built for and cannot see. A `totalSize` that is
-    missing rather than mismatched is this check going blind, and is
-    refused on the same grounds.
+    miss the canary was built for and cannot see.
+
+    A *missing* `totalSize` is logged, not raised, and the asymmetry is
+    deliberate. The failure this guards against is per-selection and
+    partial: some episodes of one show go missing, and the rest still
+    work. This guard's own failure would be global and total -- if SVT
+    makes `totalSize` nullable or moves `itemsPaginated`, then every
+    selection of every mapping raises, `list_episodes` fails everywhere at
+    once, the feed empties, and Sonarr rejects the indexer outright for
+    returning no results in the configured categories. This project has
+    shipped an empty feed once already and it is much the worse outcome:
+    nothing is grabbed, and the operator can do nothing about the cause. A
+    total we cannot read costs a log line; only a total that disagrees
+    costs the request.
     """
     items = selection.get("items")
     paginated = selection.get("itemsPaginated")
     total = paginated.get("totalSize") if isinstance(paginated, dict) else None
     if not isinstance(total, int):
-        raise SvtApiError(
-            "details page selection carried no totalSize; "
-            "cannot tell a complete list from a truncated one"
+        log.warning(
+            "SVT details page selection carried no itemsPaginated.totalSize, "
+            "so a truncated selection can no longer be told from a complete "
+            "one; taking its %d item(s) as complete",
+            len(items or []),
         )
+        return
     if len(items or []) != total:
         raise SvtApiError(
             f"details page selection returned {len(items or [])} of "

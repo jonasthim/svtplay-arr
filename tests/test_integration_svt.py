@@ -109,6 +109,19 @@ async def test_real_episode_list_matches_the_captured_fixture_shape():
     assert all(e.svt_id and e.url for e in episodes)
     assert all(SHOW_SLUG in e.url for e in episodes)
     assert any(e.available for e in episodes)
+    # Separability, live. Offline this is over-determined -- `selectionType`
+    # and `upcomingOverlay` are perfectly correlated in every capture, so
+    # each one alone reproduces the recorded answer. Only the real API can
+    # show that the query still *asks* for enough to tell the two apart, and
+    # without this the docstring above claims a safety property nothing here
+    # exercises. This show has aired weekly for fourteen seasons; if it ever
+    # has nothing upcoming, point this at another currently-airing show
+    # rather than dropping the assertion.
+    assert any(not e.available for e in episodes), (
+        "no upcoming episodes came back at all -- either SVT changed what "
+        "`addExtras: [upcoming]` returns, or the availability signals are "
+        "no longer being asked for"
+    )
     assert all(e.published is not None for e in episodes)
     # Exact seconds from `item.duration`, never the page's rounded minutes.
     assert any(e.duration_s % 60 for e in episodes if e.duration_s)

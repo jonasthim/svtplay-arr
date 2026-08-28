@@ -709,9 +709,8 @@
     SVT is reachable or that it still lists episodes. Check svtplay-arr's log.
     {%- elif svt.state == 'svt' %}
     <strong>None of your {{ svt.checked }} mapping{{ '' if svt.checked == 1 else 's' }}
-    resolved on SVT.</strong> That points at SVT or at this service's page
-    parser, not at any one show &mdash; nothing will be grabbed until it is
-    fixed.
+    resolved on SVT.</strong> That points at SVT itself, not at any one show
+    &mdash; nothing will be grabbed until it is fixed.
     {%- if svt.last_success_age_s is not none %}
     SVT last worked {{ age.ago(svt.last_success_age_s) }}.
     {%- else %}

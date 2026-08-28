@@ -24,12 +24,16 @@ sharing an air date that make the ordinal load-bearing.
 """
 
 import json
+import re
 from datetime import date
 from pathlib import Path
 
 import pytest
 
-from svtplay_arr.svt.client import episodes_from_details_page
+from svtplay_arr.svt.client import (
+    _details_page_query,
+    episodes_from_details_page,
+)
 
 FIX = Path(__file__).parent / "fixtures/svt"
 CAPTURED = date(2026, 8, 28)
@@ -92,6 +96,171 @@ def _scraped(show: str) -> dict:
 
 def _published_iso(episode) -> str | None:
     return episode.published.isoformat() if episode.published else None
+
+
+# --- the request contract ---------------------------------------------------
+#
+# Everything else in this file tests what is done with a response. Nothing
+# here can test what was *asked for*: delete a field from the query document
+# and every captured response still contains it, so the whole offline suite
+# passes while production silently loses that field. A mutation run found
+# five such fields, two of them dangerous, and the test below is the answer
+# to all five at once.
+
+
+class _RecordsFieldReads(dict):
+    """A dict that remembers the full path of every key looked up in it."""
+
+    def __init__(self, data, seen, path):
+        super().__init__(data)
+        self._seen = seen
+        self._path = path
+
+    def get(self, key, default=None):
+        self._seen.add(self._path + (key,))
+        return super().get(key, default)
+
+    def __getitem__(self, key):
+        self._seen.add(self._path + (key,))
+        return super().__getitem__(key)
+
+
+def _watched(value, seen, path=()):
+    """`value` with every dict in it recording where its keys were read.
+
+    Lists do not add a level, because a GraphQL list field and its items
+    share one selection set.
+    """
+    if isinstance(value, dict):
+        return _RecordsFieldReads(
+            {k: _watched(v, seen, path + (k,)) for k, v in value.items()},
+            seen,
+            path,
+        )
+    if isinstance(value, list):
+        return [_watched(v, seen, path) for v in value]
+    return value
+
+
+def _selection_tree(query: str) -> dict:
+    """The query document's selection sets, as nested dicts of field names.
+
+    Paths, not a flat set of names: `heading` appears twice in this query at
+    two different depths (the teaser's, and the one `upcomingOverlay` needs
+    only because GraphQL requires a selection set on an object type). A
+    membership test cannot tell them apart, so dropping the teaser's -- the
+    mutation that costs fifteen of gvfo's ordinals -- leaves the name
+    present and passes. The same trap waits for `__typename`.
+
+    Small enough to be obviously right: arguments are stripped, an inline
+    fragment is flattened into its parent, aliases are dropped, and what is
+    left is names and braces.
+    """
+    q = re.sub(r"\([^()]*\)", " ", query)              # arguments
+    q = re.sub(r"\.\.\.\s*on\s+\w+", " __inline__ ", q)  # inline fragments
+    q = re.sub(r"[A-Za-z_]\w*\s*:\s*", " ", q)         # aliases
+    tokens = re.findall(r"[A-Za-z_]\w*|[{}]", q)
+
+    def parse(i):
+        fields, name = {}, None
+        while i < len(tokens):
+            token = tokens[i]
+            if token == "{":
+                child, i = parse(i + 1)
+                fields[name] = child
+            elif token == "}":
+                return fields, i + 1
+            else:
+                name = token
+                fields.setdefault(token, {})
+                i += 1
+        return fields, i
+
+    tree, _ = parse(0)
+    return _flattened(tree)
+
+
+def _flattened(tree: dict) -> dict:
+    """Merge inline-fragment selections into the type that carries them."""
+    out = {}
+    for name, children in tree.items():
+        children = _flattened(children)
+        if name == "__inline__":
+            out.update(children)
+        else:
+            out[name] = children
+    return out
+
+
+def _reaches(tree: dict, path: tuple) -> bool:
+    for name in path:
+        if name not in tree:
+            return False
+        tree = tree[name]
+    return True
+
+
+def test_the_query_asks_for_every_field_the_reader_actually_reads():
+    """The set of fields is derived from the reader, never listed here.
+
+    A hand-written list is a second copy of the truth and drifts from it
+    silently, which is the same class of defect this is guarding against.
+    So the real captured responses are run through the real reader with
+    every dict recording where its keys were read, and every path it touched
+    must exist in the query document at that same depth.
+
+    Three of the fields this covers fail *dangerous* if dropped, and none of
+    them is obvious from reading the query:
+
+    - `upcomingOverlay` and `selectionType` are the two independent
+      availability signals, and in every capture they are perfectly
+      correlated -- every overlay-bearing teaser sits in the upcoming
+      selection and vice versa. So dropping *either one* changes no
+      observable behaviour, and the redundancy the design rests on had
+      nothing asserting it exists. Drop **both** and the captured gvfo page
+      goes from 13 available episodes of 27 to all 27: every upcoming
+      episode offered to Sonarr, every grab failing, and every stable GUID
+      blocklisted before the episode airs. The comment beside
+      `upcomingOverlay` in the query says its text is never read, and
+      `selectionType` reads as one enum among many, so a later cleanup
+      taking both is an entirely ordinary thing to do.
+    - `heading` looks decorative next to `urls.svtplay`. Without it
+      `_ordinal` falls back to the URL rule alone, which only matches
+      `/avsnitt-N`, and gvfo's ordinals drop from 26 to 11 -- including
+      `KZmQ5JY`, S15E01, whose URL is `/1-tager-du`. Fifteen episodes stop
+      matching, and every other test still passes.
+
+    `addExtras: [upcoming]` is an *argument* rather than a field, so the
+    reader never sees it and this cannot cover it; it has its own test in
+    `test_svt_client.py`.
+    """
+    read: set[tuple] = set()
+    for show in SHOWS:
+        body = json.loads(
+            (FIX / f"details-{show}-20260828.json").read_text(encoding="utf-8")
+        )
+        page = next(iter(body["data"].values()))
+        episodes_from_details_page(_watched(page, read))
+
+    assert read, "the reader touched no field at all; this test proves nothing"
+    # Every branch is exercised, or a field only some shows reach goes
+    # unpinned and this passes by not looking.
+    assert {
+        ("associatedContent", "selectionType"),
+        ("associatedContent", "items", "heading"),
+        ("associatedContent", "items", "upcomingOverlay"),
+        ("associatedContent", "items", "item", "duration"),
+    } <= read
+
+    # The page the reader is handed is `detailsPageByPath`'s own selection
+    # set, so that is the level the recorded paths are rooted at.
+    tree = _selection_tree(_details_page_query("qtest"))["query"]["detailsPageByPath"]
+    missing = sorted(path for path in read if not _reaches(tree, path))
+    assert missing == [], (
+        f"the reader reads {missing}, which the query does not ask for at "
+        "that path -- in production those arrive as None and the failure is "
+        "silent"
+    )
 
 
 # --- the differential -------------------------------------------------------
