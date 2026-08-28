@@ -80,15 +80,78 @@ value across restarts, and would let a stale success outlive the run that
 earned it. So a restart resets to `STATE_UNKNOWN`, which is explicit and
 reported as such, rather than implied by a missing field.
 
-**It writes nothing.** The only call it makes is
-`SvtClient.list_episodes`, the same read-only listing `Resolver` and the
-config page's Check control already use. It never touches the mapping
-writer, the config writer, the job store, or Sonarr.
+**It writes nothing.** Three calls, all read-only GETs:
+`SvtClient.list_episodes` -- the same listing `Resolver` and the config
+page's Check control already use -- and `SonarrClient.all_series` and
+`SonarrClient.episodes`, which the resolver already makes several times an
+hour. It never touches the mapping writer, the config writer or the job
+store, and there is no Sonarr endpoint in its reach that could write.
 
 **It cannot degrade the service.** Every round is wrapped: a probe that
 raises costs that probe, a round that raises costs that round, and
-`run_forever` never dies of anything but cancellation. A hanging SVT is
-bounded by a per-probe timeout rather than being allowed to wedge the loop.
+`run_forever` never dies of anything but cancellation. A hanging SVT or a
+hanging Sonarr is bounded by a per-probe timeout rather than being allowed
+to wedge the loop.
+
+--- The mapping that resolves nothing -------------------------------------
+
+Everything above answers "does SVT still list episodes for this row". A
+mapping can pass that on every round of its life and still **resolve
+nothing, ever**.
+
+`uppdrag-granskning` is the live example. Correct slug, HTTP 200, 61
+episodes -- and `_ordinal` returns None for every one of them, because that
+show's titles and play URLs encode no number, so `episode_matches` signal 2
+refuses all 61. The show has been mapped, has been returning episodes, and
+has never grabbed anything. The cause cannot be fixed from SVT's data; see
+`docs/design/2026-08-28-svt-episode-ordinals.md`.
+
+**The SVT half is structurally unable to see this.** It watches for an
+empty list or a failed fetch; this returns a full, healthy list that simply
+never matches. It was found by accident, in a differential against a
+scraper being deleted for unrelated reasons.
+
+So each round asks a second question of each mapping: can its episodes
+match *any* of Sonarr's episodes for that series? See `resolvability`.
+
+**The counting is `discovery.corroborate`, not a second copy of it.** That
+function already counts how many of Sonarr's episodes have a corresponding
+SVT episode under `matching.episode_matches` -- the resolver's own rule, in
+its one implementation. That arithmetic now decides two things (whether a
+mapping may be written unconfirmed, and whether one already written can
+ever work), and two copies of it drifting is this codebase's most
+persistent defect class.
+
+**Zero matches is not the finding.** Getting that distinction right is the
+whole of this half, because a false alarm here trains the operator to
+ignore the one signal that would have caught a real problem -- a lesson
+this project has already learned twice. Three shapes produce zero matches
+and are not broken: Sonarr has no aired episode yet (a newly added
+series), every SVT episode is still upcoming, or Sonarr has no such series
+at all. Only "SVT has available episodes, Sonarr has aired episodes, and
+no pair of them agrees" is reported, and anything that cannot be placed
+there confidently is reported as undetermined instead.
+
+**It says which of the two reasons it is.** No SVT episode carries an
+ordinal at all is unfixable and means removing the mapping or accepting
+it; ordinals exist and no air date lines up suggests a wrong mapping or a
+tolerance too tight. Those send the operator to completely different
+places, so `status()` carries the reason as a value and the page renders
+its sentence.
+
+**It is amber, not red.** `STATE_UNRESOLVABLE` is in `ATTENTION_STATES`
+and not in `DEGRADED_STATES`, exactly like the ended-show case -- see
+those two names for the argument. One show being inert does not stop
+anything else working, and in the `no_ordinals` case there is nothing to
+do about it ever, so a red light over it would be permanent by
+construction.
+
+**A Sonarr outage degrades this half and nothing else.** `resolves` goes
+to None with a reason, `resolvability_unknown` counts the rows, and the
+SVT half's `ok`/`episode_count`/`failing` are untouched. It raises no
+alarm of its own, because `SonarrCanary` already turns the top-level light
+red for a Sonarr that is not answering and a second alarm for one cause is
+the noise this module exists to avoid.
 
 --- The Sonarr check ------------------------------------------------------
 
@@ -120,8 +183,11 @@ Between a save and a restart those two are legitimately different answers.
 import asyncio
 import logging
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
+from svtplay_arr.config import Settings
+from svtplay_arr.discovery import corroborate
+from svtplay_arr.models import SonarrEpisode, SvtEpisode
 from svtplay_arr.sonarr import REASON_UNKNOWN, SonarrApiError
 from svtplay_arr.svt.client import SvtApiError
 
@@ -180,6 +246,11 @@ STATE_NO_MAPPINGS = "no_mappings"
 STATE_OK = "ok"
 # The last round resolved some mappings and not others: those shows.
 STATE_SERIES = "series"
+# Every mapping resolved on SVT, and at least one of them returns episodes
+# that can never match anything Sonarr has. See the module docstring: this
+# is the shape the SVT half is structurally unable to see, because from its
+# side it is a perfect pass.
+STATE_UNRESOLVABLE = "unresolvable"
 # The last round resolved none of its mappings: SVT, not any one show.
 STATE_SVT = "svt"
 # Reading the canary's own state failed. Unknown for an unknown reason.
@@ -216,9 +287,65 @@ STATE_UNAVAILABLE = "unavailable"
 # what turns the light red, not about hiding anything.
 DEGRADED_STATES = frozenset({STATE_STALE, STATE_SVT, STATE_UNAVAILABLE})
 # ...and the states that must be visible on every rendered surface, which is
-# the same set plus `series`. The strip and its banner key off this; only
-# `/health`'s top-level `status` keys off DEGRADED_STATES above.
-ATTENTION_STATES = DEGRADED_STATES | {STATE_SERIES}
+# the same set plus `series` and `unresolvable`. The strip and its banner
+# key off this; only `/health`'s top-level `status` keys off
+# DEGRADED_STATES above.
+#
+# `STATE_UNRESOLVABLE` sits here for exactly the reason `STATE_SERIES` does,
+# and the argument is if anything stronger. It is one show; the rest of the
+# feed works; there is nothing urgent to do about it tonight -- and in the
+# `no_ordinals` case there is nothing to do about it *ever*, so a red light
+# over it would be permanent by construction, which is the precise recipe
+# for a light nobody reads. It still has to be loud on the page, because
+# the whole point is that this failure is otherwise invisible.
+ATTENTION_STATES = DEGRADED_STATES | {STATE_SERIES, STATE_UNRESOLVABLE}
+
+# Why a mapping can never resolve. Two values, because they send the
+# operator to completely different places and "this mapping resolves
+# nothing" on its own does not say which.
+#
+# No SVT episode carries an ordinal at all, so `episode_matches` signal 2
+# refuses every one of them. Unfixable from here -- the ordinal is derived
+# from `/avsnitt-N` in the play URL or a leading `N.` in the heading, and
+# shows grouped by production period carry neither. The action is to remove
+# the mapping or to accept that it is inert. See
+# `docs/design/2026-08-28-svt-episode-ordinals.md`.
+UNRESOLVABLE_NO_ORDINALS = "no_ordinals"
+# Ordinals exist, and no SVT episode agrees with a Sonarr episode on both
+# number and air date. That is a mapping that may well be pointed at the
+# wrong programme, or an `air_date_tolerance_days` too tight for how far
+# SVT's publication dates sit from Sonarr's air dates. Both are fixable,
+# and neither is what the case above means.
+UNRESOLVABLE_NO_AIR_DATE = "no_air_date"
+# The two together, so a caller asking "is this a finding" cannot drift
+# from the list of findings.
+UNRESOLVABLE_REASONS = frozenset(
+    {UNRESOLVABLE_NO_ORDINALS, UNRESOLVABLE_NO_AIR_DATE}
+)
+
+# ...and why nothing could be concluded. These are *not* findings. Each one
+# is a shape where zero matches is the expected, healthy answer, and
+# alarming on any of them would be the false alarm that teaches an operator
+# to ignore the two reasons above.
+#
+# Nothing SVT lists is downloadable yet -- every episode is flagged
+# upcoming. Nothing can match, and nothing being matchable yet is not a
+# broken mapping.
+UNDETERMINED_NOTHING_AVAILABLE = "nothing_available"
+# Sonarr has no aired episode for this series: a newly added series, or one
+# whose season is scheduled but has not started. Same argument.
+UNDETERMINED_NOTHING_AIRED = "nothing_aired"
+# Sonarr's library has no series with this mapping's tvdb id. Nothing can
+# match, but the cause is not this mapping's episodes and this check does
+# not claim it as one.
+UNDETERMINED_NOT_IN_SONARR = "not_in_sonarr"
+# Sonarr could not be asked. The one undetermined value that is *reported*
+# as a count, because it is the one that would otherwise let a Sonarr
+# outage read as a clean sweep.
+UNDETERMINED_SONARR_UNAVAILABLE = "sonarr_unavailable"
+# Nothing asked. The SVT half failed for this row (so there is no episode
+# list to compare), or no Sonarr client was wired in at all.
+UNDETERMINED_NOT_CHECKED = "not_checked"
 
 # The last Sonarr check failed: unreachable, unauthenticated, or answering
 # like something that is not Sonarr. `SonarrCanary.status()` carries the
@@ -277,6 +404,168 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+@dataclass(frozen=True)
+class Resolvability:
+    """Whether one mapping's episodes can match any of Sonarr's, and why.
+
+    `resolves` is tri-state and the three values are three different
+    claims, not two plus a fallback:
+
+    * `True`  -- at least one SVT episode agrees with exactly one Sonarr
+      episode under `matching.episode_matches`. This mapping can resolve.
+    * `False` -- both sides have real content and no pair of them agrees.
+      This mapping resolves nothing and will not start on its own. The one
+      finding this whole computation exists to produce.
+    * `None`  -- nothing could be concluded. Never rendered as either of
+      the above, because "not checked" reading as healthy is the defect
+      this module exists to remove, one level in.
+
+    `reason` is always set except on `True`: one of `UNRESOLVABLE_REASONS`
+    when `resolves` is False, one of the `UNDETERMINED_*` values when it is
+    None. A caller never has to distinguish "no reason" from "a reason of
+    None".
+
+    `note` is the same fact as a sentence for the operator, and it is what
+    the page and `/health` render. It never contains anything but this
+    module's own words, the mapping's slug, counts, and -- for a Sonarr
+    failure -- one of `sonarr.REASON_MESSAGES`, which are fixed literals.
+    The API key cannot reach it.
+    """
+
+    resolves: bool | None = None
+    reason: str | None = None
+    note: str | None = None
+
+    @property
+    def is_finding(self) -> bool:
+        return self.reason in UNRESOLVABLE_REASONS
+
+
+# Nothing was asked, and nothing is claimed. Shared rather than rebuilt at
+# each of its five sites so the "not checked" verdict has one spelling.
+_NOT_CHECKED = Resolvability(None, UNDETERMINED_NOT_CHECKED)
+
+
+def resolvability(
+    svt_episodes,
+    sonarr_episodes,
+    *,
+    slug: str,
+    tolerance_days: int,
+    today: date,
+) -> Resolvability:
+    """Can this mapping's episodes match any of Sonarr's? Pure; never raises.
+
+    **The match counting is not done here.** It is `discovery.corroborate`,
+    which counts strictly one-to-one agreements under
+    `matching.episode_matches` -- the resolver's own rule, in its one
+    implementation. A second copy of that arithmetic drifting from the
+    first is this codebase's most persistent defect class, and it now
+    decides two different things: whether a mapping may be *written*
+    unconfirmed, and whether one already written can ever work. Those must
+    be the same question asked twice, not two questions that resemble each
+    other.
+
+    `corroborate`'s numerator is the right bar for this and not merely a
+    convenient one. It requires an SVT episode and a Sonarr episode that
+    each have exactly one partner; where that fails the resolver refuses
+    too, in both directions (`Resolver.resolve` and `_recent_for` both give
+    up on `len(candidates) != 1`). So `matched == 0` really does mean
+    "nothing here resolves", rather than "nothing here resolves under a
+    stricter rule than the one that runs".
+
+    Everything before that call is exclusions, and getting them right is
+    the whole job. Zero matches is the *expected* answer in three
+    situations that are not broken, and a check that cried wolf on any of
+    them would train the operator to ignore the one signal that catches a
+    real problem -- a lesson this project has already learned twice, in the
+    installer's fresh-install warning and in the canary's own ended-show
+    case. Anything that cannot be placed confidently in the third category
+    below is reported as undetermined, never as a finding.
+
+    `today` is passed in rather than read here, so this stays pure and the
+    caller's one clock read covers the whole round. It is used for exactly
+    one thing: telling a series Sonarr has scheduled from one it has aired.
+    Note that `corroborate` itself is, and remains, clock-free -- see
+    `Evidence`'s docstring for why a wall-clock reading inside a gate that
+    *writes* was a safety hole. Here the direction of harm is reversed: a
+    clock behind under-counts what has aired and so raises fewer alarms,
+    and the worst a clock ahead can do is show one warning too many on a
+    page, which the next round corrects.
+    """
+    listed = [
+        e for e in svt_episodes or () if isinstance(e, SvtEpisode) and e.available
+    ]
+    if not listed:
+        # Exclusion 1: nothing SVT lists is downloadable yet. A show
+        # between seasons, or one whose next run is announced and not out.
+        return Resolvability(
+            None,
+            UNDETERMINED_NOTHING_AVAILABLE,
+            f"Nothing to compare yet: every episode SVT lists for {slug!r} is "
+            "still upcoming, so none of them is downloadable.",
+        )
+
+    # Season 0 excluded for the same reason `corroborate` and
+    # `Resolver._recent_for` exclude it: a Sonarr special dated alongside
+    # the run is not evidence about the run.
+    aired = [
+        se
+        for se in sonarr_episodes or ()
+        if isinstance(se, SonarrEpisode)
+        and se.season > 0
+        and se.air_date is not None
+        and se.air_date <= today
+    ]
+    if not aired:
+        # Exclusion 2: a newly added series, or one whose season is
+        # scheduled but has not started. Sonarr dates a whole season from
+        # the day it is announced, so "has episodes" is not "has aired".
+        return Resolvability(
+            None,
+            UNDETERMINED_NOTHING_AIRED,
+            "Nothing to compare yet: Sonarr has no aired episode for this "
+            "series.",
+        )
+
+    evidence = corroborate(
+        sonarr_episodes, svt_episodes, tolerance_days=tolerance_days
+    )
+    if evidence.matched > 0:
+        return Resolvability(
+            True,
+            None,
+            f"{evidence.matched} of Sonarr's aired episodes have a matching "
+            f"episode on SVT.",
+        )
+
+    # Both sides have real content and nothing agrees. The mapping is
+    # valid, SVT answers, the episode list is full -- and it has never
+    # grabbed anything and never will until something changes.
+    if not any(e.ordinal is not None for e in listed):
+        return Resolvability(
+            False,
+            UNRESOLVABLE_NO_ORDINALS,
+            f"This mapping can never match anything. SVT lists "
+            f"{len(listed)} available episode"
+            f"{'' if len(listed) == 1 else 's'} for {slug!r} and not one of "
+            "them carries an episode number, so every one of them is refused "
+            "before any date is compared. Nothing about this show or this "
+            "mapping can fix it: either remove the row, or keep it knowing "
+            "it will never grab anything.",
+        )
+    return Resolvability(
+        False,
+        UNRESOLVABLE_NO_AIR_DATE,
+        f"This mapping can never match anything as it stands. SVT's episodes "
+        f"for {slug!r} carry episode numbers, and none of them agrees with a "
+        f"Sonarr episode on both number and air date within "
+        f"{tolerance_days} day{'' if tolerance_days == 1 else 's'}. Check "
+        "that this row points at the right programme, and at the air dates "
+        "Sonarr holds for it.",
+    )
+
+
 def _iso(when: datetime | None) -> str | None:
     return None if when is None else when.isoformat()
 
@@ -293,6 +582,14 @@ class MappingHealth:
     *worked*, not the last check. "Worked an hour ago, failing now" and
     "never worked" call for different actions from the operator, and only
     keeping both timestamps can tell them apart.
+
+    `resolves`, `unresolvable_reason` and `resolvability_note` are the
+    other half of the check -- see `Resolvability` -- and they follow the
+    opposite rule to `last_success`: they always describe *this* round and
+    are cleared when this round could not determine them. A high-water
+    mark is right for "did SVT ever answer"; it would be wrong here,
+    because a stale `False` kept across a Sonarr outage would go on
+    accusing a mapping nothing has looked at.
     """
 
     tvdb_id: int
@@ -304,6 +601,9 @@ class MappingHealth:
     episode_count: int | None = None
     last_error: str | None = None
     last_error_at: datetime | None = None
+    resolves: bool | None = None
+    unresolvable_reason: str | None = None
+    resolvability_note: str | None = None
 
     def as_dict(self, now: datetime) -> dict:
         """This row's state, with both an instant and an age per timestamp.
@@ -335,6 +635,12 @@ class MappingHealth:
             "last_error": self.last_error,
             "last_error_at": _iso(self.last_error_at),
             "last_error_age_s": _age_s(self.last_error_at, now),
+            # Tri-state, and rendered as three things. `None` here is "not
+            # determined this round", which is not the same claim as
+            # "matches nothing" and must never be shown as "fine".
+            "resolves": self.resolves,
+            "unresolvable_reason": self.unresolvable_reason,
+            "resolvability_note": self.resolvability_note,
         }
 
 
@@ -360,6 +666,14 @@ def unavailable_status() -> dict:
         "last_error_at": None,
         "failing_series": [],
         "failing_series_truncated": False,
+        # None, not 0: "no mapping was found unresolvable" and "nothing is
+        # known about any mapping" are different claims, and only one of
+        # them is reassuring.
+        "unresolvable": None,
+        "unresolvable_series": [],
+        "unresolvable_series_truncated": False,
+        "resolvability_unknown": None,
+        "resolvability_error": None,
     }
 
 
@@ -469,18 +783,33 @@ class SvtCanary(_PeriodicCheck):
     round with no restart.
 
     `svt` is the shared `SvtClient`; only `list_episodes` is ever called.
+
+    `sonarr` is the shared `SonarrClient`, and it is optional: without it
+    the SVT half runs exactly as before and every row's `resolves` stays
+    `None`. Only `all_series` and `episodes` are ever called, both
+    read-only GETs. It is here rather than in a third check because the
+    resolvability question needs *both* episode lists, and the SVT one is
+    already in hand at this point in the round -- a separate check would
+    double this service's traffic against an unofficial API to learn
+    nothing new.
     """
 
     def __init__(
         self,
         mappings_provider,
         svt,
+        sonarr=None,
         *,
         interval_s: float = DEFAULT_INTERVAL_S,
         probe_timeout_s: float = DEFAULT_PROBE_TIMEOUT_S,
         concurrency: int = DEFAULT_CONCURRENCY,
         spacing_s: float = DEFAULT_SPACING_S,
         initial_delay_s: float = DEFAULT_INITIAL_DELAY_S,
+        # `Settings`' own default, never a literal: this must compare at
+        # the tolerance the resolver will later match at, and a number
+        # written here would be a second home for an operator-visible
+        # setting.
+        tolerance_days: int = Settings.air_date_tolerance_days,
         clock=_utcnow,
     ):
         super().__init__(
@@ -491,6 +820,8 @@ class SvtCanary(_PeriodicCheck):
         )
         self._mappings_provider = mappings_provider
         self._svt = svt
+        self._sonarr = sonarr
+        self._tolerance_days = int(tolerance_days)
         self._concurrency = max(int(concurrency), 1)
         self._spacing = max(float(spacing_s), 0.0)
 
@@ -506,6 +837,12 @@ class SvtCanary(_PeriodicCheck):
         self._checked = 0
         self._failing = 0
         self._episodes_seen = 0
+        # ...and the resolvability half of the same round. Counts only,
+        # per round: a verdict is never carried forward, so a Sonarr
+        # outage clears them rather than leaving a stale accusation.
+        self._unresolvable = 0
+        self._resolvability_unknown = 0
+        self._resolvability_error: str | None = None
 
     # --- Reporting --------------------------------------------------------
 
@@ -519,15 +856,21 @@ class SvtCanary(_PeriodicCheck):
             return STATE_UNKNOWN
         if self._checked == 0:
             return STATE_NO_MAPPINGS
-        if self._failing == 0:
-            return STATE_OK
         if self._failing >= self._checked:
             # With exactly one mapping the two shapes are the same set, and
             # this branch wins: a lone mapping failing is indistinguishable
             # from SVT being down, and the more urgent reading is the safe
             # one to act on.
             return STATE_SVT
-        return STATE_SERIES
+        if self._failing:
+            return STATE_SERIES
+        # Ranked below both of the above, and only because `state` is one
+        # word: a row SVT will not even list is the louder finding, and an
+        # unresolvable row alongside it is still reported in full by
+        # `status()` rather than lost to the headline.
+        if self._unresolvable:
+            return STATE_UNRESOLVABLE
+        return STATE_OK
 
     def status(self) -> dict:
         """The canary's contribution to `/health` -- and, through it, to the
@@ -540,6 +883,11 @@ class SvtCanary(_PeriodicCheck):
         now = self._now()
         state = self.state()
         failing = [h for h in self._health.values() if h.ok is False]
+        unresolvable = [
+            h
+            for h in sorted(self._health.values(), key=_by_tvdb)
+            if h.unresolvable_reason in UNRESOLVABLE_REASONS
+        ]
         return {
             "state": state,
             # Does this turn /health's top-level light red? See
@@ -584,6 +932,41 @@ class SvtCanary(_PeriodicCheck):
                 for h in failing[:_MAX_REPORTED_FAILURES]
             ],
             "failing_series_truncated": len(failing) > _MAX_REPORTED_FAILURES,
+            # --- the mapping that resolves nothing ---------------------
+            #
+            # Reported alongside the counts above rather than folded into
+            # them: a row that fails on SVT and a row that returns a
+            # perfect episode list nothing can ever match are different
+            # findings with different fixes, and `failing` has always
+            # meant the first one.
+            "unresolvable": self._unresolvable,
+            "unresolvable_series": [
+                {
+                    "tvdb_id": h.tvdb_id,
+                    "series_title": h.series_title,
+                    "svt_slug": h.svt_slug,
+                    # Machine-readable, so a monitoring setup can tell the
+                    # unfixable case from the fixable one without matching
+                    # on prose. One of UNRESOLVABLE_REASONS.
+                    "reason": h.unresolvable_reason,
+                    "note": h.resolvability_note,
+                }
+                for h in unresolvable[:_MAX_REPORTED_FAILURES]
+            ],
+            "unresolvable_series_truncated": (
+                len(unresolvable) > _MAX_REPORTED_FAILURES
+            ),
+            # How many rows this round could not decide because Sonarr
+            # could not be asked. Present so that a Sonarr outage reads as
+            # "this was not checked" rather than as `unresolvable: 0`,
+            # which is what a clean sweep looks like. It does not raise
+            # attention here -- `SonarrCanary` already turns the top-level
+            # light red for a Sonarr that is not answering, and a second
+            # alarm for the same cause is the noise this module avoids.
+            "resolvability_unknown": self._resolvability_unknown,
+            # One of `sonarr.REASON_MESSAGES` (fixed literals), or this
+            # module's own words. Never the exception's, and never a URL.
+            "resolvability_error": self._resolvability_error,
         }
 
     def per_mapping(self) -> list[dict]:
@@ -645,21 +1028,32 @@ class SvtCanary(_PeriodicCheck):
             self._record_error(f"could not read the mappings: {exc}")
             return
 
+        # One library read for the whole round, ahead of the fan-out.
+        # `SonarrClient.series_id_for_tvdb` fetches the series list on
+        # every call, so asking it per mapping would cost N reads of the
+        # same list to learn the same thing.
+        series_index, index_error = await self._sonarr_series_index()
+
         # Built per round, not held on the instance: `asyncio.Semaphore`
         # binds to the loop it is first awaited on and refuses to be used
         # from another, and `SvtCanary` is constructed by `create_app`
         # outside any running loop. A per-round gate has no lifetime to get
-        # wrong, and bounds exactly what it needs to -- in-flight SVT
-        # requests within one round.
+        # wrong, and bounds exactly what it needs to -- in-flight probes
+        # within one round.
         gate = asyncio.Semaphore(self._concurrency)
         results = await asyncio.gather(
-            *(self._staggered(i, m, gate) for i, m in enumerate(mappings)),
+            *(
+                self._staggered(i, m, gate, series_index, index_error)
+                for i, m in enumerate(mappings)
+            ),
             return_exceptions=True,
         )
 
         now = self._now()
         health: dict[int, MappingHealth] = {}
         checked = failing = episodes = 0
+        unresolvable = resolvability_unknown = 0
+        resolvability_error: str | None = None
         for mapping, result in zip(mappings, results):
             previous = self._health.get(mapping.tvdb_id)
             if isinstance(result, BaseException):
@@ -670,26 +1064,86 @@ class SvtCanary(_PeriodicCheck):
                     "SVT canary probe for %r raised", mapping.svt_slug,
                     exc_info=result,
                 )
-                result = (False, None, f"probe failed unexpectedly: {result}")
-            ok, episode_count, error = result
+                result = (
+                    False,
+                    None,
+                    f"probe failed unexpectedly: {result}",
+                    Resolvability(None, UNDETERMINED_NOT_CHECKED),
+                )
+            ok, episode_count, error, resolves = result
             checked += 1
             if ok:
                 episodes += episode_count or 0
             else:
                 failing += 1
                 self._record_error(error, at=now)
+            if resolves.is_finding:
+                unresolvable += 1
+            elif resolves.reason == UNDETERMINED_SONARR_UNAVAILABLE:
+                resolvability_unknown += 1
+                resolvability_error = resolvability_error or resolves.note
             health[mapping.tvdb_id] = _merge(previous, mapping, now, ok,
-                                             episode_count, error)
+                                             episode_count, error, resolves)
 
         self._health = health
         self._last_round_at = now
         self._checked = checked
         self._failing = failing
         self._episodes_seen = episodes
+        self._unresolvable = unresolvable
+        self._resolvability_unknown = resolvability_unknown
+        self._resolvability_error = resolvability_error
         if checked and failing < checked:
             self._last_success_at = now
 
-    async def _staggered(self, index: int, mapping, gate: asyncio.Semaphore):
+    async def _sonarr_series_index(self) -> tuple[dict[int, int] | None, str | None]:
+        """tvdb id -> Sonarr series id, or (None, why not). Never raises.
+
+        `None` is "Sonarr could not be asked", which every row then reports
+        as undetermined. It is deliberately not an empty dict: an empty
+        library and an unreachable Sonarr are different facts, and only one
+        of them says anything about a mapping.
+        """
+        if self._sonarr is None:
+            return None, None
+        try:
+            series = await asyncio.wait_for(
+                self._sonarr.all_series(), timeout=self._probe_timeout
+            )
+        except TimeoutError:
+            return None, (
+                f"Sonarr did not answer within {self._probe_timeout:g}s, so "
+                "whether these mappings can match anything is unknown."
+            )
+        except SonarrApiError as exc:
+            # `str(exc)` is one of REASON_MESSAGES -- a fixed literal with
+            # no URL and no key in it. Same discipline as `SonarrCanary`.
+            return None, str(exc)
+        except Exception:
+            # This module's own words rather than the exception's, so an
+            # unexpected type cannot smuggle anything -- an API key
+            # included -- onto a rendered page.
+            log.warning(
+                "SVT canary could not read Sonarr's series list", exc_info=True
+            )
+            return None, (
+                "Sonarr's series list could not be read, so whether these "
+                "mappings can match anything is unknown. Check svtplay-arr's "
+                "log."
+            )
+        index: dict[int, int] = {}
+        for entry in series or ():
+            if not isinstance(entry, dict):
+                continue
+            tvdb_id, series_id = entry.get("tvdbId"), entry.get("id")
+            if isinstance(tvdb_id, int) and isinstance(series_id, int):
+                index[tvdb_id] = series_id
+        return index, None
+
+    async def _staggered(
+        self, index: int, mapping, gate: asyncio.Semaphore,
+        series_index, index_error,
+    ):
         if self._spacing and index:
             # Spread the round's requests out instead of opening N
             # connections to svtplay.se in the same second. Sequenced by
@@ -697,13 +1151,24 @@ class SvtCanary(_PeriodicCheck):
             # and cannot deadlock.
             await asyncio.sleep(index * self._spacing)
         async with gate:
-            return await self._probe(mapping)
+            return await self._probe(mapping, series_index, index_error)
 
-    async def _probe(self, mapping) -> tuple[bool, int | None, str | None]:
-        """Check one mapping. Returns (ok, episode_count, error).
+    async def _probe(
+        self, mapping, series_index=None, index_error=None,
+    ) -> tuple[bool, int | None, str | None, Resolvability]:
+        """Check one mapping. Returns (ok, episode_count, error, resolvability).
 
-        Never raises except on cancellation. Read-only: exactly the same
-        `list_episodes` call `Resolver` makes, and nothing else.
+        Never raises except on cancellation. Read-only throughout: the same
+        `list_episodes` call `Resolver` makes, and -- when a Sonarr client
+        is wired in and SVT answered -- one `episodes()` read of the
+        series' episode list. Nothing else on either client.
+
+        The two halves are independent by construction. A Sonarr that is
+        down cannot change `ok`, `episode_count` or `error`; it can only
+        leave the resolvability undetermined. Both are bounded by the same
+        per-probe timeout, and both run inside this round's stagger and
+        concurrency gate, so the Sonarr requests arrive at the same
+        measured pace as the SVT ones rather than as a burst.
         """
         slug = mapping.svt_slug
         try:
@@ -719,6 +1184,7 @@ class SvtCanary(_PeriodicCheck):
                 None,
                 f"SVT timed out for {slug!r} after "
                 f"{self._probe_timeout:g}s",
+                _NOT_CHECKED,
             )
         except SvtApiError as exc:
             # The status code is why `SvtApiError` carries one: a 404 is the
@@ -733,13 +1199,20 @@ class SvtCanary(_PeriodicCheck):
                     None,
                     f"SVT has nothing at slug {slug!r} (404 not found) -- the "
                     "show may have ended, or its URL changed",
+                    _NOT_CHECKED,
                 )
-            return False, None, f"SVT check for {slug!r} failed: {exc}"
+            return (
+                False, None, f"SVT check for {slug!r} failed: {exc}",
+                _NOT_CHECKED,
+            )
         except Exception as exc:
             # Anything else is caught for the same reason every other guard
             # in this project catches broadly: a monitoring component must
             # not be able to fail the thing it monitors.
-            return False, None, f"SVT check for {slug!r} failed: {exc}"
+            return (
+                False, None, f"SVT check for {slug!r} failed: {exc}",
+                _NOT_CHECKED,
+            )
 
         count = len(episodes or [])
         if count == 0:
@@ -753,8 +1226,82 @@ class SvtCanary(_PeriodicCheck):
                 f"SVT answered for {slug!r} but listed no episodes "
                 "-- the show may have ended, or SVT has changed what it "
                 "returns and svtplay-arr needs updating",
+                _NOT_CHECKED,
             )
-        return True, count, None
+        return (
+            True, count, None,
+            await self._resolvability(mapping, episodes, series_index, index_error),
+        )
+
+    async def _resolvability(
+        self, mapping, svt_episodes, series_index, index_error,
+    ) -> Resolvability:
+        """Can this mapping's episodes match any of Sonarr's? Never raises.
+
+        The SVT episode list is the one this round already fetched, so this
+        costs SVT nothing. Against Sonarr it costs one `episodes()` read
+        per mapping per round, on top of the round's single `all_series()`.
+        Sonarr is the operator's own service and the resolver already calls
+        it several times an hour on every RSS poll, so that is cheap -- but
+        it is still bounded (`wait_for`), still staggered, and still behind
+        the round's concurrency gate, because "cheap" is not "unbounded".
+        """
+        if self._sonarr is None:
+            return _NOT_CHECKED
+        if series_index is None:
+            return Resolvability(
+                None,
+                UNDETERMINED_SONARR_UNAVAILABLE,
+                index_error
+                or "Sonarr could not be asked, so whether this mapping can "
+                "match anything is unknown.",
+            )
+        series_id = series_index.get(mapping.tvdb_id)
+        if series_id is None:
+            # Not a finding. Nothing can match, but the cause is not this
+            # mapping's episodes, and this check only ever claims that one
+            # shape. `Resolver` logs the same situation per request.
+            return Resolvability(
+                None,
+                UNDETERMINED_NOT_IN_SONARR,
+                f"Sonarr has no series with tvdb id {mapping.tvdb_id}, so "
+                "there is nothing to compare these episodes against.",
+            )
+        try:
+            sonarr_episodes = await asyncio.wait_for(
+                self._sonarr.episodes(series_id), timeout=self._probe_timeout
+            )
+        except TimeoutError:
+            return Resolvability(
+                None,
+                UNDETERMINED_SONARR_UNAVAILABLE,
+                f"Sonarr did not answer within {self._probe_timeout:g}s, so "
+                "whether this mapping can match anything is unknown.",
+            )
+        except SonarrApiError as exc:
+            # A fixed literal from REASON_MESSAGES. No URL, no key.
+            return Resolvability(
+                None, UNDETERMINED_SONARR_UNAVAILABLE, str(exc)
+            )
+        except Exception:
+            log.warning(
+                "SVT canary could not read Sonarr's episodes for %r",
+                mapping.svt_slug, exc_info=True,
+            )
+            return Resolvability(
+                None,
+                UNDETERMINED_SONARR_UNAVAILABLE,
+                "Sonarr's episode list could not be read, so whether this "
+                "mapping can match anything is unknown. Check svtplay-arr's "
+                "log.",
+            )
+        return resolvability(
+            svt_episodes,
+            sonarr_episodes,
+            slug=mapping.svt_slug,
+            tolerance_days=self._tolerance_days,
+            today=self._now().date(),
+        )
 
 
 def sonarr_unavailable_status() -> dict:
@@ -952,12 +1499,18 @@ def _merge(
     ok: bool,
     episode_count: int | None,
     error: str | None,
+    resolves: Resolvability = _NOT_CHECKED,
 ) -> MappingHealth:
     """Fold one probe's outcome into what was already known about a mapping.
 
     A failure keeps the previous `last_success` and `episode_count`: they
     describe the last check that *worked*, and losing them on the first
     failure would erase the only evidence that this show ever resolved.
+
+    The resolvability fields do the opposite, deliberately: they are always
+    this round's, so a `False` verdict cannot outlive the round that earned
+    it. Keeping one would go on accusing a mapping through a Sonarr outage
+    that looked at nothing.
     """
     base = previous or MappingHealth(
         tvdb_id=mapping.tvdb_id,
@@ -972,6 +1525,11 @@ def _merge(
         svt_slug=mapping.svt_slug,
         ok=ok,
         last_checked=now,
+        resolves=resolves.resolves,
+        unresolvable_reason=(
+            resolves.reason if resolves.is_finding else None
+        ),
+        resolvability_note=resolves.note,
     )
     if ok:
         return replace(

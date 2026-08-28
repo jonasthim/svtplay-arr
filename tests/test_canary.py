@@ -10,6 +10,8 @@ computation, two surfaces" property actually lives.
 
 import asyncio
 import hashlib
+import json
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -27,6 +29,10 @@ from svtplay_arr.canary import (
     STATE_SVT,
     STATE_UNAVAILABLE,
     STATE_UNKNOWN,
+    STATE_UNRESOLVABLE,
+    UNRESOLVABLE_NO_AIR_DATE,
+    UNRESOLVABLE_NO_ORDINALS,
+    Resolvability,
     SonarrCanary,
     SvtCanary,
     sonarr_unavailable_status,
@@ -44,10 +50,26 @@ from svtplay_arr.sonarr import (
     SonarrApiError,
     SonarrStatus,
 )
-from svtplay_arr.models import Mapping, SvtEpisode
-from svtplay_arr.svt.client import SvtApiError
+from svtplay_arr.models import Mapping, SonarrEpisode, SvtEpisode
+from svtplay_arr.svt.client import SvtApiError, episodes_from_details_page
 
 _T0 = datetime(2026, 8, 27, 9, 0, 0, tzinfo=timezone.utc)
+
+# The Stage 1 differential captures, read here for the one show that
+# motivated the resolvability half of this check. A hand-built list of
+# ordinal-less episodes would prove only that the code does what it was
+# written to do; this is the response SVT actually sent for
+# `uppdrag-granskning`, and it is what exposed the defect in the first
+# place. Parsed through the shipped reader, so the episodes under test are
+# exactly the objects the resolver would be handed.
+_FIXTURES = Path(__file__).parent / "fixtures/svt"
+
+
+def _captured(show: str) -> list[SvtEpisode]:
+    body = json.loads(
+        (_FIXTURES / f"details-{show}-20260828.json").read_text(encoding="utf-8")
+    )
+    return episodes_from_details_page(next(iter(body["data"].values())))
 
 
 def _sonarr_error(reason: str) -> SonarrApiError:
@@ -539,10 +561,10 @@ async def test_a_probe_that_escapes_its_own_guard_costs_only_that_probe():
     # `_probe` is written not to raise, so this exercises the net under a bug
     # in it: one probe blowing up must cost that probe, not the round.
     class Leaky(SvtCanary):
-        async def _probe(self, mapping):
+        async def _probe(self, mapping, series_index=None, index_error=None):
             if mapping.tvdb_id == 1:
                 raise RuntimeError("escaped the guard")
-            return True, 3, None
+            return True, 3, None, Resolvability()
 
     c = Leaky(
         lambda: [_mapping(1), _mapping(2)],
@@ -956,3 +978,450 @@ async def test_run_forever_survives_a_round_that_raises():
     with pytest.raises(asyncio.CancelledError):
         await task
     assert sonarr.calls >= 2, "the loop died on the first failing round"
+
+
+# --- The mapping that resolves nothing -------------------------------------
+#
+# The failure this half of the check exists for is one the SVT half cannot
+# see, by construction. `uppdrag-granskning` is the live example: a correct
+# slug, a 200, a full list of 61 episodes -- and not one of them carries an
+# ordinal, so `matching.episode_matches` signal 2 refuses every one and the
+# mapping has never grabbed anything. To the SVT probe that is a perfect
+# pass, and to an operator it is indistinguishable from a series between
+# seasons.
+#
+# The condition is deliberately narrow. A false alarm here trains the
+# operator to ignore the one signal that would catch a real problem, which
+# is the mistake this project has already shipped twice -- the installer's
+# fresh-install warning and the canary's own ended-show case. So the three
+# not-broken shapes below are pinned first, and each is mutation-checked:
+# every one must fail if it starts alarming.
+
+
+def _sonarr_episode(season: int, episode: int, air_date: date | None):
+    return SonarrEpisode(
+        series_id=0, season=season, episode=episode, air_date=air_date,
+        title="TBA",
+    )
+
+
+def _aired(n: int, *, first: date = date(2026, 8, 20), season: int = 1):
+    """`n` Sonarr episodes, one a day, ending on `first`.
+
+    Dated in the past of `_T0` so they count as aired against the canary's
+    own clock, and numbered from 1 so they line up with `_episodes(n)`.
+    """
+    return [
+        _sonarr_episode(season, i, first - timedelta(days=n - i))
+        for i in range(1, n + 1)
+    ]
+
+
+class FakeSonarrLibrary:
+    """Stands in for `SonarrClient`, offering *only* `all_series` and
+    `episodes`.
+
+    Both are read-only GETs. Every other method -- `status`, and anything
+    that could write -- is absent by construction, so a check that grew a
+    second Sonarr call, or reached for a write path, fails these tests with
+    an AttributeError rather than quietly costing more than the arithmetic
+    in the docs claims.
+    """
+
+    def __init__(self, library=None, *, series_error=None,
+                 episodes_error=None, hang=False):
+        # {tvdb_id: [SonarrEpisode, ...]}
+        self.library = dict(library or {})
+        self.series_error = series_error
+        self.episodes_error = episodes_error
+        self.hang = hang
+        self.series_calls = 0
+        self.episode_calls: list[int] = []
+
+    def _series_id(self, tvdb_id: int) -> int:
+        return 1000 + tvdb_id
+
+    async def all_series(self):
+        self.series_calls += 1
+        if self.series_error is not None:
+            raise self.series_error
+        await asyncio.sleep(0)
+        return [
+            {"tvdbId": t, "id": self._series_id(t)} for t in sorted(self.library)
+        ]
+
+    async def episodes(self, series_id: int):
+        self.episode_calls.append(series_id)
+        if self.hang:
+            await asyncio.Event().wait()  # never returns
+        if self.episodes_error is not None:
+            raise self.episodes_error
+        await asyncio.sleep(0)
+        for tvdb_id, eps in self.library.items():
+            if self._series_id(tvdb_id) == series_id:
+                return list(eps)
+        return []
+
+
+def _row(canary, tvdb_id: int = 1) -> dict:
+    return next(r for r in canary.per_mapping() if r["tvdb_id"] == tvdb_id)
+
+
+# --- ...and the three shapes that are not it -------------------------------
+
+
+async def test_a_mapping_whose_episodes_match_is_not_flagged():
+    svt = FakeSvt(results={"show-1": _episodes(3)})
+    sonarr = FakeSonarrLibrary({1: _aired(3)})
+    c = _canary([_mapping(1)], svt, sonarr=sonarr, tolerance_days=1)
+    await c.run_once()
+
+    s = c.status()
+    assert s["state"] == STATE_OK
+    assert s["unresolvable"] == 0
+    assert s["unresolvable_series"] == []
+    assert _row(c)["resolves"] is True
+
+
+async def test_a_series_with_nothing_aired_in_sonarr_is_not_flagged():
+    # A newly added series. Sonarr knows the season and has dated every
+    # episode of it, but none has aired, so nothing can match -- and
+    # nothing being able to match yet is not a broken mapping.
+    svt = FakeSvt(results={"show-1": _episodes(3)})
+    future = [
+        _sonarr_episode(1, i, _T0.date() + timedelta(days=i)) for i in (1, 2, 3)
+    ]
+    sonarr = FakeSonarrLibrary({1: future})
+    c = _canary([_mapping(1)], svt, sonarr=sonarr, tolerance_days=1)
+    await c.run_once()
+
+    s = c.status()
+    assert s["state"] == STATE_OK
+    assert s["unresolvable"] == 0
+    row = _row(c)
+    assert row["resolves"] is None
+    assert row["unresolvable_reason"] is None
+
+
+async def test_a_series_sonarr_has_no_episodes_for_at_all_is_not_flagged():
+    svt = FakeSvt(results={"show-1": _episodes(3)})
+    sonarr = FakeSonarrLibrary({1: []})
+    c = _canary([_mapping(1)], svt, sonarr=sonarr, tolerance_days=1)
+    await c.run_once()
+
+    assert c.status()["unresolvable"] == 0
+    assert _row(c)["resolves"] is None
+
+
+async def test_a_show_whose_episodes_are_all_upcoming_is_not_flagged():
+    # Every SVT episode is flagged upcoming, so none is downloadable yet.
+    # Nothing can be grabbed, and nothing being grabbable yet is not a
+    # mapping that can never work.
+    upcoming = [replace(e, available=False) for e in _episodes(3)]
+    svt = FakeSvt(results={"show-1": upcoming})
+    sonarr = FakeSonarrLibrary({1: _aired(3)})
+    c = _canary([_mapping(1)], svt, sonarr=sonarr, tolerance_days=1)
+    await c.run_once()
+
+    assert c.status()["unresolvable"] == 0
+    assert _row(c)["resolves"] is None
+
+
+async def test_a_series_missing_from_sonarr_is_not_flagged():
+    # The tvdb id in mappings.yaml is not in Sonarr's library. Nothing can
+    # match, but the cause is not the mapping's episodes, and this check
+    # only ever claims the third shape.
+    svt = FakeSvt(results={"show-1": _episodes(3)})
+    sonarr = FakeSonarrLibrary({99: _aired(3)})
+    c = _canary([_mapping(1)], svt, sonarr=sonarr, tolerance_days=1)
+    await c.run_once()
+
+    assert c.status()["unresolvable"] == 0
+    assert _row(c)["resolves"] is None
+
+
+# --- ...and the shape that is ----------------------------------------------
+
+
+async def test_available_episodes_aired_episodes_and_no_pair_matching_is_flagged():
+    svt = FakeSvt(results={"show-1": _episodes(3)})
+    # Same episode numbers, a year apart: both sides have real content and
+    # no pair of them can ever agree.
+    sonarr = FakeSonarrLibrary({1: _aired(3, first=date(2025, 8, 20))})
+    c = _canary([_mapping(1)], svt, sonarr=sonarr, tolerance_days=1)
+    await c.run_once()
+
+    s = c.status()
+    assert s["state"] == STATE_UNRESOLVABLE
+    assert s["unresolvable"] == 1
+    assert s["unresolvable_series"][0]["tvdb_id"] == 1
+    assert s["unresolvable_series"][0]["reason"] == UNRESOLVABLE_NO_AIR_DATE
+    assert _row(c)["resolves"] is False
+
+
+async def test_uppdrag_granskning_is_flagged_and_blames_the_missing_ordinals():
+    """The show this half of the check exists for, on its own capture.
+
+    61 episodes, a healthy 200, and `_ordinal` returns None for every one
+    of them because the titles encode no number -- see
+    `docs/design/2026-08-28-svt-episode-ordinals.md` for why that cannot be
+    fixed. The reason matters as much as the finding: no ordinal anywhere
+    means the mapping cannot be made to work, which sends the operator
+    somewhere completely different from "the dates disagree".
+    """
+    episodes = _captured("uppdrag-granskning")
+    assert len(episodes) == 61 and all(e.ordinal is None for e in episodes)
+
+    svt = FakeSvt(results={"show-1": episodes})
+    sonarr = FakeSonarrLibrary({1: _aired(20, first=date(2026, 6, 1))})
+    c = _canary([_mapping(1)], svt, sonarr=sonarr, tolerance_days=1)
+    await c.run_once()
+
+    s = c.status()
+    assert s["state"] == STATE_UNRESOLVABLE
+    assert s["unresolvable"] == 1
+    assert s["unresolvable_series"][0]["reason"] == UNRESOLVABLE_NO_ORDINALS
+    # ...and the SVT half is untouched: the slug resolves, 61 episodes.
+    assert s["failing"] == 0
+    row = _row(c)
+    assert row["ok"] is True
+    assert row["episode_count"] == 61
+    assert row["resolves"] is False
+
+
+async def test_the_two_reasons_are_distinguished():
+    # They send the operator to different places -- one is unfixable and
+    # means removing the mapping or accepting it, the other suggests a
+    # wrong mapping or a tolerance too tight -- so they must never share a
+    # sentence.
+    svt = FakeSvt(results={
+        "show-1": _captured("uppdrag-granskning"),
+        "show-2": _episodes(3),
+    })
+    sonarr = FakeSonarrLibrary({
+        1: _aired(20, first=date(2026, 6, 1)),
+        2: _aired(3, first=date(2025, 8, 20)),
+    })
+    c = _canary([_mapping(1), _mapping(2)], svt, sonarr=sonarr,
+                tolerance_days=1)
+    await c.run_once()
+
+    reasons = {
+        u["tvdb_id"]: u["reason"] for u in c.status()["unresolvable_series"]
+    }
+    assert reasons == {1: UNRESOLVABLE_NO_ORDINALS, 2: UNRESOLVABLE_NO_AIR_DATE}
+    notes = {r["tvdb_id"]: r["resolvability_note"] for r in c.per_mapping()}
+    assert notes[1] != notes[2]
+    assert all(n for n in notes.values())
+
+
+async def test_a_tolerance_wide_enough_to_match_clears_the_finding():
+    # The date reason really is about the tolerance and the dates, and not
+    # about anything else: widen it and the same two lists agree.
+    svt = FakeSvt(results={"show-1": _episodes(3)})
+    sonarr = FakeSonarrLibrary({1: _aired(3, first=date(2026, 8, 24))})
+    tight = _canary([_mapping(1)], svt, sonarr=sonarr, tolerance_days=0)
+    await tight.run_once()
+    assert tight.status()["unresolvable"] == 1
+
+    loose = _canary([_mapping(1)], svt, sonarr=sonarr, tolerance_days=5)
+    await loose.run_once()
+    assert loose.status()["unresolvable"] == 0
+
+
+async def test_a_mapping_that_starts_matching_again_stops_being_flagged():
+    # The amber must clear on its own, or it becomes the permanent noise
+    # this check is built to avoid.
+    svt = FakeSvt(results={"show-1": _episodes(3)})
+    sonarr = FakeSonarrLibrary({1: _aired(3, first=date(2025, 8, 20))})
+    c = _canary([_mapping(1)], svt, sonarr=sonarr, tolerance_days=1)
+    await c.run_once()
+    assert c.status()["needs_attention"] is True
+
+    sonarr.library[1] = _aired(3)
+    await c.run_once()
+    s = c.status()
+    assert s["state"] == STATE_OK
+    assert s["unresolvable"] == 0
+    assert s["needs_attention"] is False
+
+
+# --- What it is worth ------------------------------------------------------
+
+
+async def test_the_finding_asks_for_attention_without_turning_the_light_red():
+    # One show, actionable but not urgent: the rest of the feed works. Same
+    # urgency as the ended-show case, and for the same reason -- see
+    # DEGRADED_STATES.
+    svt = FakeSvt(results={"show-1": _episodes(3)})
+    sonarr = FakeSonarrLibrary({1: _aired(3, first=date(2025, 8, 20))})
+    c = _canary([_mapping(1)], svt, sonarr=sonarr, tolerance_days=1)
+    await c.run_once()
+
+    s = c.status()
+    assert s["needs_attention"] is True
+    assert s["degraded"] is False
+    assert STATE_UNRESOLVABLE in ATTENTION_STATES
+    assert STATE_UNRESOLVABLE not in DEGRADED_STATES
+
+
+async def test_a_failing_svt_row_still_wins_the_headline():
+    # A row that does not resolve on SVT at all is the louder finding, and
+    # the unresolvable rows are still reported beside it rather than lost.
+    svt = FakeSvt(results={
+        "show-1": SvtApiError("404", status_code=404),
+        "show-2": _episodes(3),
+    })
+    sonarr = FakeSonarrLibrary({
+        1: _aired(3), 2: _aired(3, first=date(2025, 8, 20)),
+    })
+    c = _canary([_mapping(1), _mapping(2)], svt, sonarr=sonarr,
+                tolerance_days=1)
+    await c.run_once()
+
+    s = c.status()
+    assert s["state"] == STATE_SERIES
+    assert s["unresolvable"] == 1
+    assert [u["tvdb_id"] for u in s["unresolvable_series"]] == [2]
+
+
+# --- Sonarr failing degrades this check, and only this check ---------------
+
+
+async def test_a_sonarr_outage_leaves_resolvability_unknown_not_healthy():
+    svt = FakeSvt(results={"show-1": _episodes(3)})
+    sonarr = FakeSonarrLibrary(
+        {1: _aired(3)}, series_error=_sonarr_error(REASON_REFUSED)
+    )
+    c = _canary([_mapping(1)], svt, sonarr=sonarr, tolerance_days=1)
+    await c.run_once()
+
+    s = c.status()
+    # The SVT half is untouched: the slug still resolves.
+    assert s["state"] == STATE_OK
+    assert s["failing"] == 0
+    # ...and the other half says so rather than reporting a clean sweep.
+    assert s["unresolvable"] == 0
+    assert s["resolvability_unknown"] == 1
+    assert s["resolvability_error"] == REASON_MESSAGES[REASON_REFUSED]
+    row = _row(c)
+    assert row["resolves"] is None
+    assert row["resolvability_note"]
+
+
+async def test_a_sonarr_that_fails_only_the_episode_call_degrades_that_row():
+    svt = FakeSvt(results={"show-1": _episodes(3), "show-2": _episodes(3)})
+    sonarr = FakeSonarrLibrary(
+        {1: _aired(3), 2: _aired(3)},
+        episodes_error=_sonarr_error(REASON_UNAUTHORIZED),
+    )
+    c = _canary([_mapping(1), _mapping(2)], svt, sonarr=sonarr,
+                tolerance_days=1)
+    await c.run_once()
+
+    s = c.status()
+    assert s["state"] == STATE_OK
+    assert s["resolvability_unknown"] == 2
+    assert s["unresolvable"] == 0
+
+
+async def test_a_hanging_sonarr_costs_one_probe_and_not_the_round():
+    svt = FakeSvt(results={"show-1": _episodes(3)})
+    sonarr = FakeSonarrLibrary({1: _aired(3)}, hang=True)
+    c = _canary([_mapping(1)], svt, sonarr=sonarr, tolerance_days=1,
+                probe_timeout_s=0.01)
+    await asyncio.wait_for(c.run_once(), timeout=5.0)
+
+    s = c.status()
+    assert s["state"] == STATE_OK
+    assert s["resolvability_unknown"] == 1
+    assert s["unresolvable"] == 0
+
+
+async def test_a_sonarr_that_raises_something_unexpected_says_this_modules_words():
+    key = "sekrit-sonarr-api-key"
+
+    class Leaky:
+        async def all_series(self):
+            raise RuntimeError(f"X-Api-Key: {key}")
+
+    svt = FakeSvt(results={"show-1": _episodes(3)})
+    c = _canary([_mapping(1)], svt, sonarr=Leaky(), tolerance_days=1)
+    await c.run_once_guarded()
+
+    s = c.status()
+    assert s["resolvability_unknown"] == 1
+    assert key not in repr(s)
+    assert key not in repr(c.per_mapping())
+
+
+async def test_no_sonarr_client_leaves_resolvability_undetermined():
+    # Every mapping resolves on SVT and nothing is claimed about matching.
+    svt = FakeSvt(results={"show-1": _episodes(3)})
+    c = _canary([_mapping(1)], svt)
+    await c.run_once()
+
+    s = c.status()
+    assert s["state"] == STATE_OK
+    assert s["unresolvable"] == 0
+    assert _row(c)["resolves"] is None
+
+
+# --- What it costs, and that it costs nothing else -------------------------
+
+
+async def test_one_sonarr_episode_call_per_mapping_and_one_library_read():
+    svt = FakeSvt(results={f"show-{i}": _episodes(3) for i in (1, 2, 3)})
+    sonarr = FakeSonarrLibrary({1: _aired(3), 2: _aired(3), 3: _aired(3)})
+    c = _canary([_mapping(1), _mapping(2), _mapping(3)], svt, sonarr=sonarr,
+                tolerance_days=1)
+    await c.run_once()
+
+    assert sonarr.series_calls == 1, "the library was read once per mapping"
+    assert sorted(sonarr.episode_calls) == [1001, 1002, 1003]
+
+    await c.run_once()
+    assert sonarr.series_calls == 2
+    assert len(sonarr.episode_calls) == 6
+
+
+async def test_an_svt_failure_costs_no_sonarr_episode_call():
+    # Nothing can be concluded about matching without SVT's list, so the
+    # request is not made.
+    svt = FakeSvt(default=SvtApiError("boom"))
+    sonarr = FakeSonarrLibrary({1: _aired(3)})
+    c = _canary([_mapping(1)], svt, sonarr=sonarr, tolerance_days=1)
+    await c.run_once()
+
+    assert sonarr.episode_calls == []
+
+
+async def test_the_resolvability_check_writes_nothing(tmp_path: Path):
+    # Same guarantee as the SVT half, now with Sonarr in the round:
+    # `FakeSonarrLibrary` offers only the two read-only GETs, so any write
+    # path fails with an AttributeError.
+    (tmp_path / "mappings.yaml").write_text("series: []\n", encoding="utf-8")
+    (tmp_path / "config.yaml").write_text("sonarr_url: http://x\n", encoding="utf-8")
+    (tmp_path / "jobs.db").write_bytes(b"not really a database")
+    before = _tree_digest(tmp_path)
+
+    svt = FakeSvt(results={"show-1": _captured("uppdrag-granskning")})
+    sonarr = FakeSonarrLibrary({1: _aired(20, first=date(2026, 6, 1))})
+    c = _canary([_mapping(1)], svt, sonarr=sonarr, tolerance_days=1)
+    await c.run_once()
+    await c.run_once()
+
+    assert c.status()["unresolvable"] == 1
+    assert _tree_digest(tmp_path) == before
+
+
+def test_the_unavailable_report_carries_the_resolvability_keys_too():
+    # Same keys as a real report, so nothing rendering it has to branch on
+    # which of the two it was handed -- and none of them claims a clean
+    # sweep.
+    real = _canary([_mapping(1)], FakeSvt()).status()
+    s = unavailable_status()
+    assert set(s) == set(real)
+    assert s["unresolvable"] is None
+    assert s["unresolvable_series"] == []
+    assert s["resolvability_unknown"] is None
