@@ -139,15 +139,25 @@ matches and are not broken — Sonarr has no aired episode for the series yet,
 and every SVT episode is still upcoming — and neither is reported. Both are
 "nothing to compare *yet*".
 
+**One situation will put amber on a healthy row, and it is worth knowing
+about.** When SVT starts a season TVDB has not added yet, Sonarr has aired
+episodes (last season's), SVT lists available episodes (this season's), and
+no pair of them agrees — so both exclusions pass and the row is reported as
+`no_air_date`. That is a true statement about the resolver as it stands
+today: nothing *will* be grabbed for that show until TVDB catches up and
+Sonarr refreshes, which is usually days. The note names it as one of the
+things to check. If the row is one you know is mid-season, this is the
+likely explanation and it clears itself.
+
 The **Check** button on the Mappings view answers the same question. It
 re-runs both halves live for one row: the slug, and whether its episodes can
 match anything Sonarr has. It shares the verdict with the background check,
 so it cannot tell you a row is fine while the page beside it says the row
 resolves nothing.
 
-The comparison costs one Sonarr episode-list read per mapping per round, plus
-one series-list read for the whole round, spread out at the same pace as the
-SVT requests. A Sonarr that is not answering degrades **only** this half:
+The comparison costs one Sonarr episode-list read per mapping per round, at
+the same spread-out pace as the SVT requests, plus one series-list read at
+the start of each round. A Sonarr that is not answering degrades **only** this half:
 `resolvability_unknown` counts the rows it could not decide, `resolvability_
 error` says why, and `unresolvable` stays at 0 rather than reporting a clean
 sweep. Everything the `svt` block says about SVT is unaffected, and the

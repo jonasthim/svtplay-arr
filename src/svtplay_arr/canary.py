@@ -141,6 +141,15 @@ neither -- the row points at nothing, and the fix is to remove it or to
 add the series back to Sonarr. `status()` carries the reason as a value
 and the page renders its sentence.
 
+`no_air_date` is the one that can be raised by a *correct* mapping: when
+SVT starts a season TVDB has not added yet, Sonarr's aired episodes are
+last season's, SVT's available ones are this season's, both exclusions
+pass and nothing agrees. It is a true statement about the resolver -- that
+show will grab nothing until TVDB catches up -- but it is the one shape
+that will routinely put amber on a healthy row, for days. Named in the
+note rather than excluded, because excluding it would mean excluding every
+genuinely wrong mapping that looks the same from here.
+
 **The Check button answers the same question.** `check_resolvability` is
 shared with the configuration page's per-mapping control, which used to
 report only whether the slug returned episodes -- so an operator
@@ -579,7 +588,8 @@ def resolvability(
         f"Sonarr episode on both number and air date within "
         f"{tolerance_days} day{'' if tolerance_days == 1 else 's'}. Check "
         "that this row points at the right programme, and at the air dates "
-        "Sonarr holds for it.",
+        "Sonarr holds for it -- or, if SVT has started a season Sonarr does "
+        "not know about yet, that TVDB has caught up.",
     )
 
 
