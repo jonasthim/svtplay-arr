@@ -101,6 +101,17 @@ Note that the *effective* key — an override supplied through the
 `SONARR_API_KEY` environment variable — is never rendered and is never written
 to disk by a save. Only the file's own value reaches the page.
 
+The **Test connection** button on the settings page sends a key to the Sonarr
+URL in the submitted form. Which key is not a detail: the environment's value
+is substituted **only when the submitted URL is one this host is already
+configured for** — the URL the service booted with, or the one currently in
+`config.yaml`. For any other URL the submitted key is what gets sent, and the
+result says so. Without that condition, one POST could hand a value the page
+never renders to whatever host the request body named, with no config write
+and no restart; there is no CSRF token on this form and no `Origin` check in
+this service, so it would be reachable cross-site. The URLs it *is* sent to
+are ones the running service already talks to on every RSS poll.
+
 ### The service invokes a media downloader
 
 `svtplay-dl` is called with an SVT video id taken from an uploaded `.nzb`. Both
@@ -137,6 +148,12 @@ Tests pin these, and a change that breaks one is a real bug:
 - It never appears in the settings-saved notice or the pending-restart banner,
   which render field labels only.
 - An environment-supplied key is never written into `config.yaml`.
+- An environment-supplied key is never sent to a Sonarr URL that arrived in a
+  request body, only to one this host is already configured for.
+- No connection-test result — rendered, JSON, or logged — contains the key, on
+  any success or failure path. `httpx` exceptions carry the whole request,
+  headers included, so every message the client produces is a fixed literal
+  with nothing substituted into it but an HTTP status code.
 
 ## Supported versions
 

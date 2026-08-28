@@ -150,6 +150,33 @@ def _result_class(html: str) -> str:
     return m.group(1)
 
 
+def _post_with_deadline(client, path, deadline=10.0, **kwargs):
+    """POST with a deadline of its own, for any test driving a hanging probe.
+
+    Without the bound in `_sonarr_test` these requests never return, and a
+    test that simply awaited one would wedge the entire run rather than
+    failing -- which is worth nothing in CI, and is exactly the defect this
+    helper exists to stop recurring. Every test that hands the router a
+    `Probe(hang=True)` goes through here, not just the one where the
+    problem was first noticed.
+
+    The thread is a daemon, so a hung request is abandoned rather than
+    holding the session open.
+    """
+    done: list = []
+    thread = threading.Thread(
+        target=lambda: done.append(client.post(path, **kwargs)), daemon=True
+    )
+    thread.start()
+    thread.join(timeout=deadline)
+    assert not thread.is_alive(), (
+        f"POST {path} never returned within {deadline}s -- the Sonarr call "
+        "is unbounded"
+    )
+    (response,) = done
+    return response
+
+
 def _sonarr_error(reason: str) -> SonarrApiError:
     """Exactly what `SonarrClient` raises for that shape.
 
@@ -378,7 +405,7 @@ def test_a_blank_url_or_key_is_refused_without_calling_sonarr(tmp_path: Path):
     assert probe.calls == []
 
 
-def test_the_environment_key_is_what_gets_tested_when_it_is_set(
+def test_the_environment_key_is_used_for_the_url_this_host_is_configured_for(
     tmp_path: Path, monkeypatch
 ):
     # $SONARR_API_KEY beats config.yaml in Settings.load, so on such a
@@ -386,6 +413,9 @@ def test_the_environment_key_is_what_gets_tested_when_it_is_set(
     # it would report on a value that can never take effect -- and the
     # result has to say which key was actually used, or it is misleading in
     # the other direction.
+    #
+    # The URL here is the one already in config.yaml, which is where the
+    # running service sends that key on every RSS poll anyway.
     monkeypatch.setenv("SONARR_API_KEY", "FROM-THE-ENVIRONMENT")
     probe = Probe()
     body = _client(tmp_path, sonarr_probe=probe).post(
@@ -396,6 +426,106 @@ def test_the_environment_key_is_what_gets_tested_when_it_is_set(
     assert "SONARR_API_KEY" in _result_text(body)
 
 
+def test_the_environment_key_is_never_sent_to_a_url_from_the_form(
+    tmp_path: Path, monkeypatch
+):
+    # The one that matters. The URL comes from the submitted body and the
+    # key would come from the environment, so an unrestricted substitution
+    # hands a secret this page deliberately never renders to whatever host
+    # the request names -- immediately, with no config write, no restart and
+    # no log line carrying the value. There is no CSRF token on this form
+    # and no Origin check in this service, so it is reachable cross-site,
+    # and SECURITY.md publishes the opposite as a guarantee.
+    monkeypatch.setenv("SONARR_API_KEY", "ENV-ONLY-SECRET-NEVER-RENDERED")
+    probe = Probe()
+    body = _client(tmp_path, sonarr_probe=probe).post(
+        "/config/settings/test",
+        data=_form(
+            tmp_path,
+            sonarr_url="http://attacker.invalid:9999",
+            sonarr_api_key="ANY-JUNK",
+        ),
+    ).text
+    assert probe.calls == [("http://attacker.invalid:9999", "ANY-JUNK")]
+    assert "ENV-ONLY-SECRET-NEVER-RENDERED" not in repr(probe.calls)
+    assert "ENV-ONLY-SECRET-NEVER-RENDERED" not in body
+    # ...and it says so, rather than reporting success as though the
+    # environment's key had been tried.
+    result = _result_text(body)
+    assert "was not sent" in result
+    assert "after a restart" in result
+
+
+def test_the_environment_key_is_never_sent_to_a_url_from_the_form_on_failure(
+    tmp_path: Path, monkeypatch
+):
+    # "Sonarr answered and rejected the API key" is actively misleading if
+    # the operator believes the environment's key was the one tried, so the
+    # note rides on the failure paths too, not only on success.
+    monkeypatch.setenv("SONARR_API_KEY", "ENV-ONLY-SECRET-NEVER-RENDERED")
+    probe = Probe(error=_sonarr_error(REASON_UNAUTHORIZED))
+    body = _client(tmp_path, sonarr_probe=probe).post(
+        "/config/settings/test",
+        data=_form(
+            tmp_path,
+            sonarr_url="http://attacker.invalid:9999",
+            sonarr_api_key="ANY-JUNK",
+        ),
+    ).text
+    assert probe.calls == [("http://attacker.invalid:9999", "ANY-JUNK")]
+    assert "ENV-ONLY-SECRET-NEVER-RENDERED" not in body
+    assert "was not sent" in _result_text(body)
+
+
+def test_a_blank_key_against_an_unconfigured_url_sends_nothing_at_all(
+    tmp_path: Path, monkeypatch
+):
+    # The obvious way round the guard: leave the key box empty and hope the
+    # environment fills it in. It does not, and nothing is sent.
+    monkeypatch.setenv("SONARR_API_KEY", "ENV-ONLY-SECRET-NEVER-RENDERED")
+    probe = Probe()
+    body = _client(tmp_path, sonarr_probe=probe).post(
+        "/config/settings/test",
+        data=_form(
+            tmp_path,
+            sonarr_url="http://attacker.invalid:9999",
+            sonarr_api_key="",
+        ),
+    ).text
+    assert probe.calls == []
+    assert "ENV-ONLY-SECRET-NEVER-RENDERED" not in body
+    assert "Nothing was sent" in _result_text(body)
+
+
+def test_a_trailing_slash_is_the_same_url_and_a_different_host_is_not(
+    tmp_path: Path, monkeypatch
+):
+    # `SonarrClient` strips the trailing slash itself, so the two spellings
+    # are genuinely one host and refusing the substitution there would be a
+    # gratuitous inconsistency. Everything else is compared strictly: being
+    # wrong towards "trusted" is the failure this guard exists to prevent,
+    # and being wrong the other way only tests the submitted key.
+    monkeypatch.setenv("SONARR_API_KEY", "ENV-ONLY-SECRET-NEVER-RENDERED")
+    probe = Probe()
+    client = _client(tmp_path, sonarr_probe=probe)
+
+    client.post(
+        "/config/settings/test",
+        data=_form(tmp_path, sonarr_url="http://sonarr.test:8989/",
+                   sonarr_api_key="JUNK"),
+    )
+    # A host that merely starts the same is not the same host.
+    client.post(
+        "/config/settings/test",
+        data=_form(tmp_path, sonarr_url="http://sonarr.test:8989.evil.invalid",
+                   sonarr_api_key="JUNK"),
+    )
+    assert probe.calls == [
+        ("http://sonarr.test:8989/", "ENV-ONLY-SECRET-NEVER-RENDERED"),
+        ("http://sonarr.test:8989.evil.invalid", "JUNK"),
+    ]
+
+
 # --- Never a 500, never a hang ---------------------------------------------
 
 
@@ -404,30 +534,15 @@ def test_a_hanging_sonarr_does_not_hang_the_page(tmp_path: Path, monkeypatch):
     # loop the download worker runs on. A Sonarr that accepts the connection
     # and then says nothing must cost this click its timeout and no more.
     #
-    # Run on a thread with a deadline of its own, deliberately: without the
-    # bound in `_sonarr_test` this request never returns, and a test that
-    # merely awaited it would wedge the whole run instead of failing. The
-    # thread is left behind if that happens -- it is a daemon, and a hung
-    # run is what this exists to prevent.
+    # Driven through `_post_with_deadline` so the unbounded case fails
+    # cleanly rather than wedging the run; see that helper.
     monkeypatch.setattr(
         "svtplay_arr.api.config_ui._SONARR_TEST_TIMEOUT_S", 0.05
     )
     client = _client(tmp_path, sonarr_probe=Probe(hang=True))
-    done: list = []
-
-    def _post():
-        done.append(
-            client.post("/config/settings/test", data=_form(tmp_path))
-        )
-
-    thread = threading.Thread(target=_post, daemon=True)
-    thread.start()
-    thread.join(timeout=10.0)
-    assert not thread.is_alive(), (
-        "the render never returned -- the Sonarr call is unbounded"
+    r = _post_with_deadline(
+        client, "/config/settings/test", data=_form(tmp_path)
     )
-
-    (r,) = done
     assert r.status_code == 200
     assert "did not answer within" in _result_text(r.text)
 
@@ -513,12 +628,17 @@ def test_the_api_key_never_appears_in_any_test_result(tmp_path: Path, monkeypatc
     probes += [Probe(error=_sonarr_error(r)) for r in REASON_MESSAGES]
     for probe in probes:
         client = _client(tmp_path, sonarr_probe=probe)
-        payload = client.post(
-            "/config/settings/test", data=_form(tmp_path),
+        # Deadline-bounded, because one of these probes hangs: `bf49efb`
+        # fixed the dedicated timeout test and left this one able to wedge
+        # the run under the very same mutation.
+        payload = _post_with_deadline(
+            client, "/config/settings/test", data=_form(tmp_path),
             headers={"Accept": "application/json"},
         ).json()
         assert KEY not in repr(payload), payload
-        page = client.post("/config/settings/test", data=_form(tmp_path)).text
+        page = _post_with_deadline(
+            client, "/config/settings/test", data=_form(tmp_path)
+        ).text
         assert KEY not in _result_text(page)
 
 

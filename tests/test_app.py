@@ -1610,3 +1610,54 @@ def test_the_settings_view_can_test_the_apps_own_sonarr_credentials(
     # ...and the key the service booted with is not what was tested, which
     # is the point: the operator is asking about the value in the form.
     assert s.sonarr_api_key not in seen
+
+
+def test_the_environment_key_never_leaves_for_a_host_the_request_body_names(
+    tmp_path: Path, monkeypatch,
+):
+    # End to end through a real create_app, because this is the one place
+    # the guard's inputs come from the composition root: `booted.sonarr_url`
+    # and the config file's own value.
+    #
+    # $SONARR_API_KEY is a value this page deliberately never renders and
+    # never writes to disk (SECURITY.md says so). Substituting it for any
+    # URL the form happened to carry would send it to whatever host a
+    # request body names -- immediately, with no config write, no restart
+    # and no log line carrying the value -- and there is no CSRF token on
+    # this form and no Origin check in this service, so that is reachable
+    # cross-site.
+    monkeypatch.setenv("SONARR_API_KEY", "ENV-ONLY-SECRET-NEVER-RENDERED")
+    seen: list[tuple[str, str]] = []
+
+    async def _status(self):
+        seen.append((self._base, self._headers["X-Api-Key"]))
+        return SonarrStatus(version="4.0.10.2544", series_count=7)
+
+    monkeypatch.setattr("svtplay_arr.sonarr.SonarrClient.status", _status)
+
+    settings = _settings(tmp_path)
+    with TestClient(create_app(settings)) as c:
+        away = c.post(
+            "/config/settings/test",
+            data={
+                "sonarr_url": "http://attacker.invalid:9999",
+                "sonarr_api_key": "ANY-JUNK",
+            },
+        )
+        home = c.post(
+            "/config/settings/test",
+            data={
+                "sonarr_url": settings.sonarr_url,
+                "sonarr_api_key": "ANY-JUNK",
+            },
+        )
+
+    assert away.status_code == 200 and home.status_code == 200
+    assert seen == [
+        # The URL from the body got the key from the body, and nothing else.
+        ("http://attacker.invalid:9999", "ANY-JUNK"),
+        # The URL this service is configured for still gets the effective
+        # key, which is what a restart would use against it anyway.
+        (settings.sonarr_url, "ENV-ONLY-SECRET-NEVER-RENDERED"),
+    ]
+    assert "ENV-ONLY-SECRET-NEVER-RENDERED" not in away.text

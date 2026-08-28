@@ -237,7 +237,9 @@ async def _check_slug(svt, slug: str) -> dict:
     }
 
 
-async def _sonarr_test(probe, url: str, api_key: str) -> dict:
+async def _sonarr_test(
+    probe, url: str, api_key: str, *, trusted_urls=(),
+) -> dict:
     """The one computation behind the Test connection control.
 
     Both of its response paths -- the no-JS form POST that re-renders the
@@ -257,12 +259,30 @@ async def _sonarr_test(probe, url: str, api_key: str) -> dict:
     The form already posts the key on every save, so reading it here is no
     new exposure.
 
-    The one place the submitted value is overridden is `$SONARR_API_KEY`:
-    `Settings.load` gives the environment precedence over the file, so on
-    such a deployment the typed value is not what any restart would use.
-    Testing it would report on a value that can never take effect. The
-    precedence is mirrored rather than re-decided, and the result says
-    which key was actually used.
+    **`$SONARR_API_KEY` is substituted only for a URL this host is already
+    configured for**, and `trusted_urls` is that set -- the URL the service
+    booted with, and the one currently on disk. Both halves of that rule
+    are load-bearing and neither is obvious:
+
+    * *Substituting at all.* `Settings.load` gives the environment
+      precedence over the file, so on such a deployment the typed key is
+      not what any restart would use. Testing it would report on a value
+      that can never take effect.
+    * *Only for a configured URL.* The URL comes from the submitted form
+      and the key would come from the environment, so an unrestricted
+      substitution sends a secret the page deliberately never renders to
+      whatever host the request body names -- immediately, with no config
+      write, no restart and no log line carrying the value. There is no
+      CSRF token on this form and no Origin check anywhere in this service
+      (it relies entirely on the gateway in front of it), so that is
+      reachable cross-site, and `SECURITY.md` publishes the opposite as a
+      guarantee. A URL the operator has already committed to on this host
+      is one the environment's key is sent to on every RSS poll already; a
+      URL typed into a form and not saved is not.
+
+    When the URL is not trusted the *submitted* key is tested instead, and
+    the result says so plainly -- including that the environment's key, not
+    this one, is what a restart would actually use against it.
 
     Read-only: two GETs against Sonarr and nothing else. It never touches
     config.yaml, mappings.yaml or the job store.
@@ -277,10 +297,19 @@ async def _sonarr_test(probe, url: str, api_key: str) -> dict:
         )
 
     url = (url or "").strip()
-    env_key = os.environ.get("SONARR_API_KEY") or ""
-    # Mirrors Settings.load and save_settings: the environment wins.
-    key = env_key.strip() or (api_key or "").strip()
-    used_env = bool(env_key.strip())
+    env_key = (os.environ.get("SONARR_API_KEY") or "").strip()
+    # Mirrors Settings.load and save_settings -- but only towards a host
+    # this deployment is already configured to send that key to. See the
+    # docstring; this one condition is the whole difference between a
+    # convenience and an exfiltration route.
+    trusted = bool(env_key) and _is_trusted_url(url, trusted_urls)
+    key = env_key if trusted else (api_key or "").strip()
+    used_env = trusted
+    # The environment is set, and the operator is testing somewhere else.
+    # The result has to say both that this is not the key that was sent and
+    # that it is not the key a restart would use, or it is misleading in one
+    # direction or the other.
+    env_ignored = bool(env_key) and not trusted
     if not url or not key:
         # Refused before any request: there is nothing to test, and saying
         # "Sonarr rejected the key" about a blank field would send the
@@ -288,8 +317,34 @@ async def _sonarr_test(probe, url: str, api_key: str) -> dict:
         return _sonarr_test_result(
             "incomplete",
             "Fill in both the Sonarr URL and the API key, then test again. "
-            "Nothing was sent.",
+            "Nothing was sent."
+            + (
+                " The $SONARR_API_KEY value is only used to test the URL "
+                "this service is already configured for, so it cannot "
+                "stand in for an empty key against a different one."
+                if env_ignored else ""
+            ),
         )
+
+    # Which key went out, said once and appended to every outcome that
+    # actually sent one. A failure needs this at least as much as a success
+    # does: "Sonarr rejected the API key" is misleading if the operator
+    # believes the environment's key was the one tried.
+    if used_env:
+        key_note = (
+            " (tested with $SONARR_API_KEY, which overrides the value in "
+            "this form)"
+        )
+    elif env_ignored:
+        key_note = (
+            " (tested with the key in this form. $SONARR_API_KEY is set, and "
+            "was not sent: it is only used for the Sonarr URL this service is "
+            "already configured for, and this is a different one. Note that "
+            "after a restart the environment's key is what would be used "
+            "against this URL, not the one tested here.)"
+        )
+    else:
+        key_note = ""
 
     try:
         status = await asyncio.wait_for(
@@ -303,14 +358,16 @@ async def _sonarr_test(probe, url: str, api_key: str) -> dict:
             "failed",
             f"Sonarr did not answer within {_SONARR_TEST_TIMEOUT_S:g} seconds. "
             "It may be starting up, overloaded, or behind something that is "
-            "silently dropping the connection.",
+            "silently dropping the connection." + key_note,
             reason="timeout",
         )
     except SonarrApiError as exc:
         # `str(exc)` is one of `sonarr.REASON_MESSAGES` -- a fixed literal
         # naming the failure shape, with no URL and no key in it. Nothing
         # here re-derives what went wrong; see sonarr.py.
-        return _sonarr_test_result("failed", str(exc), reason=exc.reason)
+        return _sonarr_test_result(
+            "failed", str(exc) + key_note, reason=exc.reason
+        )
     except Exception:
         # A check must not be the one control that can 500. This module's
         # own words rather than the exception's, so an unexpected type
@@ -319,16 +376,14 @@ async def _sonarr_test(probe, url: str, api_key: str) -> dict:
         log.warning("Sonarr connection test failed unexpectedly", exc_info=True)
         return _sonarr_test_result(
             "failed",
-            "The connection test failed unexpectedly. Check svtplay-arr's log.",
+            "The connection test failed unexpectedly. Check svtplay-arr's "
+            "log." + key_note,
             reason=REASON_UNKNOWN,
         )
 
     count = getattr(status, "series_count", None)
     version = getattr(status, "version", None)
-    which_key = (
-        " (using $SONARR_API_KEY, which overrides the value in this form)"
-        if used_env else ""
-    )
+    which_key = key_note
     if count == 0:
         # Not a failure. A Sonarr with an empty library is correctly
         # configured -- but it is also what the wrong Sonarr looks like, so
@@ -348,6 +403,27 @@ async def _sonarr_test(probe, url: str, api_key: str) -> dict:
         )
     return _sonarr_test_result(
         "ok", message, version=version, series_count=count
+    )
+
+
+def _is_trusted_url(url: str, trusted_urls) -> bool:
+    """Is `url` one this deployment is already configured to talk to?
+
+    Deliberately strict: whitespace and a trailing slash are normalised
+    away (`SonarrClient` strips the latter itself, so the two spellings are
+    genuinely the same host), and nothing else is. No case folding, no
+    scheme or port defaulting, no DNS -- every one of those would widen the
+    set of URLs the environment's key is handed to, and being wrong in that
+    direction is the failure this function exists to prevent. Being wrong
+    the other way costs nothing: the submitted key is tested instead, and
+    the result says so.
+    """
+    needle = (url or "").strip().rstrip("/")
+    if not needle:
+        return False
+    return any(
+        needle == str(candidate or "").strip().rstrip("/")
+        for candidate in trusted_urls
     )
 
 
@@ -635,6 +711,44 @@ def build_config_router(
             except AttributeError:
                 continue
         return pending
+
+    def _configured_sonarr_urls() -> tuple[str, ...]:
+        """The Sonarr URLs this host has already committed to.
+
+        The *only* consumer is the `$SONARR_API_KEY` substitution in
+        `_sonarr_test`, and the whole point is to keep that key from being
+        sent to a host named by a request body. Two entries, because both
+        are values the operator wrote here themselves:
+
+        * what the service booted with -- the environment's key already
+          goes there on every RSS poll, so testing it adds no exposure;
+        * what is on disk now -- which is what the settings form renders by
+          default, so an unmodified form still tests the effective key, and
+          what the next restart will use.
+
+        Never raises: a config file that will not load contributes nothing,
+        which fails towards testing the submitted key rather than towards
+        sending the environment's somewhere new.
+        """
+        urls = []
+        booted_url = getattr(booted, "sonarr_url", None)
+        if booted_url:
+            urls.append(str(booted_url))
+        try:
+            raw, _ = read_with_mtime(config_path)
+            on_disk = raw.get("sonarr_url")
+        except Exception:
+            log.warning(
+                "could not read %s while deciding whether the environment's "
+                "Sonarr key may be used for a connection test; testing the "
+                "submitted key instead",
+                config_path,
+                exc_info=True,
+            )
+            on_disk = None
+        if on_disk:
+            urls.append(str(on_disk))
+        return tuple(urls)
 
     def _mappings_mtime() -> float | None:
         """The mtime to round-trip as a form's concurrency-check field.
@@ -1163,6 +1277,7 @@ def build_config_router(
             sonarr_probe,
             submitted.get("sonarr_url", ""),
             submitted.get("sonarr_api_key", ""),
+            trusted_urls=_configured_sonarr_urls(),
         )
         if "application/json" in request.headers.get("accept", ""):
             return JSONResponse(result)
