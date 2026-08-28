@@ -31,6 +31,7 @@ from svtplay_arr.canary import (
     STATE_UNKNOWN,
     STATE_UNRESOLVABLE,
     UNRESOLVABLE_NO_AIR_DATE,
+    UNRESOLVABLE_NOT_IN_SONARR,
     UNRESOLVABLE_NO_ORDINALS,
     Resolvability,
     SonarrCanary,
@@ -1127,19 +1128,6 @@ async def test_a_show_whose_episodes_are_all_upcoming_is_not_flagged():
     assert _row(c)["resolves"] is None
 
 
-async def test_a_series_missing_from_sonarr_is_not_flagged():
-    # The tvdb id in mappings.yaml is not in Sonarr's library. Nothing can
-    # match, but the cause is not the mapping's episodes, and this check
-    # only ever claims the third shape.
-    svt = FakeSvt(results={"show-1": _episodes(3)})
-    sonarr = FakeSonarrLibrary({99: _aired(3)})
-    c = _canary([_mapping(1)], svt, sonarr=sonarr, tolerance_days=1)
-    await c.run_once()
-
-    assert c.status()["unresolvable"] == 0
-    assert _row(c)["resolves"] is None
-
-
 # --- ...and the shape that is ----------------------------------------------
 
 
@@ -1213,6 +1201,76 @@ async def test_the_two_reasons_are_distinguished():
     notes = {r["tvdb_id"]: r["resolvability_note"] for r in c.per_mapping()}
     assert notes[1] != notes[2]
     assert all(n for n in notes.values())
+
+
+async def test_a_series_missing_from_sonarr_is_its_own_finding():
+    """The tvdb id in mappings.yaml is not in Sonarr's library.
+
+    Dead in exactly the way an ended show is dead: it will never resolve,
+    `Resolver.resolve` gives up on it before reaching a matching rule, and
+    until now nothing said so. Its own reason, not one of the other two,
+    because the remedy is different in kind -- those are about the episode
+    data, this is about the row pointing at nothing.
+    """
+    svt = FakeSvt(results={"show-1": _episodes(3)})
+    sonarr = FakeSonarrLibrary({99: _aired(3)})
+    c = _canary([_mapping(1)], svt, sonarr=sonarr, tolerance_days=1)
+    await c.run_once()
+
+    s = c.status()
+    assert s["state"] == STATE_UNRESOLVABLE
+    assert s["unresolvable"] == 1
+    assert s["unresolvable_series"][0]["reason"] == UNRESOLVABLE_NOT_IN_SONARR
+    # Amber, like the rest of this finding: one row is dead and the
+    # operator fixes it in one action.
+    assert s["needs_attention"] is True
+    assert s["degraded"] is False
+    row = _row(c)
+    assert row["resolves"] is False
+    assert "tvdb id 1" in row["resolvability_note"]
+
+
+async def test_a_missing_series_is_not_folded_into_the_other_two_reasons():
+    # The remedy differs -- remove the row or re-add the series in Sonarr,
+    # rather than anything about ordinals or air dates -- so reporting it
+    # under either of those would send the operator to the wrong place.
+    svt = FakeSvt(results={
+        "show-1": _captured("uppdrag-granskning"),
+        "show-2": _episodes(3),
+        "show-3": _episodes(3),
+    })
+    sonarr = FakeSonarrLibrary({
+        1: _aired(20, first=date(2026, 6, 1)),
+        2: _aired(3, first=date(2025, 8, 20)),
+    })
+    c = _canary([_mapping(1), _mapping(2), _mapping(3)], svt, sonarr=sonarr,
+                tolerance_days=1)
+    await c.run_once()
+
+    reasons = {
+        u["tvdb_id"]: u["reason"] for u in c.status()["unresolvable_series"]
+    }
+    assert reasons == {
+        1: UNRESOLVABLE_NO_ORDINALS,
+        2: UNRESOLVABLE_NO_AIR_DATE,
+        3: UNRESOLVABLE_NOT_IN_SONARR,
+    }
+    notes = {r["tvdb_id"]: r["resolvability_note"] for r in c.per_mapping()}
+    assert len(set(notes.values())) == 3
+
+
+async def test_a_missing_series_is_reported_even_when_svt_has_nothing_out_yet():
+    # The exclusions are about "nothing to compare *yet*"; this row has
+    # nothing to compare against ever, whatever SVT is currently offering.
+    upcoming = [replace(e, available=False) for e in _episodes(3)]
+    svt = FakeSvt(results={"show-1": upcoming})
+    sonarr = FakeSonarrLibrary({99: _aired(3)})
+    c = _canary([_mapping(1)], svt, sonarr=sonarr, tolerance_days=1)
+    await c.run_once()
+
+    s = c.status()
+    assert s["unresolvable"] == 1
+    assert s["unresolvable_series"][0]["reason"] == UNRESOLVABLE_NOT_IN_SONARR
 
 
 async def test_a_tolerance_wide_enough_to_match_clears_the_finding():
