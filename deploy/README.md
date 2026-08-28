@@ -90,6 +90,11 @@ because a hardcoded slug rots — and reports:
   ended, been re-slugged, or moved; `failing_series` names them and each is
   fixed by editing one row. This one deliberately leaves `status` at `"ok"`
   — see below.
+- `"state": "unresolvable"` — every mapping resolved on SVT, and at least one
+  of them returns a full episode list that can **never** match anything Sonarr
+  has. `unresolvable_series` names each one, with a `reason` (`no_ordinals` or
+  `no_air_date`) and a sentence saying which. Like `series`, this deliberately
+  leaves `status` at `"ok"` — see below.
 - `"state": "unknown"` — nothing has been checked since this process started.
   Deliberately *not* reported as `ok`, and it becomes `"stale"` (and degraded)
   if no check ever completes.
@@ -106,7 +111,35 @@ noise, and the day SVT breaks the listing the `svt` state arrives on a channel
 everyone has learned to ignore. One dead row does not stop anything else
 working; it is reported in full (`failing`, `failing_series`) so you can alert
 on it yourself if you want to, and it is rendered prominently on the
-configuration page either way.
+configuration page either way. `unresolvable` is scored the same way and for
+a stronger version of the same reason: in the `no_ordinals` case there is
+nothing to fix, so a red light over it would be permanent by construction.
+
+**A mapping can be perfectly valid and still resolve nothing, forever.** The
+slug is right, SVT answers, the episode list is full — and no episode in it
+carries the ordinal the resolver matches on, so every one is refused. From
+the feed that is indistinguishable from a series between seasons, which is
+why the check now asks a second question of each mapping and reports it:
+
+    #  "svt": {..., "unresolvable": 1, "resolvability_unknown": 0,
+    #          "unresolvable_series": [
+    #            {"tvdb_id": 253463, "series_title": "Uppdrag granskning",
+    #             "svt_slug": "uppdrag-granskning", "reason": "no_ordinals",
+    #             "note": "This mapping can never match anything. ..."}]}
+
+Zero matches is deliberately **not** the condition. Three shapes produce zero
+matches and are not broken — Sonarr has no aired episode for the series yet,
+every SVT episode is still upcoming, or Sonarr has no such series at all —
+and none of them is reported. Only "SVT has available episodes, Sonarr has
+aired episodes, and no pair of them agrees" is.
+
+The comparison costs one Sonarr episode-list read per mapping per round, plus
+one series-list read for the whole round, spread out at the same pace as the
+SVT requests. A Sonarr that is not answering degrades **only** this half:
+`resolvability_unknown` counts the rows it could not decide, `resolvability_
+error` says why, and `unresolvable` stays at 0 rather than reporting a clean
+sweep. Everything the `svt` block says about SVT is unaffected, and the
+`sonarr` block below is already red in that case.
 
 `svt_canary_interval_minutes` in `config.yaml` (default 60) is how to slow the
 check down; it is not on the settings page.

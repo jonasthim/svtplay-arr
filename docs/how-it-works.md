@@ -239,7 +239,16 @@ read from `/avsnitt-N` in the play URL or a leading `N.` in the episode
 heading. Shows whose episodes are titled by subject rather than number —
 `uppdrag-granskning` and `agenda` are the ones checked — carry neither, so
 signal 2 refuses every episode of them. Mapped, they will simply never
-produce a release, which looks identical to a show with nothing new.
+produce a release.
+
+That used to look identical to a show with nothing new, and it no longer
+does: the background check now asks, per mapping and per round, whether that
+programme's episodes can match *any* of Sonarr's episodes for the series. A
+mapping that can never match is named on the configuration page and in
+`/health`'s `svt.unresolvable_series`, with which of the two reasons it is —
+no SVT episode carries an ordinal at all (unfixable; remove the row or accept
+it), or ordinals exist and no air date lines up (a wrong mapping, or a
+tolerance too tight). See `deploy/README.md` for the `/health` fields.
 
 SVT's own `item.number` would fill that gap, and it is deliberately not used.
 It indexes a season grouping SVT does not expose, it is ambiguous on exactly
