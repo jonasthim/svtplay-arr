@@ -1,0 +1,547 @@
+{
+ "slug": "uppdrag-granskning",
+ "captured": "2026-08-28",
+ "show_page_bytes": 258657,
+ "episodes": [
+  {
+   "svt_id": "82dM7Ld",
+   "title": "Ons 9 sep",
+   "url": "/video/82dM7Ld/uppdrag-granskning/ons-9-sep",
+   "ordinal": null,
+   "published": null,
+   "available": false,
+   "duration_s": 3540
+  },
+  {
+   "svt_id": "82da9g9",
+   "title": "Adams egna ord",
+   "url": "/video/82da9g9/uppdrag-granskning/adams-egna-ord",
+   "ordinal": null,
+   "published": "2026-09-24",
+   "available": true,
+   "duration_s": 3480
+  },
+  {
+   "svt_id": "86dY9ww",
+   "title": "Duschvakten",
+   "url": "/video/86dY9ww/uppdrag-granskning/duschvakten",
+   "ordinal": null,
+   "published": "2026-10-15",
+   "available": true,
+   "duration_s": 2580
+  },
+  {
+   "svt_id": "8EqJmR3",
+   "title": "Smutsiga kläder",
+   "url": "/video/8EqJmR3/uppdrag-granskning/smutsiga-klader",
+   "ordinal": null,
+   "published": "2026-07-15",
+   "available": true,
+   "duration_s": 3420
+  },
+  {
+   "svt_id": "8EqwxVX",
+   "title": "Var är batterierna? - vad hände sedan?",
+   "url": "/video/8EqwxVX/uppdrag-granskning/var-ar-batterierna-vad-hande-sedan",
+   "ordinal": null,
+   "published": "2026-07-16",
+   "available": true,
+   "duration_s": 3480
+  },
+  {
+   "svt_id": "8My6LpJ",
+   "title": "Arven som försvann",
+   "url": "/video/8My6LpJ/uppdrag-granskning/arven-som-forsvann",
+   "ordinal": null,
+   "published": "2026-04-16",
+   "available": true,
+   "duration_s": 1860
+  },
+  {
+   "svt_id": "8ZY7MxY",
+   "title": "Riskområde: Tjärna Ängar",
+   "url": "/video/8ZY7MxY/uppdrag-granskning/riskomrade-tjarna-angar",
+   "ordinal": null,
+   "published": "2027-02-25",
+   "available": true,
+   "duration_s": 3540
+  },
+  {
+   "svt_id": "8ZxYJa3",
+   "title": "Ekobrottslingarnas bank",
+   "url": "/video/8ZxYJa3/uppdrag-granskning/ekobrottslingarnas-bank",
+   "ordinal": null,
+   "published": "2026-04-14",
+   "available": true,
+   "duration_s": 2280
+  },
+  {
+   "svt_id": "8myQbVa",
+   "title": "Lämnade att dö - vad hände sedan?",
+   "url": "/video/8myQbVa/uppdrag-granskning/lamnade-att-do-vad-hande-sedan",
+   "ordinal": null,
+   "published": "2026-07-02",
+   "available": true,
+   "duration_s": 3420
+  },
+  {
+   "svt_id": "8myqJQR",
+   "title": "Cosmic – journalkrisen från insidan",
+   "url": "/video/8myqJQR/uppdrag-granskning/cosmic-journalkrisen-fran-insidan",
+   "ordinal": null,
+   "published": "2026-04-29",
+   "available": true,
+   "duration_s": 3480
+  },
+  {
+   "svt_id": "8orzMoJ",
+   "title": "Varning för barn",
+   "url": "/video/8orzMoJ/uppdrag-granskning/varning-for-barn",
+   "ordinal": null,
+   "published": "2026-10-09",
+   "available": true,
+   "duration_s": 3480
+  },
+  {
+   "svt_id": "8p5Dzd3",
+   "title": "Sprit, salta pinnar och miljonavtal",
+   "url": "/video/8p5Dzd3/uppdrag-granskning/sprit-salta-pinnar-och-miljonavtal",
+   "ordinal": null,
+   "published": "2026-08-26",
+   "available": true,
+   "duration_s": 3480
+  },
+  {
+   "svt_id": "8q1BpEL",
+   "title": "Kycklingens pris",
+   "url": "/video/8q1BpEL/uppdrag-granskning/kycklingens-pris",
+   "ordinal": null,
+   "published": "2027-01-17",
+   "available": true,
+   "duration_s": 3540
+  },
+  {
+   "svt_id": "K5dby67",
+   "title": "Matchfixarna",
+   "url": "/video/K5dby67/uppdrag-granskning/matchfixarna",
+   "ordinal": null,
+   "published": "2026-06-24",
+   "available": true,
+   "duration_s": 3060
+  },
+  {
+   "svt_id": "KDnaYn9",
+   "title": "Den sista ålen - vad hände sen?",
+   "url": "/video/KDnaYn9/uppdrag-granskning/den-sista-alen-vad-hande-sen",
+   "ordinal": null,
+   "published": "2026-06-26",
+   "available": true,
+   "duration_s": 540
+  },
+  {
+   "svt_id": "KDvMrWb",
+   "title": "Var är batterierna?",
+   "url": "/video/KDvMrWb/uppdrag-granskning/var-ar-batterierna",
+   "ordinal": null,
+   "published": "2027-02-26",
+   "available": true,
+   "duration_s": 3420
+  },
+  {
+   "svt_id": "KDvMrdg",
+   "title": "Kyrkans hemliga affärer",
+   "url": "/video/KDvMrdg/uppdrag-granskning/kyrkans-hemliga-affarer",
+   "ordinal": null,
+   "published": "2026-09-17",
+   "available": true,
+   "duration_s": 2880
+  },
+  {
+   "svt_id": "KDvMxBB",
+   "title": "Dubaisvenskarna - vad hände sedan?",
+   "url": "/video/KDvMxBB/uppdrag-granskning/dubaisvenskarna-vad-hande-sedan",
+   "ordinal": null,
+   "published": "2026-07-30",
+   "available": true,
+   "duration_s": 3480
+  },
+  {
+   "svt_id": "KGVZP4d",
+   "title": "Mirakelbarnen: På gränsen till abort",
+   "url": "/video/KGVZP4d/uppdrag-granskning/mirakelbarnen-pa-gransen-till-abort",
+   "ordinal": null,
+   "published": "2026-03-20",
+   "available": true,
+   "duration_s": 2820
+  },
+  {
+   "svt_id": "KLJDqwr",
+   "title": "Världens snällaste hund",
+   "url": "/video/KLJDqwr/uppdrag-granskning/varldens-snallaste-hund",
+   "ordinal": null,
+   "published": "2026-10-01",
+   "available": true,
+   "duration_s": 3420
+  },
+  {
+   "svt_id": "KLa3m9w",
+   "title": "Den svenska spermieskandalen",
+   "url": "/video/KLa3m9w/uppdrag-granskning/den-svenska-spermieskandalen",
+   "ordinal": null,
+   "published": "2026-06-12",
+   "available": true,
+   "duration_s": 1980
+  },
+  {
+   "svt_id": "KN3DEvB",
+   "title": "Konsultnotan",
+   "url": "/video/KN3DEvB/uppdrag-granskning/konsultnotan",
+   "ordinal": null,
+   "published": "2026-11-19",
+   "available": true,
+   "duration_s": 2700
+  },
+  {
+   "svt_id": "KZmQELd",
+   "title": "Var är Therese? – fortsättningen",
+   "url": "/video/KZmQELd/uppdrag-granskning/var-ar-therese-fortsattningen",
+   "ordinal": null,
+   "published": "2027-01-15",
+   "available": true,
+   "duration_s": 3480
+  },
+  {
+   "svt_id": "KZmQJ37",
+   "title": "Göteborgskravallerna",
+   "url": "/video/KZmQJ37/uppdrag-granskning/goteborgskravallerna",
+   "ordinal": null,
+   "published": "2026-06-17",
+   "available": true,
+   "duration_s": 3540
+  },
+  {
+   "svt_id": "KZxY4Em",
+   "title": "Skyttarna - vad hände sedan?",
+   "url": "/video/KZxY4Em/uppdrag-granskning/skyttarna-vad-hande-sedan",
+   "ordinal": null,
+   "published": "2026-07-23",
+   "available": true,
+   "duration_s": 3420
+  },
+  {
+   "svt_id": "KZxYJ2Q",
+   "title": "Sprängdådens regissörer",
+   "url": "/video/KZxYJ2Q/uppdrag-granskning/sprangdadens-regissorer",
+   "ordinal": null,
+   "published": "2026-03-26",
+   "available": true,
+   "duration_s": 3540
+  },
+  {
+   "svt_id": "KZxgBLZ",
+   "title": "Det stora ROT-fusket",
+   "url": "/video/KZxgBLZ/uppdrag-granskning/det-stora-rot-fusket",
+   "ordinal": null,
+   "published": "2026-08-19",
+   "available": true,
+   "duration_s": 2640
+  },
+  {
+   "svt_id": "Kn4M7A5",
+   "title": "Spermieskandalens nya offer",
+   "url": "/video/Kn4M7A5/uppdrag-granskning/spermieskandalens-nya-offer",
+   "ordinal": null,
+   "published": "2027-02-10",
+   "available": true,
+   "duration_s": 1620
+  },
+  {
+   "svt_id": "KqWLE5w",
+   "title": "Den sista ålen",
+   "url": "/video/KqWLE5w/uppdrag-granskning/den-sista-alen",
+   "ordinal": null,
+   "published": "2027-02-21",
+   "available": true,
+   "duration_s": 3420
+  },
+  {
+   "svt_id": "KrQDby7",
+   "title": "Varför tog de Malins bebis - fortsättningen",
+   "url": "/video/KrQDby7/uppdrag-granskning/varfor-tog-de-malins-bebis-fortsattningen",
+   "ordinal": null,
+   "published": "2026-04-15",
+   "available": true,
+   "duration_s": 2700
+  },
+  {
+   "svt_id": "KxgkPay",
+   "title": "Schizofreni i Sveriges lyckligaste kommun",
+   "url": "/video/KxgkPay/uppdrag-granskning/schizofreni-i-sveriges-lyckligaste-kommun",
+   "ordinal": null,
+   "published": "2026-10-22",
+   "available": true,
+   "duration_s": 2640
+  },
+  {
+   "svt_id": "e2da939",
+   "title": "Exposed",
+   "url": "/video/e2da939/uppdrag-granskning/exposed",
+   "ordinal": null,
+   "published": "2026-11-26",
+   "available": true,
+   "duration_s": 2700
+  },
+  {
+   "svt_id": "e6dY9Pm",
+   "title": "Lämnade att dö",
+   "url": "/video/e6dY9Pm/uppdrag-granskning/lamnade-att-do",
+   "ordinal": null,
+   "published": "2027-01-22",
+   "available": true,
+   "duration_s": 3540
+  },
+  {
+   "svt_id": "eJyJzQW",
+   "title": "Telias mutaffärer",
+   "url": "/video/eJyJzQW/uppdrag-granskning/telias-mutaffarer",
+   "ordinal": null,
+   "published": "2026-08-12",
+   "available": true,
+   "duration_s": 3480
+  },
+  {
+   "svt_id": "ePvLkPq",
+   "title": "Mirakelbarnen - vad hände sedan?",
+   "url": "/video/ePvLkPq/uppdrag-granskning/mirakelbarnen-vad-hande-sedan",
+   "ordinal": null,
+   "published": "2026-06-25",
+   "available": true,
+   "duration_s": 3480
+  },
+  {
+   "svt_id": "eQrA3zN",
+   "title": "Barnsamtalen",
+   "url": "/video/eQrA3zN/uppdrag-granskning/barnsamtalen",
+   "ordinal": null,
+   "published": "2026-04-22",
+   "available": true,
+   "duration_s": 2280
+  },
+  {
+   "svt_id": "eQrzy2z",
+   "title": "Säkerhetshotens hemlighet",
+   "url": "/video/eQrzy2z/uppdrag-granskning/sakerhetshotens-hemlighet",
+   "ordinal": null,
+   "published": "2026-10-08",
+   "available": true,
+   "duration_s": 2940
+  },
+  {
+   "svt_id": "eXv1V5g",
+   "title": "Ikea och Kamprads gömda miljarder",
+   "url": "/video/eXv1V5g/uppdrag-granskning/ikea-och-kamprads-gomda-miljarder",
+   "ordinal": null,
+   "published": "2026-07-29",
+   "available": true,
+   "duration_s": 3540
+  },
+  {
+   "svt_id": "eXvyxMq",
+   "title": "Jakten på Ozempic - vad hände sedan?",
+   "url": "/video/eXvyxMq/uppdrag-granskning/jakten-pa-ozempic-vad-hande-sedan",
+   "ordinal": null,
+   "published": "2026-08-06",
+   "available": true,
+   "duration_s": 3480
+  },
+  {
+   "svt_id": "eZxgBYW",
+   "title": "Älskade kyckling",
+   "url": "/video/eZxgBYW/uppdrag-granskning/alskade-kyckling",
+   "ordinal": null,
+   "published": "2027-02-04",
+   "available": true,
+   "duration_s": 2700
+  },
+  {
+   "svt_id": "eb36D7Y",
+   "title": "Fuskförmedlingen",
+   "url": "/video/eb36D7Y/uppdrag-granskning/fuskformedlingen",
+   "ordinal": null,
+   "published": "2026-09-02",
+   "available": false,
+   "duration_s": 3540
+  },
+  {
+   "svt_id": "eb3YvP3",
+   "title": "Bedragarnas imperium - vad hände sedan?",
+   "url": "/video/eb3YvP3/uppdrag-granskning/bedragarnas-imperium-vad-hande-sedan",
+   "ordinal": null,
+   "published": "2026-08-13",
+   "available": true,
+   "duration_s": 3360
+  },
+  {
+   "svt_id": "eb3YwJN",
+   "title": "Gängskolan",
+   "url": "/video/eb3YwJN/uppdrag-granskning/gangskolan",
+   "ordinal": null,
+   "published": "2026-04-23",
+   "available": true,
+   "duration_s": 3480
+  },
+  {
+   "svt_id": "eb3Ywg9",
+   "title": "De svenska skolflyktingarna",
+   "url": "/video/eb3Ywg9/uppdrag-granskning/de-svenska-skolflyktingarna",
+   "ordinal": null,
+   "published": "2027-01-29",
+   "available": true,
+   "duration_s": 3420
+  },
+  {
+   "svt_id": "eb7kz7o",
+   "title": "Ursprungsålen",
+   "url": "/video/eb7kz7o/uppdrag-granskning/ursprungsalen",
+   "ordinal": null,
+   "published": "2026-06-26",
+   "available": true,
+   "duration_s": 1140
+  },
+  {
+   "svt_id": "egWvEgo",
+   "title": "Vardagstjuvar",
+   "url": "/video/egWvEgo/uppdrag-granskning/vardagstjuvar",
+   "ordinal": null,
+   "published": "2026-11-05",
+   "available": true,
+   "duration_s": 3420
+  },
+  {
+   "svt_id": "erokb6n",
+   "title": "Saknade barn",
+   "url": "/video/erokb6n/uppdrag-granskning/saknade-barn",
+   "ordinal": null,
+   "published": "2026-06-03",
+   "available": true,
+   "duration_s": 1560
+  },
+  {
+   "svt_id": "j1qX9rn",
+   "title": "Mullvaden",
+   "url": "/video/j1qX9rn/uppdrag-granskning/mullvaden",
+   "ordinal": null,
+   "published": "2026-09-10",
+   "available": true,
+   "duration_s": null
+  },
+  {
+   "svt_id": "j7dY9Rq",
+   "title": "Therese – fyra förlorade år",
+   "url": "/video/j7dY9Rq/uppdrag-granskning/therese-fyra-forlorade-ar",
+   "ordinal": null,
+   "published": "2026-10-29",
+   "available": true,
+   "duration_s": 2580
+  },
+  {
+   "svt_id": "jE4RrZx",
+   "title": "Varför tog de Malins bebis?",
+   "url": "/video/jE4RrZx/uppdrag-granskning/varfor-tog-de-malins-bebis",
+   "ordinal": null,
+   "published": "2027-01-28",
+   "available": true,
+   "duration_s": 2820
+  },
+  {
+   "svt_id": "jE4YNnV",
+   "title": "The last eel",
+   "url": "/video/jE4YNnV/uppdrag-granskning/the-last-eel",
+   "ordinal": null,
+   "published": "2026-06-26",
+   "available": true,
+   "duration_s": 3420
+  },
+  {
+   "svt_id": "jLJomDx",
+   "title": "När mörkret kom till byn",
+   "url": "/video/jLJomDx/uppdrag-granskning/nar-morkret-kom-till-byn",
+   "ordinal": null,
+   "published": "2026-05-06",
+   "available": true,
+   "duration_s": 2760
+  },
+  {
+   "svt_id": "jMy5DmM",
+   "title": "Barnen i Knutby",
+   "url": "/video/jMy5DmM/uppdrag-granskning/barnen-i-knutby",
+   "ordinal": null,
+   "published": "2026-07-01",
+   "available": true,
+   "duration_s": 2520
+  },
+  {
+   "svt_id": "jR5LynE",
+   "title": "Mirakelbarnen: Född i vecka 22",
+   "url": "/video/jR5LynE/uppdrag-granskning/mirakelbarnen-fodd-i-vecka-22",
+   "ordinal": null,
+   "published": "2026-03-20",
+   "available": true,
+   "duration_s": 2820
+  },
+  {
+   "svt_id": "jakyMEN",
+   "title": "Fisken vi ärvde",
+   "url": "/video/jakyMEN/uppdrag-granskning/fisken-vi-arvde",
+   "ordinal": null,
+   "published": "2026-04-09",
+   "available": true,
+   "duration_s": 3540
+  },
+  {
+   "svt_id": "jn4q5AR",
+   "title": "FN och övergreppen",
+   "url": "/video/jn4q5AR/uppdrag-granskning/fn-och-overgreppen",
+   "ordinal": null,
+   "published": "2026-08-05",
+   "available": true,
+   "duration_s": 3420
+  },
+  {
+   "svt_id": "jp59nYv",
+   "title": "Var är Therese? – “Jag kommer hem snart”",
+   "url": "/video/jp59nYv/uppdrag-granskning/var-ar-therese-jag-kommer-hem-snart",
+   "ordinal": null,
+   "published": "2026-06-09",
+   "available": true,
+   "duration_s": 1500
+  },
+  {
+   "svt_id": "jp5Dz9x",
+   "title": "Finns det hopp för Gustaf?",
+   "url": "/video/jp5Dz9x/uppdrag-granskning/finns-det-hopp-for-gustaf",
+   "ordinal": null,
+   "published": "2026-03-11",
+   "available": true,
+   "duration_s": 2640
+  },
+  {
+   "svt_id": "jqPyJZd",
+   "title": "Bolånefusket - vad hände sedan?",
+   "url": "/video/jqPyJZd/uppdrag-granskning/bolanefusket-vad-hande-sedan",
+   "ordinal": null,
+   "published": "2026-07-09",
+   "available": true,
+   "duration_s": 3360
+  },
+  {
+   "svt_id": "jvvQL4b",
+   "title": "Fisken vi ärvde",
+   "url": "/video/jvvQL4b/uppdrag-granskning/fisken-vi-arvde",
+   "ordinal": null,
+   "published": "2026-07-08",
+   "available": true,
+   "duration_s": 3480
+  }
+ ]
+}

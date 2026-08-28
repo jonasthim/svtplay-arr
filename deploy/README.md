@@ -79,7 +79,7 @@ because an empty feed is what makes it do that.
 
 The `svt` block is the SVT canary. Everything else on `/health` reports on
 *this* process, which is why an SVT page-format change could empty the feed
-while every other field stayed green: the parser returns nothing, the resolver
+while every other field stayed green: the listing returns nothing, the resolver
 returns nothing, Sonarr grabs nothing, and no existing check notices. Once an
 hour the canary re-checks the mappings you actually have — no hardcoded show,
 because a hardcoded slug rots — and reports:
@@ -103,7 +103,7 @@ because a hardcoded slug rots — and reports:
 `"degraded"`. `series` does **not**, and that is deliberate: a show ends, SVT
 retires the URL, nobody gets round to deleting the row, and a `status` that
 went red for it would stay red — so within a week the check is background
-noise, and the day SVT breaks the parser the `svt` state arrives on a channel
+noise, and the day SVT breaks the listing the `svt` state arrives on a channel
 everyone has learned to ignore. One dead row does not stop anything else
 working; it is reported in full (`failing`, `failing_series`) so you can alert
 on it yourself if you want to, and it is rendered prominently on the

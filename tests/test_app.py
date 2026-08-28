@@ -714,7 +714,7 @@ def test_a_text_query_reaches_the_live_mapping_table(tmp_path: Path, monkeypatch
 #
 # The one silence this service could not detect was its own. Everything
 # /health knew about was *this* process -- the worker, the store, the
-# mapping table, the filesystem -- so an SVT format change left the parser
+# mapping table, the filesystem -- so an SVT change left the listing
 # returning [], the feed empty, Sonarr grabbing nothing, and /health saying
 # "ok" throughout. These tests are about the wiring: one computation behind
 # both surfaces, and a canary whose own death is visible.
@@ -1202,7 +1202,7 @@ def test_the_mappings_view_shows_the_apps_own_canary_state(
         health = c.get("/health").json()
 
     assert "Failing" in body
-    assert "no episodes could be parsed" in body
+    assert "listed no episodes" in body
     # ...and the page and /health are describing the same one failing row.
     assert health["svt"]["failing"] == 1
 

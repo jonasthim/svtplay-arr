@@ -1,3 +1,4 @@
+import json
 from datetime import date
 from pathlib import Path
 
@@ -5,12 +6,23 @@ from svtplay_arr.models import (
     Mapping, QualityInfo, SonarrEpisode, SvtEpisode,
 )
 from svtplay_arr.resolver import Resolver
-from svtplay_arr.svt.parser import parse_show_page
+from svtplay_arr.svt.client import episodes_from_details_page
 
-FIXTURE = Path(__file__).parent / "fixtures/svt/show-gvfo-20260824.html"
-# The fixture's real capture date, so its relative "Igår"/"Idag" subheadings
-# resolve deterministically instead of drifting with wall-clock time.
-CAPTURED = date(2026, 8, 24)
+FIXTURE = Path(__file__).parent / "fixtures/svt/details-gvfo-20260828.json"
+# The fixture's real capture date. `recent()` takes `today` explicitly, so
+# pinning it here keeps the window assertions from drifting with wall-clock
+# time.
+CAPTURED = date(2026, 8, 28)
+
+
+def _captured_episodes():
+    """The real captured SVT response, through the real client mapping.
+
+    The body is stored as SVT sent it, so its `data` block is keyed by that
+    request's field alias.
+    """
+    body = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    return episodes_from_details_page(next(iter(body["data"].values())))
 
 MAP = Mapping(288649, "jpmQD3q", "gift-vid-forsta-ogonkastet",
               "Gift vid första ögonkastet")
@@ -174,16 +186,16 @@ async def test_unconfirmed_air_date_returns_none_and_logs_distinctly(caplog):
 # Every other resolver test above hand-writes its SvtEpisode list. That is
 # how two production defects survived a full unit suite at once: the
 # hand-written doubles described the page as the spec said it was, not as the
-# captured page actually parses. This test builds its SVT episode list by
-# running the real `parse_show_page` over the real captured page, so the only
-# fakes left are Sonarr (an external service) and quality resolution (a
-# separate HTTP call). If the parser regresses in a way that changes what the
-# resolver can match, this fails -- which neither a parser-only nor a
-# resolver-only test did.
+# captured response actually maps. This test builds its SVT episode list by
+# running the real `episodes_from_details_page` over the real captured SVT
+# response, so the only fakes left are Sonarr (an external service) and
+# quality resolution (a separate HTTP call). If the episode mapping regresses
+# in a way that changes what the resolver can match, this fails -- which
+# neither a listing-only nor a resolver-only test did.
 
 
 def _fixture_resolver():
-    episodes = parse_show_page(FIXTURE.read_text(encoding="utf-8"), today=CAPTURED)
+    episodes = _captured_episodes()
     return Resolver(FakeMappings(MAP), FakeSonarr(SONARR_EPS), FakeSvt(episodes))
 
 
@@ -244,8 +256,8 @@ async def test_recent_never_matches_an_svt_ordinal_to_a_sonarr_special():
     # agree. The result is a permanent S00E01 filename for what is really
     # S15E01 -- and renameEpisodes=False means that is not a retry.
     # An SVT ordinal belongs to a numbered run by construction; SVT-side
-    # specials parse with ordinal=None and never reach this path at all.
-    episodes = parse_show_page(FIXTURE.read_text(encoding="utf-8"), today=CAPTURED)
+    # specials come out with ordinal=None and never reach this path at all.
+    episodes = _captured_episodes()
     sonarr_eps = {
         (0, 1): SonarrEpisode(70, 0, 1, date(2026, 8, 23), "Bakom kulisserna"),
         (15, 1): SonarrEpisode(70, 15, 1, None, "TBA"),   # not yet dated by TVDB
@@ -264,7 +276,7 @@ async def test_recent_never_matches_an_svt_ordinal_to_a_sonarr_special():
 async def test_recent_keeps_good_releases_when_one_candidate_blows_up():
     # An empty feed is what makes Sonarr reject the indexer, so one bad
     # candidate must not discard the ones that already resolved.
-    episodes = parse_show_page(FIXTURE.read_text(encoding="utf-8"), today=CAPTURED)
+    episodes = _captured_episodes()
 
     class ExplodingQuality(FakeSvt):
         async def resolve_quality(self, svt_id):
@@ -279,18 +291,18 @@ async def test_recent_keeps_good_releases_when_one_candidate_blows_up():
     assert [rel.svt_id for rel in releases] == ["KZmQ5JY"]
 
 
-async def test_recent_fetches_the_show_page_once_per_sweep():
-    # Each candidate goes through a full resolve(), which re-fetches the
-    # 171 KB show page and Sonarr's lists. Sonarr polls RSS every few
+async def test_recent_fetches_the_episode_list_once_per_sweep():
+    # Each candidate goes through a full resolve(), which re-fetches SVT's
+    # episode listing and Sonarr's lists. Sonarr polls RSS every few
     # minutes against an unofficial API, so the sweep memoizes those reads:
     # without it this is 1 + one-per-candidate.
-    episodes = parse_show_page(FIXTURE.read_text(encoding="utf-8"), today=CAPTURED)
+    episodes = _captured_episodes()
 
     class CountingSvt(FakeSvt):
-        pages = 0
+        listings = 0
 
         async def list_episodes(self, slug):
-            CountingSvt.pages += 1
+            CountingSvt.listings += 1
             return await super().list_episodes(slug)
 
     class CountingSonarr(FakeSonarr):
@@ -304,5 +316,5 @@ async def test_recent_fetches_the_show_page_once_per_sweep():
     releases = await r.recent(within_days=14, today=CAPTURED)
 
     assert len(releases) == 2, "two candidates, so the counts below are meaningful"
-    assert CountingSvt.pages == 1
+    assert CountingSvt.listings == 1
     assert CountingSonarr.episode_lists == 1

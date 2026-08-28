@@ -70,7 +70,7 @@ Sonarr. It does not talk to Sonarr first; Sonarr always initiates.
        │                                   ▼
        │                               Resolver ──── "which SVT video
        │                                   │          is this episode?"
-       │                                   ├──────────────────────────►  show page
+       │                                   ├──────────────────────────►  GraphQL
        │                                   │  ◄────────────────────────  episode list
        │                                   ├──────────────────────────►  /video/{id}
        │  ◄─── XML: 0 or 1 release ────────┘  ◄─────────  HLS manifest (quality)
@@ -114,9 +114,9 @@ In words:
    up from `completed/` and files it, exactly as it would a usenet download.
 
 There is no SVT API to speak of. SVT publishes no documented public API; the
-service reads the GraphQL endpoint their own web player uses, scrapes the
-episode list out of the show page's markup, and reads the available quality
-out of an HLS manifest. All of that lives in one module
+service reads the GraphQL endpoint their own web player uses — for series
+search and for the episode list alike — and reads the available quality out
+of an HLS manifest. All of that lives in one module
 (`src/svtplay_arr/svt/client.py`) precisely because it can change without
 notice.
 

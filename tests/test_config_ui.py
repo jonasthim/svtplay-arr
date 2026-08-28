@@ -2499,13 +2499,13 @@ def test_check_reports_an_svt_error_with_the_error(tmp_path: Path):
     assert "boom" in r.text
 
 
-def test_the_empty_result_message_names_a_parse_failure_too(tmp_path: Path):
-    # `parse_show_page` is a regex scan over SVT's escaped payload, so a
-    # markup change on SVT's side returns [] from a perfectly valid 200
-    # for a perfectly correct slug. In that outage the resolver goes quiet
-    # as well, the operator checks every row, and being told the slug is
-    # probably wrong for all of them points them away from the parser --
-    # the one thing that actually needs fixing. Name it as a cause.
+def test_the_empty_result_message_names_svt_itself_as_a_cause(tmp_path: Path):
+    # A valid 200 for a perfectly correct slug can still come back with no
+    # episodes if SVT changes what its API *means* rather than its shape --
+    # a shape change now raises and lands in the "error" branch instead. In
+    # that outage the resolver goes quiet as well, the operator checks every
+    # row, and being told the slug is probably wrong for all of them points
+    # them away from the one thing that actually needs fixing. Name it.
     svt = FakeSvt(episodes=[])
     payload = _client(tmp_path, svt=svt).post(
         "/config/mappings/288649/check", headers={"Accept": "application/json"}
@@ -2517,7 +2517,7 @@ def test_the_empty_result_message_names_a_parse_failure_too(tmp_path: Path):
     assert "slug" in message
     assert "ended" in message
     assert "svtplay-arr" in message
-    assert "pars" in message  # parse / parsing / parser
+    assert "every" in message  # the every-row-empty tell that points at SVT
     # Wording only: the outcome and the colour it drives are unchanged.
     assert payload["outcome"] == "not_found"
     assert payload["css_class"] == "warn"

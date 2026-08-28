@@ -203,21 +203,23 @@ async def _check_slug(svt, slug: str) -> dict:
             "outcome": "not_found",
             "css_class": _CHECK_CSS_CLASS["not_found"],
             "episode_count": 0,
-            # Three causes, not two. `parse_show_page` is a regex scan
-            # over SVT's escaped payload, so a markup change on SVT's side
-            # returns [] from a valid 200 for a correct slug -- and in that
-            # outage the resolver goes quiet too, so the operator checks
-            # every row and would be told the slug is probably wrong for
-            # all of them. That points away from the parser, which is the
-            # thing that needs fixing. The 404 branch above genuinely is
-            # SVT saying "no such show" and keeps its own two causes.
+            # Two likely causes and one unlikely one, and the unlikely
+            # one is why the last sentence is here. An SVT schema change
+            # now arrives as an `errors` block, which becomes the "error"
+            # outcome above rather than this one -- but a *semantic*
+            # change (episodes moving out of `associatedContent`) would
+            # still empty this for a slug that is perfectly correct, and
+            # in that outage the resolver goes quiet too, so the operator
+            # checks every row and is told each slug is probably wrong.
+            # Every row checking empty at once is the tell, and it points
+            # away from the slugs.
             "message": (
-                f"SVT returned no episodes for slug {slug!r}. The slug may "
-                "be wrong, the show may have ended, or svtplay-arr may "
-                "have failed to parse SVT's show page -- its parser reads "
-                "SVT's own markup, so a change there empties this result "
-                "for a slug that is perfectly correct. If every mapping "
-                "checks empty, suspect the parser before the slugs."
+                f"SVT returned no episodes for slug {slug!r}. The slug is "
+                "probably wrong, or the show has ended and SVT is no "
+                "longer offering it. If *every* mapping checks empty, "
+                "suspect SVT rather than the slugs: svtplay-arr reads an "
+                "undocumented SVT API, and a change at their end can empty "
+                "this result for slugs that are all perfectly correct."
             ),
         }
 

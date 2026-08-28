@@ -266,7 +266,7 @@ def create_app(settings: Settings) -> FastAPI:
             # than a guess. Added, never folded into an existing field, on
             # the same contract every other addition here keeps.
             "version": service_version(),
-            # Is SVT still there, does the parser still work, and do the
+            # Is SVT still there, does it still list episodes, and do the
             # operator's own mappings still resolve? Added, never folded
             # into an existing field: Sonarr health-check setups may poll
             # this endpoint, so every key above keeps its name and type.

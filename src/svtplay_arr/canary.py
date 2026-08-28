@@ -19,11 +19,11 @@ wrong about what the class does.
 
 --- The SVT canary --------------------------------------------------------
 
-Periodic proof that SVT still answers and the parser still works.
+Periodic proof that SVT still answers and still lists episodes.
 
 This project's design is "refuse on doubt, return nothing". That is why the
 media library is safe -- but it is also what makes failure and idleness
-indistinguishable. If SVT changes its page format, `parse_show_page` returns
+indistinguishable. If SVT changes what it returns, `list_episodes` returns
 `[]`, the resolver returns nothing, the feed goes empty, and Sonarr grabs
 nothing. Every existing check keeps saying `ok`, because every existing
 check is about *this* service: the worker task, the mapping table, the
@@ -31,9 +31,13 @@ filesystem, the job store. None of them has ever known whether SVT is
 there. The operator finds out weeks later, wondering why no episodes have
 appeared.
 
-The parser is a regex scan over SVT's Next.js flight payload against an
-undocumented API. That breaking is a *when*, not an *if*, so the one silence
-this codebase could not detect was its own.
+The episode listing reads an undocumented GraphQL API with no stability
+guarantee. That breaking is a *when*, not an *if*, so the one silence this
+codebase could not detect was its own. A *structural* break now raises --
+SVT answers a vanished field with an `errors` block, which the client turns
+into `SvtApiError` and this reports by name. A *semantic* one, where the
+response is still valid and no longer means what it did, is as silent as a
+drifting regex ever was, and is exactly what the rule below is for.
 
 **The canary is the operator's own mappings, not a hardcoded show.** A
 hardcoded slug is a fixture that rots: the show ends, SVT retires the URL,
@@ -44,14 +48,15 @@ side effect, and it is exactly the set of shows whose absence the operator
 would notice.
 
 **Zero episodes is a failure, not a success.** This is the single decision
-the whole module turns on. A show page whose format changed still returns
-HTTP 200; `parse_show_page` just finds nothing in it. Treating an empty list
+the whole module turns on. An SVT response that changed meaning still
+returns HTTP 200; the listing just finds nothing in it. Treating an empty
+list
 as "the check passed, SVT answered" would make this report `ok` through
 precisely the outage it exists to catch.
 
 **Two failure shapes, because they need different actions.**
-  - *Every* mapping failing points at SVT or the parser: nothing will be
-    grabbed until it is fixed, the operator can do nothing about the cause,
+  - *Every* mapping failing points at SVT, not at any one show: nothing
+    will be grabbed until it is fixed, the operator can do nothing about the cause,
     and they must know immediately.
   - *One* mapping failing points at that show -- ended, re-slugged, moved.
     It is fixed by editing one row.
@@ -175,7 +180,7 @@ STATE_NO_MAPPINGS = "no_mappings"
 STATE_OK = "ok"
 # The last round resolved some mappings and not others: those shows.
 STATE_SERIES = "series"
-# The last round resolved none of its mappings: SVT or the parser.
+# The last round resolved none of its mappings: SVT, not any one show.
 STATE_SVT = "svt"
 # Reading the canary's own state failed. Unknown for an unknown reason.
 STATE_UNAVAILABLE = "unavailable"
@@ -192,7 +197,7 @@ STATE_UNAVAILABLE = "unavailable"
 # actually happens if it holds `status` red: a show ends, SVT retires the
 # URL, the operator does not get round to deleting the row, and every
 # monitoring setup polling this endpoint has a permanently red check. Within
-# a week they stop looking at it. Then the day SVT breaks the parser and the
+# a week they stop looking at it. Then the day SVT breaks the listing and the
 # state goes to `svt`, the signal built to catch exactly that arrives on a
 # channel everyone has already learned to ignore.
 #
@@ -559,7 +564,8 @@ class SvtCanary(_PeriodicCheck):
             "failing": self._failing,
             "episodes_seen": self._episodes_seen,
             "last_checked": _iso(self._last_round_at),
-            # The last time SVT and the parser were demonstrably working.
+            # The last time SVT and the episode listing were demonstrably
+            # working.
             # Survives a later failure on purpose: it is the difference
             # between "broke this hour" and "never worked".
             "last_success": _iso(self._last_success_at),
@@ -737,16 +743,16 @@ class SvtCanary(_PeriodicCheck):
 
         count = len(episodes or [])
         if count == 0:
-            # The whole point. A 200 with nothing parseable in it is what an
-            # SVT format change looks like from here, and it is also what a
-            # retired show looks like -- the counts in `status()` are what
+            # The whole point. A 200 carrying no episodes is what a
+            # semantic SVT change looks like from here, and it is also what
+            # a retired show looks like -- the counts in `status()` are what
             # separate those two, not this probe.
             return (
                 False,
                 0,
-                f"SVT answered for {slug!r} but no episodes could be parsed "
-                "-- the show may have ended, or SVT's page format has "
-                "changed and the parser needs updating",
+                f"SVT answered for {slug!r} but listed no episodes "
+                "-- the show may have ended, or SVT has changed what it "
+                "returns and svtplay-arr needs updating",
             )
         return True, count, None
 

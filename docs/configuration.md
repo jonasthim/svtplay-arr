@@ -551,7 +551,7 @@ This service is built to refuse on doubt and return nothing. That is why your
 library is safe — and it is also what makes a failure and a quiet week look
 identical from the outside.
 
-If SVT changes its page format, the parser finds no episodes, the resolver
+If SVT changes what its API returns, the listing finds no episodes, the resolver
 returns nothing, the feed goes empty, and Sonarr grabs nothing. Every other
 field on `/health` keeps saying `ok`, because every other field is about *this*
 process: the worker, the job store, the mappings table, the filesystem. None of
@@ -582,7 +582,7 @@ They need different actions, so they are reported differently:
 | `svt.state` | What it means | What to do |
 | --- | --- | --- |
 | `ok` | Every mapping resolved. | Nothing. |
-| `svt` | **None** of them did. | This is SVT or the parser, not any one show. Nothing will be grabbed until it is fixed. |
+| `svt` | **None** of them did. | This is SVT itself, not any one show. Nothing will be grabbed until it is fixed. |
 | `series` | Some did, some did not. | Those shows ended, were re-slugged, or moved. `failing_series` names them; fix one row each. Everything else keeps working. |
 | `no_mappings` | Nothing to check. | Nothing — a fresh install legitimately has no mappings. |
 | `unknown` | No check has completed since the service started. | Wait. It is deliberately not reported as `ok`. |
@@ -605,7 +605,7 @@ Two states deliberately do *not*, and both exclusions are load-bearing:
 - **`series`.** One dead mapping is real and it is yours to fix, but it does not
   stop anything else working — and if it held `status` red until you got round
   to deleting the row, it would hold it red for weeks. A monitoring check that
-  is permanently red is one you stop reading, and the day SVT breaks the parser
+  is permanently red is one you stop reading, and the day SVT breaks the listing
   the `svt` state would arrive on exactly that channel. This project has shipped
   that mistake once already, as an installer warning that fired on every fresh
   install. It is still reported in full (`failing`, `failing_series`), so you can

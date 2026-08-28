@@ -26,7 +26,6 @@ src/svtplay_arr/
   discovery.py    Which mappings may be written unconfirmed, + the CLI
   sonarr.py       Sonarr API client (the metadata oracle)
   svt/
-    parser.py     Show-page parsing
     client.py     GraphQL search, episode listing, quality resolution
   matching.py     The one episode-matching rule, shared
   resolver.py     The confidence gate
@@ -293,9 +292,9 @@ produce the release, so a release from the RSS feed is byte-identical to one
 from a targeted search. It also asserts that the forward rule came back with
 the SVT id it started from, which catches page drift between the two calls.
 
-The whole sweep memoises Sonarr's series and episode lists and SVT's show page,
-because a full `resolve()` per candidate would re-fetch a 171 KB page every
-time — traffic that starts to look like scraping as the window widens. The
+The whole sweep memoises Sonarr's series and episode lists and SVT's episode
+listing, because a full `resolve()` per candidate would re-fetch it every
+time — traffic that adds up as the window widens. The
 memo is per-sweep and thrown away, because SVT's availability data is the one
 thing that must never go stale.
 
@@ -681,35 +680,41 @@ implementation, and why.
 
 ## The SVT client
 
-[`src/svtplay_arr/svt/client.py`](../src/svtplay_arr/svt/client.py). Three
-surfaces, all reverse-engineered, none of them documented or stable.
+[`src/svtplay_arr/svt/client.py`](../src/svtplay_arr/svt/client.py). Two
+surfaces, both reverse-engineered, neither documented or stable.
 
-- **Contento GraphQL** (`api.svt.se/contento/graphql`) for series search.
-- **The show page HTML** (`svtplay.se/{slug}`) for the episode list, parsed by
-  `svt/parser.py`.
+- **Contento GraphQL** (`api.svt.se/contento/graphql`) for series search
+  (`search`) and for the episode list (`detailsPageByPath`).
 - **The video endpoint** (`api.svt.se/video/{svt_id}`) plus the HLS master
   manifest it points at, for quality and exact duration.
 
 Three quirks are worth knowing because they explain code that otherwise looks
 paranoid:
 
-**The CDN returns cached responses across different query strings.** Two
-different GraphQL queries were observed coming back with the same body. A
-structural check does not catch this — the swapped body is perfectly
-well-formed JSON for *some* query. So every request carries a cache-buster
-*and* a per-request field alias (`q<nonce>: search(...)`), and the response's
-`data` block must echo that exact alias before anything in it is trusted.
+**The CDN returns cached responses across different queries.** Two different
+GraphQL queries were observed coming back with the same body. A structural
+check does not catch this — the swapped body is perfectly well-formed JSON
+for *some* query. So every request carries a per-request field alias
+(`q<nonce>: search(...)`), and the response's `data` block must echo that
+exact alias before anything in it is trusted. The alias doubles as the
+cache-buster, and it travels **inside `variables`**: the CDN keys on
+`(path, ua, variables)` and on nothing else, so the `cb` query parameter this
+client sent until 2026-08-28 was never part of the key and never busted
+anything.
 
-**The show page's `__NEXT_DATA__` is empty of content.** The episode list lives
-in an HTML-escaped JSON payload elsewhere in the markup, which is why the
-parser unescapes and scans rather than parsing something structured.
+**An unknown slug is not a 404.** `detailsPageByPath` answers HTTP 200 with
+`{"data": {"…": null}}`. The client translates that back into an
+`SvtApiError` carrying `status_code=404`, because the configuration page's
+mapping check distinguishes "no such slug" from every other SVT failure by
+exactly that attribute.
 
 **Quality is not in the video endpoint.** Its `videoReferences` entries carry
 only `format`, `url`, `resolve` and `redirect` — no resolution, no bitrate. The
 quality ladder is in the HLS master playlist one of those entries points to.
 The same video endpoint response does carry an exact `contentDuration`, which
-is materially better than the show page's coarse "N min" subheading (observed
-drifting up to ~19% off), so it is threaded through for size estimation.
+is preferred for size estimation over the listing's own `duration`, though
+the two now agree to the second (the show page this replaced rounded to the
+minute, and read "1 tim 9 min" as nine).
 
 ---
 
@@ -722,8 +727,8 @@ drift surfaces as a fixture mismatch rather than as a production mystery**.
 
 Two rules that shaped a lot of the test code:
 
-- **Fixtures are ground truth, not the code.** When the parser and a fixture
-  disagree, the fixture wins and the parser gets fixed.
+- **Fixtures are ground truth, not the code.** When the client and a fixture
+  disagree, the fixture wins and the client gets fixed.
 - **A synchronous fake cannot test an asynchronous protocol.** The worker is
   long-running and Sonarr polls `mode=queue` *during* the download, so a fake
   that completed instantly would make every queue test pass while proving

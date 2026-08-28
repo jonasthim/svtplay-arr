@@ -57,7 +57,7 @@ import pytest
 
 from svtplay_arr.downloader import SvtplayDlDownloader
 from svtplay_arr.naming import release_title
-from svtplay_arr.svt.client import SvtClient
+from svtplay_arr.svt.client import SvtApiError, SvtClient
 
 pytestmark = pytest.mark.integration
 
@@ -65,6 +65,9 @@ pytestmark = pytest.mark.integration
 # 2026-08-24. If SVT retires it, replace it with any other short clip from
 # the same show page rather than reaching for a full episode.
 SHORT_CLIP_SVT_ID = "jgWYBgb"
+
+# The slug behind the captured fixtures; long-running, so it is still there.
+SHOW_SLUG = "gift-vid-forsta-ogonkastet"
 
 
 async def test_real_search_finds_the_show():
@@ -87,6 +90,41 @@ async def test_real_repeated_search_is_not_served_a_stale_body():
         second = await client.search_series("uppdrag granskning")
     assert first and second
     assert [h.svt_id for h in first] == [h.svt_id for h in second]
+
+
+async def test_real_episode_list_matches_the_captured_fixture_shape():
+    """The live details page still answers, and still carries every field
+    `SvtEpisode` is built from.
+
+    Asserted structurally rather than by episode count: the count is a
+    property of what SVT is currently offering, which changes weekly. What
+    must not change is that a known-good slug yields episodes at all, that
+    they have ids and urls, and that the upcoming ones are still separable
+    -- which is the whole safety property.
+    """
+    async with httpx.AsyncClient(timeout=30) as http:
+        episodes = await SvtClient(http).list_episodes(SHOW_SLUG)
+
+    assert episodes, "an empty list here is the outage the canary exists for"
+    assert all(e.svt_id and e.url for e in episodes)
+    assert all(SHOW_SLUG in e.url for e in episodes)
+    assert any(e.available for e in episodes)
+    assert all(e.published is not None for e in episodes)
+    # Exact seconds from `item.duration`, never the page's rounded minutes.
+    assert any(e.duration_s % 60 for e in episodes if e.duration_s)
+
+
+async def test_real_unknown_slug_reaches_callers_as_a_404():
+    """SVT answers an unknown path with HTTP 200 and a null page, not a 404.
+
+    `config_ui.check_mapping` branches on `status_code == 404` to tell an
+    operator their slug does not exist; if that translation is ever dropped,
+    every bad slug starts reporting as a generic SVT error instead.
+    """
+    async with httpx.AsyncClient(timeout=30) as http:
+        with pytest.raises(SvtApiError) as excinfo:
+            await SvtClient(http).list_episodes("no-such-show-at-all-xyz")
+    assert excinfo.value.status_code == 404
 
 
 async def test_real_quality_resolution():

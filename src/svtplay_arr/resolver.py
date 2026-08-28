@@ -25,7 +25,7 @@ log = logging.getLogger(__name__)
 _BYTES_PER_KBIT = 1000 / 8
 
 # Used only when neither the video endpoint's exact contentDuration nor the
-# show page's coarse "N min" subheading is available. A conservative,
+# episode listing's own duration is available. A conservative,
 # clearly-nonzero stand-in so the release isn't silently advertised at 0
 # bytes (Sonarr uses size in quality-profile decisions) -- 30 minutes is a
 # deliberately modest floor, not a guess at the real runtime.
@@ -149,7 +149,7 @@ class Resolver:
         today = today or date.today()
         cutoff = today - timedelta(days=within_days)
         # Memoize the read-only lookups for this sweep. Each candidate goes
-        # through a full `resolve()`, which re-fetches the 171 KB show page
+        # through a full `resolve()`, which re-fetches SVT's episode list
         # and Sonarr's series and episode lists -- data this method already
         # holds. Sonarr polls RSS every few minutes against an unofficial
         # API, so re-fetching it per candidate is the kind of traffic that

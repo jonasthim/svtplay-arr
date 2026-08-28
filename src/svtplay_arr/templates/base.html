@@ -561,8 +561,8 @@
     </span>
     {#- The one fact on this strip that is about the world outside this
         process. Every other chip reports on the service itself, which is
-        exactly why an SVT format change could empty the feed while the
-        whole strip stayed green: the parser returns [], the resolver
+        exactly why an SVT change could empty the feed while the
+        whole strip stayed green: the listing returns [], the resolver
         returns nothing, Sonarr grabs nothing, and nothing above notices.
         `health.svt` is /health's own already-computed verdict (see
         canary.py and app.compute_health); this renders it and derives
@@ -683,7 +683,7 @@
   {#- The strip is a headline; a canary with a finding needs to be
       actionable, because this is the warning standing between the operator
       and a month of silently missing episodes. It says which of the two
-      failure shapes this is -- everything failing means SVT or the parser,
+      failure shapes this is -- everything failing means SVT itself,
       one show failing means that row -- because they call for completely
       different actions.
 
@@ -706,7 +706,7 @@
     is working. Check svtplay-arr's log.
     {%- elif svt.state == 'stale' %}
     No SVT check has completed recently, so nothing currently confirms that
-    SVT is reachable or that the parser still works. Check svtplay-arr's log.
+    SVT is reachable or that it still lists episodes. Check svtplay-arr's log.
     {%- elif svt.state == 'svt' %}
     <strong>None of your {{ svt.checked }} mapping{{ '' if svt.checked == 1 else 's' }}
     resolved on SVT.</strong> That points at SVT or at this service's page

@@ -1,4 +1,4 @@
-"""The SVT canary: does SVT still answer, does the parser still work, and
+"""The SVT canary: does SVT still answer, does it still list episodes, and
 do the operator's own mappings still resolve?
 
 These tests are about the canary in isolation. Its wiring into the app --
@@ -341,7 +341,7 @@ async def test_no_mappings_is_its_own_state_and_not_a_degrade():
 
 async def test_a_page_that_parses_to_no_episodes_counts_as_failing():
     # THE case this feature exists for. If SVT changes its page format the
-    # request still returns 200 and parse_show_page returns []. Counting
+    # request still returns 200 and the listing returns []. Counting
     # that as a success would make the canary report "ok" through exactly
     # the outage it was built to catch.
     svt = FakeSvt(default=[])

@@ -1,9 +1,22 @@
 """Client for the three SVT surfaces this project talks to.
 
 This is the only module in the project that knows SVT exists: the Contento
-GraphQL endpoint (series search), the show page HTML (episode listing,
-delegated to `svtplay_arr.svt.parser`), and the per-video stream/quality
-endpoint. An SVT API change should touch this file and nothing else.
+GraphQL endpoint (series search *and* episode listing) and the per-video
+stream/quality endpoint. An SVT API change should touch this file and
+nothing else.
+
+Episode listing quirk: this used to scrape the SVT Play show page, regex-
+scanning the escaped React flight payload it embeds, because
+`__NEXT_DATA__` is empty and the payload is not well-formed JSON on its
+own. `detailsPageByPath` returns every field `SvtEpisode` carries as a
+typed value, for the same one GET, at roughly 7% of the bytes (11 KB
+against 170 KB for a currently-airing show; 47 KB against 370 KB for one
+with thirteen seasons). What that buys, beyond the bytes, is the failure
+mode: a field that disappears from SVT's schema now comes back as an
+`errors` block this module turns into `SvtApiError`, where a regex whose
+anchor text drifted returned `[]` and said nothing at all. The one
+observed cost is that an unknown slug answers HTTP 200 with a null page
+instead of a 404, which `list_episodes` translates back -- see there.
 
 Cache-busting quirk: the SVT CDN was observed on 2026-08-24 returning a
 *well-formed* response body belonging to a *different* GraphQL query than
@@ -51,17 +64,23 @@ import json
 import re
 import time
 import uuid
+from dataclasses import replace
+from datetime import date, datetime
 
 import httpx
 
 from svtplay_arr.models import QualityInfo, SvtEpisode, SvtSearchHit
-from svtplay_arr.svt.parser import parse_show_page
 
 GRAPHQL = "https://api.svt.se/contento/graphql"
 VIDEO = "https://api.svt.se/video/{svt_id}"
-SHOW = "https://www.svtplay.se/{slug}"
 UA_PARAM = "svtplaywebb-play-render-prod-client"
 BROWSER_UA = "Mozilla/5.0"
+
+# SVT files not-yet-published episodes in a selection of their own. This is
+# one of the two independent availability signals; see
+# `_episode_from_teaser`.
+_UPCOMING_SELECTION = "upcoming"
+_EPISODE = "Episode"
 
 # Preferred HLS variant to resolve quality from; any other "hls*" format is
 # an acceptable fallback (they all point at equivalent quality ladders).
@@ -71,6 +90,13 @@ _TAGS = re.compile(r"<[^>]+>")
 _STREAM_INF_LINE = re.compile(r"^#EXT-X-STREAM-INF:(.*)$", re.MULTILINE)
 _RESOLUTION = re.compile(r"RESOLUTION=(\d+)x(\d+)")
 _AVERAGE_BANDWIDTH = re.compile(r"AVERAGE-BANDWIDTH=(\d+)")
+
+# The ordinal rule, moved verbatim off the retired show-page scraper. SVT
+# writes an episode's position either into the play URL (`/avsnitt-6`) or as
+# a leading number in the teaser heading ("1. Tager du..?"), the latter
+# optionally after a show-title prefix ("... XL: 3. Avslojandet").
+_ORDINAL_TITLE = re.compile(r"(?:^|:\s*)(\d{1,3})[.\s]")
+_ORDINAL_SLUG = re.compile(r"/(?:avsnitt-)(\d{1,3})(?:$|/)")
 
 _SLUG_KEEP = "abcdefghijklmnopqrstuvwxyz0123456789"
 _SLUG_FOLD = {"å": "a", "ä": "a", "ö": "o", "é": "e", "à": "a", "ü": "u"}
@@ -122,21 +148,31 @@ class SvtClient:
         return hits
 
     async def list_episodes(self, slug: str) -> list[SvtEpisode]:
-        try:
-            r = await self._http.get(
-                SHOW.format(slug=slug),
-                headers={"User-Agent": BROWSER_UA, "Cache-Control": "no-cache"},
-                follow_redirects=True,
-            )
-            r.raise_for_status()
-        except httpx.HTTPStatusError as exc:
+        """Every episode SVT currently lists for `slug`, available or not.
+
+        One GET. An empty list is a legitimate answer -- a show whose run
+        has ended returns `associatedContent: []` -- which is why the
+        canary, not this, is what treats zero episodes as a failure.
+        """
+        alias = _alias()
+        page = await self._graphql(
+            _details_page_query(alias), alias, {"path": f"/{slug}"}
+        )
+        if page is None:
+            # SVT answers an unknown path with HTTP 200 and a null page,
+            # where the show page it replaced answered 404. The config
+            # page's Check control branches on `status_code == 404` to tell
+            # an operator their slug does not exist, so the shape callers
+            # already depend on is reconstructed here rather than leaving
+            # that branch unreachable.
             raise SvtApiError(
-                f"show page request for {slug!r} failed",
-                status_code=exc.response.status_code,
-            ) from exc
-        except httpx.HTTPError as exc:
-            raise SvtApiError(f"show page request for {slug!r} failed") from exc
-        return parse_show_page(r.text)
+                f"SVT has no page for slug {slug!r}", status_code=404
+            )
+        if not isinstance(page, dict):
+            raise SvtApiError(
+                f"details page for {slug!r} was not an object: {type(page).__name__}"
+            )
+        return episodes_from_details_page(page)
 
     async def resolve_quality(self, svt_id: str) -> QualityInfo | None:
         try:
@@ -233,6 +269,172 @@ def _search_query(alias: str) -> str:
         + ": search(query:$q){svtId name title episodeTitle isGenre "
         "item{__typename}}}"
     )
+
+
+def _details_page_query(alias: str) -> str:
+    """The show's episode listing, as one `detailsPageByPath` document.
+
+    Every field here is read by `episodes_from_details_page`; nothing is
+    requested speculatively. In particular `item.number` is *not* asked
+    for. It exists, it is populated for every episode of shows the old
+    scraper could not derive an ordinal for at all, and adopting it is the
+    obvious next step -- but it is also populated for specials, where the
+    scraper correctly produced `None`, and `resolver.py::_recent_for`
+    states that as an assumption it relies on. Changing the ordinal is a
+    safety decision that deserves its own change and its own tests, not a
+    side effect of changing transport. So the ordinal keeps coming from
+    `heading` and `urls.svtplay` via `_ordinal`, exactly as before.
+
+    `exclude: [clips, related]` rather than `include:` because `include`
+    and `addExtras` cannot be combined ("addExtras and include cannot be
+    combined"), and `addExtras: [upcoming]` is not optional: without it
+    `associatedContent` returns only *available* episodes, and the
+    unavailable ones simply vanish -- which would make an unaired episode
+    indistinguishable from one SVT has never mentioned rather than
+    something to refuse.
+
+    `upcomingOverlay` is selected for its `heading` only because GraphQL
+    requires a selection set on an object type; the text is never read.
+    Null versus non-null is the whole signal, and matching the text is the
+    bug this replaced (SVT labels the *imminent* episode by weekday, not
+    "Kommer").
+    """
+    return (
+        "query($path: String!){" + alias + ": detailsPageByPath(path:$path){"
+        "associatedContent(exclude:[clips,related],addExtras:[upcoming]){"
+        "selectionType "
+        "items{heading upcomingOverlay{heading} "
+        "item{__typename ... on Episode{"
+        "svtId duration validFrom urls{svtplay}}}} "
+        "itemsPaginated(pagination:{limit:1,offset:0}){totalSize}"
+        "}}}"
+    )
+
+
+def episodes_from_details_page(page: dict) -> list[SvtEpisode]:
+    """Build the episode list from a `detailsPageByPath` body.
+
+    Split out from `list_episodes` so the mapping can be exercised against
+    captured responses without a transport in the way -- which is what the
+    differential test against the retired scraper's recorded output does.
+    """
+    by_id: dict[str, SvtEpisode] = {}
+    for selection in page.get("associatedContent") or []:
+        if not isinstance(selection, dict):
+            continue
+        _refuse_a_truncated_selection(selection)
+        upcoming = selection.get("selectionType") == _UPCOMING_SELECTION
+        for teaser in selection.get("items") or []:
+            episode = _episode_from_teaser(teaser, upcoming)
+            if episode is None:
+                continue
+            already = by_id.get(episode.svt_id)
+            if already is None:
+                by_id[episode.svt_id] = episode
+            elif already.available and not episode.available:
+                # An episode listed in two selections is unavailable if it
+                # is unavailable in either. First-wins would decide this by
+                # document order, and seasons come before "Kommande" -- so
+                # first-wins resolves it the dangerous way, and the cost of
+                # offering an unaired episode is a stable GUID blocklisted
+                # before it airs and never retried.
+                by_id[episode.svt_id] = replace(already, available=False)
+    return list(by_id.values())
+
+
+def _refuse_a_truncated_selection(selection: dict) -> None:
+    """A short selection must be an error, never a short list.
+
+    Measured 2026-08-28 across four shows and 47 selections: `items`
+    returns each one whole, and its length equals `itemsPaginated.
+    totalSize` every time -- 119 episodes of one show arrived in a single
+    response. If SVT ever imposes a default cap, the episodes past it
+    become unreachable with nothing to say so, which is exactly the silent
+    miss the canary was built for and cannot see. A `totalSize` that is
+    missing rather than mismatched is this check going blind, and is
+    refused on the same grounds.
+    """
+    items = selection.get("items")
+    paginated = selection.get("itemsPaginated")
+    total = paginated.get("totalSize") if isinstance(paginated, dict) else None
+    if not isinstance(total, int):
+        raise SvtApiError(
+            "details page selection carried no totalSize; "
+            "cannot tell a complete list from a truncated one"
+        )
+    if len(items or []) != total:
+        raise SvtApiError(
+            f"details page selection returned {len(items or [])} of "
+            f"{total} items; SVT appears to be paginating"
+        )
+
+
+def _episode_from_teaser(teaser: object, upcoming_selection: bool) -> SvtEpisode | None:
+    """One teaser as an `SvtEpisode`, or None if it is not an episode.
+
+    Trailers, singles and linked series share the teaser shape, so
+    `__typename` is what excludes them -- a field comparison where the
+    scraper anchored a regex on the same string appearing as text.
+
+    Availability is over-determined on purpose. `upcoming_selection` and a
+    non-null `upcomingOverlay` are independent signals for the same fact,
+    and SVT would have to break both at once to hand back an unaired
+    episode as available. The old scraper had one anchor.
+    """
+    if not isinstance(teaser, dict):
+        return None
+    item = teaser.get("item")
+    if not isinstance(item, dict) or item.get("__typename") != _EPISODE:
+        return None
+    svt_id = item.get("svtId")
+    urls = item.get("urls")
+    url = urls.get("svtplay") if isinstance(urls, dict) else None
+    if not svt_id or not url:
+        return None  # malformed entry: skip it rather than fail the show
+    heading = teaser.get("heading") or ""
+    duration = item.get("duration")
+    return SvtEpisode(
+        svt_id=svt_id,
+        title=heading,
+        url=url,
+        ordinal=_ordinal(heading, url),
+        published=_published(item.get("validFrom")),
+        available=not upcoming_selection and teaser.get("upcomingOverlay") is None,
+        duration_s=duration if isinstance(duration, int) else None,
+    )
+
+
+def _ordinal(heading: str, url: str) -> int | None:
+    """SVT's position within its own run -- never a season number.
+
+    Unchanged, deliberately, from the scraper this replaced: the same rule
+    over the same two strings, both of which the details page carries. The
+    ordinal is what disambiguates when SVT labels a run "Sasong 14" that
+    TVDB calls season 15 and two episodes share an air date, so it is one
+    of the resolver's two signals and moving it would move what matches.
+    """
+    m = _ORDINAL_SLUG.search(url)
+    if m:
+        return int(m.group(1))
+    m = _ORDINAL_TITLE.search(heading)
+    return int(m.group(1)) if m else None
+
+
+def _published(valid_from: object) -> date | None:
+    """The publication date, in SVT's own timezone.
+
+    `validFrom` is ISO 8601 carrying SVT's offset, e.g.
+    `2026-08-23T02:00:00+02:00`. The date is taken from the offset-aware
+    value as-is: normalising to UTC first would move an episode published
+    at `00:30+02:00` onto the previous day, and the air date is one of the
+    resolver's two signals.
+    """
+    if not isinstance(valid_from, str):
+        return None
+    try:
+        return datetime.fromisoformat(valid_from).date()
+    except ValueError:
+        return None
 
 
 def _alias() -> str:
