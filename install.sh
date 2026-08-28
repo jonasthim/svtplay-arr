@@ -163,6 +163,8 @@ CONFIG_HASH_BEFORE=""
 MAPPINGS_HASH_BEFORE=""
 CONFIG_SEEDED=false  # this run wrote config.yaml from the example
 PRE_HEALTH_STATUS=""
+PRE_HEALTH_BODY=""   # the whole pre-upgrade /health body, for service_regressed
+REGRESSION=""        # what service_regressed found, for the rollback message
 TMP_DIR=""
 
 # ---------------------------------------------------------------------------
@@ -1063,6 +1065,53 @@ wait_for_health() {
     done
 }
 
+# Did this upgrade break something *this service* is responsible for?
+#
+# Deliberately not a comparison of the top-level `status`, which is what this
+# used to be. That field folds in the background checks on SVT and Sonarr --
+# facts about the world outside this process, which the version being replaced
+# may never have looked at at all. Upgrade svtplay-arr and Sonarr in the same
+# window and the old binary reports `ok` because it never asked Sonarr a
+# question, the new one correctly reports `degraded`, and a status comparison
+# rolls back a perfectly good upgrade to "fix" a dependency that is merely
+# restarting. Nothing but a few seconds of startup delay was standing between
+# that and happening, and a rollback gate must not rest on a timing margin in
+# another file.
+#
+# So this compares only the flat, process-level facts every version
+# understands, and only a regression in one of them counts. A dependency being
+# down is still reported by report_health, still turns /health red for a
+# monitor, and is still in the body logged above -- it is simply not evidence
+# that *this upgrade* failed.
+#
+# It also no longer requires the service to have been `ok` beforehand: a
+# worker that dies across an upgrade of an already-degraded service is still a
+# failed upgrade, and the old gate would have waved it through.
+#
+# Sets REGRESSION to what it found. Returns 1 (no regression) when there is no
+# pre-upgrade body to compare against, which is the same "cannot tell, do not
+# roll back" answer the old gate gave for an empty PRE_HEALTH_STATUS.
+service_regressed() {
+    local before=$1 after=$2 field was now
+    REGRESSION=""
+    [[ -n $before ]] || return 1
+    for field in worker_alive same_filesystem; do
+        was=$(json_field "$before" "$field")
+        now=$(json_field "$after" "$field")
+        if [[ $was == "true" && $now != "true" ]]; then
+            REGRESSION="${field} was true before the upgrade and is '${now:-missing}' now"
+            return 0
+        fi
+    done
+    was=$(json_field "$before" mappings_degraded)
+    now=$(json_field "$after" mappings_degraded)
+    if [[ $was != "true" && $now == "true" ]]; then
+        REGRESSION="mappings_degraded became true across the upgrade"
+        return 0
+    fi
+    return 1
+}
+
 report_health() {
     local body=$1 status same_fs
     status=$(json_field "$body" status)
@@ -1262,7 +1311,8 @@ main() {
             log "to ${RELEASES_DIR}/<commit> with a ${CURRENT_LINK} symlink."
             log "The existing checkout is left in place, untouched, as the rollback target."
         fi
-        PRE_HEALTH_STATUS=$(json_field "$(fetch_health)" status)
+        PRE_HEALTH_BODY=$(fetch_health)
+        PRE_HEALTH_STATUS=$(json_field "$PRE_HEALTH_BODY" status)
         if [[ -n $PRE_HEALTH_STATUS ]]; then
             log "current /health status: ${PRE_HEALTH_STATUS}"
         fi
@@ -1376,8 +1426,8 @@ main() {
             # a failed upgrade. An upgrade of a service that was already
             # degraded (a mount is down, say) is not -- rolling back would not
             # fix it and would lose the upgrade.
-            if [[ $MODE == upgrade && $status != "ok" && $PRE_HEALTH_STATUS == "ok" ]]; then
-                rollback "the service came back as '${status}' after the upgrade; it was 'ok' before"
+            if [[ $MODE == upgrade ]] && service_regressed "$PRE_HEALTH_BODY" "$body"; then
+                rollback "the service came back as '${status}' after the upgrade: ${REGRESSION}"
             fi
             # Only now is this release known to be the one actually serving.
             record_active_release "$id"

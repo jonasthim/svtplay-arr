@@ -49,6 +49,23 @@ DEGRADED = (
     '"active_jobs": 0, "mappings": 1, "mappings_ever_loaded": true, '
     '"mappings_degraded": false}'
 )
+# `status` is degraded and every process-level field is fine: what a new
+# version reports when a *dependency* is down. The version being replaced
+# never asked Sonarr anything, so it reported `ok` through exactly the same
+# outage -- which is why the rollback gate must not compare the two.
+DEGRADED_BY_A_DEPENDENCY = (
+    '{"status": "degraded", "same_filesystem": true, "worker_alive": true, '
+    '"active_jobs": 0, "mappings": 1, "mappings_ever_loaded": true, '
+    '"mappings_degraded": false, '
+    '"svt": {"state": "unknown", "degraded": false, "alive": true}, '
+    '"sonarr": {"state": "sonarr", "degraded": true, "alive": true}}'
+)
+# The process itself broke, and the service was already degraded beforehand.
+WORKER_DEAD = (
+    '{"status": "degraded", "same_filesystem": false, "worker_alive": false, '
+    '"active_jobs": 0, "mappings": 1, "mappings_ever_loaded": true, '
+    '"mappings_degraded": false}'
+)
 
 
 def _write_exec(path: Path, body: str) -> None:
@@ -754,6 +771,56 @@ def test_upgrade_of_an_already_degraded_service_is_not_rolled_back(harness: Harn
     second = next(p for p in harness.releases if p != first)
     assert harness.current.resolve() == second.resolve()
     assert "Rolling back" not in proc.stdout
+
+
+def test_a_dependency_being_down_does_not_roll_back_a_good_upgrade(
+    harness: Harness,
+):
+    """The coupling this gate must not have.
+
+    `/health`'s top-level `status` folds in the background checks on SVT and
+    Sonarr. The version being replaced may never have looked at either --
+    the Sonarr check did not exist before 2026-08-28 -- so it reported `ok`
+    through an outage the new one correctly calls `degraded`. Upgrade
+    svtplay-arr and Sonarr in the same window and a status comparison throws
+    away a working upgrade to "fix" a dependency that is merely restarting.
+
+    Nothing prevented that but a few seconds of startup delay in a different
+    file, which is not a guard.
+    """
+    harness.run()
+    first = harness.releases[0]
+    harness.release_upstream("0.2.0")
+    harness.plan_health(DEGRADED_BY_A_DEPENDENCY)
+
+    proc = harness.run()
+
+    second = next(p for p in harness.releases if p != first)
+    assert harness.current.resolve() == second.resolve()
+    assert "Rolling back" not in proc.stdout
+    # Still reported, just not treated as this upgrade's fault.
+    assert "degraded" in proc.stdout
+
+
+def test_a_worker_that_dies_across_an_upgrade_rolls_back_even_when_degraded(
+    harness: Harness,
+):
+    """The other half of dropping the `was ok before` precondition.
+
+    The old gate only fired when the service had been `ok` beforehand, so an
+    upgrade that killed the download worker on a host whose mount was already
+    split was waved through. Comparing the process-level fields catches it.
+    """
+    harness.set_health(DEGRADED)
+    harness.run()
+    first = harness.releases[0]
+    harness.release_upstream("0.2.0")
+    harness.plan_health(WORKER_DEAD, DEGRADED)
+
+    proc = harness.run(expect=1)
+
+    assert harness.current.resolve() == first.resolve()
+    assert "worker_alive was true before the upgrade" in proc.stderr
 
 
 def test_upgrade_migrates_a_pre_release_layout_checkout(harness: Harness):
