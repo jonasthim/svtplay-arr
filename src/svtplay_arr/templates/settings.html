@@ -17,9 +17,25 @@ Mappings apply immediately &mdash; see <a href="/config/mappings">Mappings</a>.<
      field would run a connection test instead of saving -- a silent change
      to what this form has always done. Removed from the tab order and from
      the accessibility tree; the visible Save button at the foot of the
-     form is the one anyone actually reaches. #}
-  <button type="submit" class="default-submit" tabindex="-1"
-          aria-hidden="true">Save settings</button>
+     form is the one anyone actually reaches.
+
+     `tabindex="-1"` and nothing else. It carried `aria-hidden="true"` as
+     well, which is the one combination that is an actual violation --
+     aria-hidden over a focusable element hides from assistive technology
+     something that can still be reached programmatically. Dropping it
+     changes nothing about implicit submission, and what a screen reader
+     then meets is a duplicate "Save settings" at the top of the form,
+     which is accurate.
+
+     The tidier-looking fix -- move the real Save button to the top so it
+     is first in tree order -- is not available: "first submit in tree
+     order" is a DOM property, Save sits after four fieldsets and Test
+     inside the first, so making Save first in the DOM *is* moving it to a
+     top action bar. Repositioning it with CSS instead would put focus
+     order ahead of the fields, which is a WCAG 2.4.3 failure and strictly
+     worse than what it replaced. #}
+  <button type="submit" class="default-submit"
+          tabindex="-1">Save settings</button>
   {%- endif %}
   {% for section_name, section_fields in sections %}
   <fieldset class="settings-section">

@@ -223,6 +223,44 @@ async def test_something_that_is_not_sonarr_is_reported_as_such():
     assert await _reason_of(wrong_json) == REASON_NOT_SONARR
 
 
+async def test_a_good_series_list_does_not_excuse_a_status_that_is_not_sonarr():
+    # A handler that differs per path, deliberately. With one handler
+    # answering both requests the same way, `isinstance(series, list)` does
+    # all the work and the two discriminators in front of it are never
+    # exercised on their own -- they pass transitively, and dropping either
+    # survives the whole suite.
+    #
+    # Here the series list is perfectly good and only the version
+    # requirement can catch it. This is what a proxy or another *arr on the
+    # port looks like when its error body happens to be a JSON array.
+    def no_version(request):
+        if request.url.path == "/api/v3/system/status":
+            return httpx.Response(200, json={"hello": "world"})
+        return httpx.Response(200, json=SERIES)
+
+    assert await _reason_of(no_version) == REASON_NOT_SONARR
+
+    # ...and an empty-string version is not a version either.
+    def blank_version(request):
+        if request.url.path == "/api/v3/system/status":
+            return httpx.Response(200, json={"version": ""})
+        return httpx.Response(200, json=SERIES)
+
+    assert await _reason_of(blank_version) == REASON_NOT_SONARR
+
+
+async def test_a_good_series_list_does_not_excuse_a_status_that_is_not_json():
+    # Same shape, on the other discriminator: a login page at the status
+    # endpoint, with the series path still answering like Sonarr. Only the
+    # "a 200 that is not JSON is not Sonarr answering" rule catches this.
+    def handler(request):
+        if request.url.path == "/api/v3/system/status":
+            return httpx.Response(200, text="<html><body>Sign in</body></html>")
+        return httpx.Response(200, json=SERIES)
+
+    assert await _reason_of(handler) == REASON_NOT_SONARR
+
+
 async def test_a_sonarr_shaped_status_with_an_unusable_series_list_is_not_sonarr():
     def handler(request):
         if request.url.path == "/api/v3/system/status":
