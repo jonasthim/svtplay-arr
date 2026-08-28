@@ -34,6 +34,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from svtplay_arr.api.config_ui import build_config_router
+from svtplay_arr.config import Settings
 from svtplay_arr.mappings import add_mapping
 from svtplay_arr.sonarr import (
     REASON_BAD_URL,
@@ -495,6 +496,61 @@ def test_a_blank_key_against_an_unconfigured_url_sends_nothing_at_all(
     assert probe.calls == []
     assert "ENV-ONLY-SECRET-NEVER-RENDERED" not in body
     assert "Nothing was sent" in _result_text(body)
+
+
+def test_the_url_the_service_booted_with_is_trusted_after_a_save(
+    tmp_path: Path, monkeypatch
+):
+    # Between a save and the restart that applies it, the file and the
+    # running service disagree about the Sonarr URL -- and *both* are
+    # values the operator committed to on this host. The running one is
+    # where the environment's key is already going on every RSS poll, so
+    # refusing to test it would leave the very URL in use untestable.
+    #
+    # Dropping `booted` from the trusted set survived every other test,
+    # because every fixture has the file and the boot agreeing.
+    monkeypatch.setenv("SONARR_API_KEY", "ENV-ONLY-SECRET-NEVER-RENDERED")
+    cfg, maps = _paths(tmp_path)
+    booted = Settings(
+        sonarr_url="http://booted.sonarr:8989",
+        sonarr_api_key="IRRELEVANT",
+        incomplete_dir=tmp_path / "i",
+        completed_dir=tmp_path / "c",
+        config_path=cfg,
+    )
+    # ...and the file now says somewhere else, as it would after a save.
+    cfg.write_text(
+        cfg.read_text().replace(
+            "sonarr_url: http://sonarr.test:8989",
+            "sonarr_url: http://saved.sonarr:8989",
+        ),
+        encoding="utf-8",
+    )
+
+    probe = Probe()
+    app = FastAPI()
+    app.include_router(
+        build_config_router(
+            cfg, maps, FakeSvt(), FakeSonarr(),
+            booted=booted, sonarr_probe=probe,
+        )
+    )
+    client = TestClient(app)
+    for url in (
+        "http://booted.sonarr:8989",   # what the service is running on
+        "http://saved.sonarr:8989",    # what the next restart will use
+        "http://attacker.invalid",     # neither
+    ):
+        client.post(
+            "/config/settings/test",
+            data=_form(tmp_path, sonarr_url=url, sonarr_api_key="JUNK"),
+        )
+
+    assert probe.calls == [
+        ("http://booted.sonarr:8989", "ENV-ONLY-SECRET-NEVER-RENDERED"),
+        ("http://saved.sonarr:8989", "ENV-ONLY-SECRET-NEVER-RENDERED"),
+        ("http://attacker.invalid", "JUNK"),
+    ]
 
 
 def test_a_trailing_slash_is_the_same_url_and_a_different_host_is_not(
