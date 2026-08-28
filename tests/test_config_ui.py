@@ -1,3 +1,4 @@
+import asyncio
 import html as html_mod
 import os
 import re
@@ -2539,16 +2540,8 @@ def test_check_says_so_when_the_slug_works_and_the_mapping_cannot_match(
 ):
     # The `uppdrag-granskning` shape: a full episode list, and not one of
     # them carrying an episode number.
-    numberless = [
-        SvtEpisode(
-            svt_id=f"ep{i}", title="Ett reportage", url=f"/video/ep{i}/ug/x",
-            ordinal=None, published=date(2026, 8, 20), available=True,
-            duration_s=1800,
-        )
-        for i in range(3)
-    ]
     client = _client(
-        tmp_path, svt=FakeSvt(episodes=numberless),
+        tmp_path, svt=FakeSvt(episodes=_numberless(3)),
         sonarr=_matching_sonarr(_sonarr_episodes(3, date(2026, 8, 20))),
     )
 
@@ -2567,36 +2560,63 @@ def test_check_says_so_when_the_slug_works_and_the_mapping_cannot_match(
     assert "3 episode" in payload["message"]
 
 
-def test_check_and_the_page_cannot_disagree_about_one_mapping(tmp_path: Path):
-    # The two surfaces are one function apart -- `canary.check_resolvability`
-    # -- so the row's verdict and the button's verdict are the same
-    # sentence, not two renderings of a shared intention.
-    from svtplay_arr.canary import resolvability
-
-    numberless = [
+def _numberless(n: int) -> list[SvtEpisode]:
+    """The `uppdrag-granskning` shape: real episodes, no episode numbers."""
+    return [
         SvtEpisode(
             svt_id=f"ep{i}", title="Ett reportage", url=f"/video/ep{i}/ug/x",
             ordinal=None, published=date(2026, 8, 20), available=True,
             duration_s=1800,
         )
-        for i in range(3)
+        for i in range(n)
     ]
+
+
+@pytest.mark.parametrize("reason", ["no_ordinals", "not_in_sonarr"])
+def test_check_and_the_page_cannot_disagree_about_one_mapping(
+    tmp_path: Path, reason: str,
+):
+    """Every reason, not just the one that was easiest to reach for.
+
+    The two surfaces are one function apart -- `canary.check_resolvability`
+    -- so the row's verdict and the button's verdict have to be the same
+    *sentence*, not two renderings of a shared intention. Asserting only
+    the reason code would let this pass while Check said something of its
+    own, which is exactly the drift a shared implementation is for: a
+    mutation that restated the missing-series verdict in Check's own words
+    passed the whole suite before this test named that reason too.
+    """
+    from svtplay_arr.canary import check_resolvability
+
     sonarr_eps = _sonarr_episodes(3, date(2026, 8, 20))
-    client = _client(
-        tmp_path, svt=FakeSvt(episodes=numberless),
-        sonarr=_matching_sonarr(sonarr_eps),
-    )
-    payload = client.post(
+    if reason == "no_ordinals":
+        episodes = _numberless(3)
+        sonarr = _matching_sonarr(sonarr_eps)
+        series_id = SONARR_SERIES_ID
+    else:
+        episodes = _dated_episodes(3, date(2026, 8, 20))
+        sonarr = FakeSonarr(series=[])
+        series_id = None
+
+    payload = _client(
+        tmp_path, svt=FakeSvt(episodes=episodes), sonarr=sonarr,
+    ).post(
         "/config/mappings/288649/check", headers={"Accept": "application/json"}
     ).json()
 
-    background = resolvability(
-        numberless, sonarr_eps, slug="gift-vid-forsta-ogonkastet",
+    # The verdict the background check would reach for the same two lists,
+    # computed straight from the shared function.
+    background = asyncio.run(check_resolvability(
+        _matching_sonarr(sonarr_eps), episodes,
+        tvdb_id=288649, series_id=series_id,
+        slug="gift-vid-forsta-ogonkastet",
         tolerance_days=Settings.air_date_tolerance_days,
-        today=date(2026, 8, 27),
-    )
-    assert background.note in payload["message"]
+        today=date(2026, 8, 27), timeout_s=5.0,
+    ))
+
+    assert background.reason == reason
     assert payload["unresolvable_reason"] == background.reason
+    assert background.note in payload["message"]
 
 
 def test_check_confirms_the_matching_half_when_it_does_resolve(tmp_path: Path):
