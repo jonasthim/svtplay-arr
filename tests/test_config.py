@@ -309,4 +309,14 @@ def test_a_zero_canary_interval_cannot_become_a_busy_loop(tmp_path: Path):
     settings = Settings.load(cfg)
     assert settings.svt_canary_interval_minutes == 0
     app = create_app(settings)
-    assert app.state.svt_canary._interval >= 60.0
+    try:
+        assert app.state.svt_canary._interval >= 60.0
+    finally:
+        # `create_app` opens the job store before any lifespan runs, and
+        # this test deliberately never starts one -- it only wants the
+        # constructed canary. Without this the sqlite connection is left to
+        # a finalizer, which raises during a later garbage collection and
+        # surfaces as a PytestUnraisableExceptionWarning at the end of the
+        # session: a failure under `-W error` attributed to whichever test
+        # happened to trigger the collection.
+        app.state.job_store.close()
