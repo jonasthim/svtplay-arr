@@ -797,10 +797,26 @@ resolve_ref() {
 
 release_id() { printf '%s' "${1:0:12}"; }
 
+# pyproject.toml has no static version field to read any more -- three
+# releases shipped with one nobody remembered to bump, which is the whole
+# defect this replaces (see pyproject.toml's [tool.hatch.version] comment).
+# `git describe` reads the same tag the Python package's own version is
+# built from, straight out of the full clone fetch_release() already made:
+# the tag itself on an exact release (0.3.0), or that tag plus how far HEAD
+# has moved past it (0.3.0-4-g<sha>) on anything else -- which is exactly
+# the "honestly distinguishable from a release" shape a build in between
+# tags should report. "unknown" only if $dir turns out not to be a git
+# checkout at all, which nothing this script does produces.
+#
+# The leading "v" this project's tags use (v0.1.0, v0.2.0, ...) is stripped
+# so this reads like the version hatch-vcs reports at /health, which drops
+# it too (PEP 440 has no "v" prefix) -- one tag, two tools, the same number
+# in both places rather than a cosmetic mismatch an operator has to learn
+# to ignore.
 project_version() {
     local dir=$1 v
-    v=$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' \
-        "${dir}/pyproject.toml" 2>/dev/null | head -n1 || true)
+    v=$("$SVTPLAY_ARR_GIT" -C "$dir" describe --tags --always --dirty 2>/dev/null || true)
+    [[ $v == v[0-9]* ]] && v=${v#v}
     printf '%s' "${v:-unknown}"
 }
 

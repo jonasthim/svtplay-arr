@@ -1297,9 +1297,18 @@ def test_an_untagged_repository_is_refused_rather_than_installed_from_main(
 
 
 def test_ref_main_is_still_available_deliberately(harness: Harness):
+    # commit_upstream's pyproject.toml claims "0.3.0", but that commit is
+    # untagged -- one commit past v0.1.0 -- and nothing here ever tags it
+    # v0.3.0. project_version no longer reads that field (see its own
+    # comment in install.sh for why trusting it is the defect this project
+    # shipped twice); it reports what git actually knows, honestly
+    # distinguishable from a tagged release rather than echoing an aspired
+    # version that was never true of this exact commit.
     harness.commit_upstream("0.3.0")
+    sha = harness.git("rev-parse", "--short", "HEAD").strip()
     proc = harness.run("--ref", "main")
-    assert "installed: 0.3.0" in proc.stdout
+    assert f"installed: 0.1.0-1-g{sha}" in proc.stdout
+    assert "installed: 0.3.0" not in proc.stdout
 
 
 # --------------------------------------------------------------------------

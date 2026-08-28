@@ -1,6 +1,6 @@
 [project]
 name = "svtplay-arr"
-version = "0.1.0"
+dynamic = ["version"]
 description = "A Newznab indexer and SABnzbd download client for Sonarr, backed by SVT Play."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -46,11 +46,30 @@ Issues = "https://github.com/jonasthim/svtplay-arr/issues"
 svtplay-arr-suggest-mappings = "svtplay_arr.discovery:main"
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/svtplay_arr"]
+
+# The version lives in the git tag, not here. Three releases (v0.1.0, v0.2.0,
+# v0.3.0) shipped with this file still reading "0.1.0" -- a number nobody
+# remembered to bump is a number that silently goes stale, and it did, twice.
+# hatch-vcs reads `git describe` at build time instead, so there is nothing
+# left to forget. A build from an exact tag reports that tag's version; a
+# build from any other commit reports the next version with a `.devN+g<sha>`
+# suffix, which is deliberately impossible to mistake for a release.
+#
+# This needs git metadata at build time -- present on every path that
+# actually builds this package: install.sh's fetch_release() does a full
+# `git clone` (tags included) before building, CI's checkout step is
+# `fetch-depth: 0` for the same reason, and the documented hand-built install
+# is `git clone` + `uv sync`. Nothing here builds from a git-less tree (no
+# tarball/zip install path exists), so no fallback version is configured --
+# a build attempted without git metadata should fail loudly rather than
+# silently emit a placeholder like "0.0.0" that looks real.
+[tool.hatch.version]
+source = "vcs"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

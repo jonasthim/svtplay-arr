@@ -930,7 +930,6 @@ wheels = [
 
 [[package]]
 name = "svtplay-arr"
-version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "defusedxml" },
