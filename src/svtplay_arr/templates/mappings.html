@@ -225,12 +225,13 @@
 <p class="help">The <strong>SVT check</strong> column is the background
 check's last word on each row, collected on its own slow loop &mdash;
 opening this page never asks SVT anything, and <strong>Check</strong>
-re-tests one row right now. <em>Resolves</em> means the slug still returns
-episodes; it does not mean the mapping points at the right show, which only
-you can tell. <em>Resolves nothing</em> is the case in between and the one
-worth reading: the slug returns a full episode list, and none of those
-episodes can ever be matched to an episode Sonarr has, so the row has never
-grabbed anything.</p>
+re-tests one row right now &mdash; both halves, the slug and whether its
+episodes can match anything Sonarr has. <em>Resolves</em> means the slug
+still returns episodes; it does not mean the mapping points at the right
+show, which only you can tell. <em>Resolves nothing</em> is the case in
+between and the one worth reading: the slug returns a full episode list,
+and none of those episodes can ever be matched to an episode Sonarr has, so
+the row has never grabbed anything.</p>
 {% endif %}
 {% if auto_rows %}
 {# Only when at least one badge is actually on the page. An explanation

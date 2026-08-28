@@ -14,6 +14,11 @@ from svtplay_arr.api.config_ui import VIEWS, build_config_router
 from svtplay_arr.config import SETTING_FIELDS, Settings
 from svtplay_arr.mappings import MappingTable, add_mapping
 from svtplay_arr.models import SonarrEpisode, SvtEpisode, SvtSearchHit
+from svtplay_arr.sonarr import (
+    REASON_MESSAGES,
+    REASON_REFUSED,
+    SonarrApiError,
+)
 from svtplay_arr.svt.client import SvtApiError, derive_slug
 
 TITLE = "Gift vid första ögonkastet"
@@ -68,6 +73,12 @@ class FakeSonarr:
     async def episodes(self, series_id):
         self.episode_calls.append(series_id)
         return self._episodes.get(series_id, [])
+
+    async def series_id_for_tvdb(self, tvdb_id):
+        for entry in self.series:
+            if entry.get("tvdbId") == tvdb_id:
+                return entry.get("id")
+        return None
 
 
 def _paths(tmp_path: Path):
@@ -140,12 +151,23 @@ def _error_text(html: str) -> str:
     return m.group(1)
 
 
+# The fixture mapping's series, as Sonarr would list it. The default
+# library carries it so that a Check against the fixture row is a check
+# against a Sonarr that has heard of the series -- otherwise every default
+# client would exercise the "Sonarr has no such series" finding, which is
+# its own test rather than the backdrop for everyone else's.
+SONARR_SERIES_ID = 7
+_DEFAULT_SERIES = [{"tvdbId": 288649, "id": SONARR_SERIES_ID}]
+
+
 def _client(tmp_path: Path, svt=None, sonarr=None, **providers) -> TestClient:
     cfg, maps = _paths(tmp_path)
     app = FastAPI()
     app.include_router(
         build_config_router(
-            cfg, maps, svt or FakeSvt(), sonarr or FakeSonarr(), **providers
+            cfg, maps, svt or FakeSvt(),
+            sonarr if sonarr is not None else FakeSonarr(series=_DEFAULT_SERIES),
+            **providers,
         )
     )
     return TestClient(app)
@@ -2473,6 +2495,233 @@ def test_check_reports_episodes_found(tmp_path: Path):
     assert "does not confirm this mapping points at the right show" in r.text
 
 
+# --- Check answers the question the operator means ---------------------
+#
+# Until 2026-08-28 this control answered only "does the slug still return
+# episodes". A mapping can pass that on every press of its life and never
+# produce a grab: `uppdrag-granskning` returns 61, none of which carries an
+# ordinal, so the resolver refuses every one. So an operator who saw "this
+# mapping resolves nothing" on the page and pressed Check on that very row
+# to investigate was told *SVT lists 61 episodes for it* -- two surfaces,
+# one mapping, opposite answers, and the reassuring one was the one they
+# asked for directly.
+
+
+def _dated_episodes(n: int, published: date) -> list[SvtEpisode]:
+    """SVT episodes that carry everything `episode_matches` needs."""
+    return [
+        SvtEpisode(
+            svt_id=f"ep{i}", title=f"{i}. Episode", url=f"/video/ep{i}/s/avsnitt-{i}",
+            ordinal=i, published=published, available=True, duration_s=1800,
+        )
+        for i in range(1, n + 1)
+    ]
+
+
+def _sonarr_episodes(n: int, air_date: date) -> list[SonarrEpisode]:
+    return [
+        SonarrEpisode(
+            series_id=SONARR_SERIES_ID, season=1, episode=i,
+            air_date=air_date, title="TBA",
+        )
+        for i in range(1, n + 1)
+    ]
+
+
+def _matching_sonarr(episodes) -> "FakeSonarr":
+    return FakeSonarr(
+        series=_DEFAULT_SERIES, episodes={SONARR_SERIES_ID: episodes}
+    )
+
+
+def test_check_says_so_when_the_slug_works_and_the_mapping_cannot_match(
+    tmp_path: Path,
+):
+    # The `uppdrag-granskning` shape: a full episode list, and not one of
+    # them carrying an episode number.
+    numberless = [
+        SvtEpisode(
+            svt_id=f"ep{i}", title="Ett reportage", url=f"/video/ep{i}/ug/x",
+            ordinal=None, published=date(2026, 8, 20), available=True,
+            duration_s=1800,
+        )
+        for i in range(3)
+    ]
+    client = _client(
+        tmp_path, svt=FakeSvt(episodes=numberless),
+        sonarr=_matching_sonarr(_sonarr_episodes(3, date(2026, 8, 20))),
+    )
+
+    payload = client.post(
+        "/config/mappings/288649/check", headers={"Accept": "application/json"}
+    ).json()
+
+    assert payload["outcome"] == "resolves_nothing"
+    assert payload["css_class"] == "warn"
+    assert payload["resolves"] is False
+    assert payload["unresolvable_reason"] == "no_ordinals"
+    # The finding leads. An operator who reads the first sentence and stops
+    # must not come away reassured -- which is the whole defect this closes.
+    assert payload["message"].startswith("This mapping can never match")
+    # ...and the slug fact is still there, as the reason it was invisible.
+    assert "3 episode" in payload["message"]
+
+
+def test_check_and_the_page_cannot_disagree_about_one_mapping(tmp_path: Path):
+    # The two surfaces are one function apart -- `canary.check_resolvability`
+    # -- so the row's verdict and the button's verdict are the same
+    # sentence, not two renderings of a shared intention.
+    from svtplay_arr.canary import resolvability
+
+    numberless = [
+        SvtEpisode(
+            svt_id=f"ep{i}", title="Ett reportage", url=f"/video/ep{i}/ug/x",
+            ordinal=None, published=date(2026, 8, 20), available=True,
+            duration_s=1800,
+        )
+        for i in range(3)
+    ]
+    sonarr_eps = _sonarr_episodes(3, date(2026, 8, 20))
+    client = _client(
+        tmp_path, svt=FakeSvt(episodes=numberless),
+        sonarr=_matching_sonarr(sonarr_eps),
+    )
+    payload = client.post(
+        "/config/mappings/288649/check", headers={"Accept": "application/json"}
+    ).json()
+
+    background = resolvability(
+        numberless, sonarr_eps, slug="gift-vid-forsta-ogonkastet",
+        tolerance_days=Settings.air_date_tolerance_days,
+        today=date(2026, 8, 27),
+    )
+    assert background.note in payload["message"]
+    assert payload["unresolvable_reason"] == background.reason
+
+
+def test_check_confirms_the_matching_half_when_it_does_resolve(tmp_path: Path):
+    client = _client(
+        tmp_path, svt=FakeSvt(episodes=_dated_episodes(3, date(2026, 8, 20))),
+        sonarr=_matching_sonarr(_sonarr_episodes(3, date(2026, 8, 20))),
+    )
+
+    payload = client.post(
+        "/config/mappings/288649/check", headers={"Accept": "application/json"}
+    ).json()
+
+    assert payload["outcome"] == "found"
+    assert payload["css_class"] == "notice"
+    assert payload["resolves"] is True
+    assert "matching episode on SVT" in payload["message"]
+    # The old caveat survives: a slug that resolves is still not a mapping
+    # that points at the right show.
+    assert "does not confirm this mapping points at the right show" in (
+        payload["message"]
+    )
+
+
+def test_check_reports_a_series_sonarr_does_not_have(tmp_path: Path):
+    client = _client(
+        tmp_path, svt=FakeSvt(episodes=_dated_episodes(3, date(2026, 8, 20))),
+        sonarr=FakeSonarr(series=[]),
+    )
+
+    payload = client.post(
+        "/config/mappings/288649/check", headers={"Accept": "application/json"}
+    ).json()
+
+    assert payload["outcome"] == "resolves_nothing"
+    assert payload["unresolvable_reason"] == "not_in_sonarr"
+    assert "288649" in payload["message"]
+
+
+def test_check_does_not_read_as_an_all_clear_when_sonarr_cannot_be_asked(
+    tmp_path: Path,
+):
+    class DeadSonarr:
+        series = []
+
+        async def all_series(self):
+            raise SonarrApiError(
+                REASON_MESSAGES[REASON_REFUSED], reason=REASON_REFUSED
+            )
+
+        async def series_id_for_tvdb(self, tvdb_id):
+            raise SonarrApiError(
+                REASON_MESSAGES[REASON_REFUSED], reason=REASON_REFUSED
+            )
+
+    client = _client(
+        tmp_path, svt=FakeSvt(episodes=_dated_episodes(3, date(2026, 8, 20))),
+        sonarr=DeadSonarr(),
+    )
+
+    payload = client.post(
+        "/config/mappings/288649/check", headers={"Accept": "application/json"}
+    ).json()
+
+    assert payload["outcome"] == "match_unchecked"
+    assert payload["css_class"] == "warn"
+    assert payload["resolves"] is None
+    assert "was not settled" in payload["message"]
+    assert REASON_MESSAGES[REASON_REFUSED] in payload["message"]
+    # This module's own words and Sonarr's fixed literals only.
+    assert "SECRET-KEY-VALUE" not in payload["message"]
+
+
+def test_check_says_plainly_when_there_is_nothing_to_compare_yet(
+    tmp_path: Path,
+):
+    # A series between seasons, or one Sonarr has only just added. Not a
+    # finding, and deliberately not coloured as one -- a control that cried
+    # wolf here would be the same noise the finding exists to avoid, on the
+    # button the operator pressed on purpose. It still says so plainly.
+    client = _client(
+        tmp_path, svt=FakeSvt(episodes=_dated_episodes(3, date(2026, 8, 20))),
+        sonarr=_matching_sonarr([]),
+    )
+
+    payload = client.post(
+        "/config/mappings/288649/check", headers={"Accept": "application/json"}
+    ).json()
+
+    assert payload["outcome"] == "found"
+    assert payload["css_class"] == "notice"
+    assert payload["resolves"] is None
+    assert "was not settled" in payload["message"]
+    assert "no aired episode" in payload["message"]
+
+
+def test_a_failed_slug_check_costs_no_sonarr_request(tmp_path: Path):
+    # There is nothing to compare, so asking Sonarr would spend a request
+    # to learn nothing.
+    sonarr = _matching_sonarr(_sonarr_episodes(3, date(2026, 8, 20)))
+    _client(tmp_path, svt=FakeSvt(episodes=[]), sonarr=sonarr).post(
+        "/config/mappings/288649/check"
+    )
+
+    assert sonarr.episode_calls == []
+
+
+def test_check_still_writes_nothing_with_the_matching_half(tmp_path: Path):
+    # `FakeSonarr` offers only `all_series`, `episodes` and
+    # `series_id_for_tvdb` -- all GETs -- so a check that reached for a
+    # write path fails with an AttributeError.
+    client = _client(
+        tmp_path, svt=FakeSvt(episodes=_dated_episodes(3, date(2026, 8, 20))),
+        sonarr=_matching_sonarr(_sonarr_episodes(3, date(2026, 8, 20))),
+    )
+    watched = (tmp_path / "config.yaml", tmp_path / "mappings.yaml")
+    before = {
+        path: (path.stat().st_mtime, path.read_bytes()) for path in watched
+    }
+    client.post("/config/mappings/288649/check")
+
+    assert {
+        path: (path.stat().st_mtime, path.read_bytes()) for path in watched
+    } == before
+
+
 def test_check_reports_nothing_found(tmp_path: Path):
     svt = FakeSvt(episodes=[])
     r = _client(tmp_path, svt=svt).post("/config/mappings/288649/check")
@@ -2538,6 +2787,14 @@ def test_the_check_css_classes_mean_what_the_page_says_they_mean():
         "not_found": "warn",  # .warn -- ⚠, caution colours
         "error": "error",  # .error -- ✕, failure colours
         "unknown_mapping": "error",
+        # The slug resolves and the mapping still cannot produce a grab.
+        # Amber, not red: one dead row does not stop anything else
+        # working, and in the no-ordinal case there is nothing to fix.
+        "resolves_nothing": "warn",
+        # The slug resolves and Sonarr could not be asked about the rest.
+        # Amber, because the one thing it must not do is read as an
+        # all-clear about a question nobody answered.
+        "match_unchecked": "warn",
     }
 
 
@@ -2690,8 +2947,13 @@ def test_the_js_check_response_is_json_not_a_page(tmp_path: Path):
     assert r.status_code == 200
     assert r.headers["content-type"].startswith("application/json")
     assert "<h2>Mappings</h2>" not in r.text
+    # An exact set, so a payload that grew a field nobody meant to expose
+    # -- an episode list, a Sonarr URL -- fails here rather than reaching
+    # the browser. `resolves` and `unresolvable_reason` are the matching
+    # half's machine-readable verdict, added deliberately.
     assert set(r.json()) == {
         "tvdb_id", "outcome", "css_class", "episode_count", "message",
+        "resolves", "unresolvable_reason",
     }
 
 
@@ -2730,10 +2992,10 @@ def test_check_json_and_html_paths_agree_is_not_vacuous(tmp_path: Path, monkeypa
 
     async def _flaky_check_slug(svt, slug):
         calls["n"] += 1
-        result = await real_check_slug(svt, slug)
+        result, episodes = await real_check_slug(svt, slug)
         if calls["n"] == 2:
             result = {**result, "message": result["message"] + " (mutated)"}
-        return result
+        return result, episodes
 
     monkeypatch.setattr(config_ui_module, "_check_slug", _flaky_check_slug)
 

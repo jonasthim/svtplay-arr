@@ -17,10 +17,17 @@ Contains no matching logic and no SVT knowledge: it calls SvtClient and
 SonarrClient the same way `discovery.sweep_for_mappings` does. That seam is
 what makes it impossible for a UI change to alter what gets grabbed.
 
-Two controls here make live SVT calls, both strictly on demand and never on
-a page render. The per-mapping Check control (`_check_slug`,
+Two controls here make live calls, both strictly on demand and never on a
+page render. The per-mapping Check control (`_check_slug`, `_check_match`,
 `_check_context`, `check_mapping`) calls `svt.list_episodes(slug)` the same
-way `Resolver` does, and writes nothing. The Find mappings sweep
+way `Resolver` does, and then asks the same question `Resolver` asks next:
+can those episodes match any of Sonarr's? That second half is
+`canary.check_resolvability`, shared verbatim with the background check, so
+this control and the verdict rendered beside it on the page cannot answer
+the same question differently -- it used to answer only the slug half, and
+so told an operator investigating "this mapping resolves nothing" that SVT
+lists 61 episodes for it. It writes nothing: three read-only GETs. The Find
+mappings sweep
 (`discover`) searches SVT for each unmapped series and then reads the
 episode lists of the few candidates it finds -- the same `list_episodes`
 call, and it is the one route that writes without a per-row confirmation.
@@ -32,6 +39,7 @@ of its own, here as everywhere else.
 import asyncio
 import logging
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, Request
@@ -47,6 +55,11 @@ from svtplay_arr.config import (
     grouped_setting_fields,
     save_settings,
     setting_defaults,
+)
+from svtplay_arr.canary import (
+    UNDETERMINED_SONARR_UNAVAILABLE,
+    Resolvability,
+    check_resolvability,
 )
 from svtplay_arr.discovery import sweep_for_mappings
 from svtplay_arr.mappings import (
@@ -116,7 +129,25 @@ _CHECK_CSS_CLASS = {
     "not_found": "warn",
     "error": "error",
     "unknown_mapping": "error",
+    # The slug resolves and the mapping still cannot produce a grab. Amber
+    # rather than red for the same reason the finding is amber everywhere
+    # else: one dead row does not stop anything else working, and in the
+    # no-ordinal case there is nothing to fix, so a red result would be
+    # permanent -- see DEGRADED_STATES in canary.py.
+    "resolves_nothing": "warn",
+    # The slug resolves and the other half could not be answered, because
+    # Sonarr could not be asked. Amber, because the one thing this result
+    # must never do is read as an all-clear about a question nobody
+    # answered.
+    "match_unchecked": "warn",
 }
+
+# How long the Check control waits on Sonarr for the matching half. Well
+# short of a browser's patience, and short of the SVT half's own timeout
+# budget: an operator pressing Check on a page that is already telling them
+# something is wrong should not be left staring at a spinner because Sonarr
+# is the thing that is wrong.
+_CHECK_SONARR_TIMEOUT_S = 15.0
 
 # The same idea for the Sonarr Test connection control: one dict, read by
 # both the no-JS full-page re-render and the JSON the fetch consumes, so
@@ -136,8 +167,8 @@ _SONARR_TEST_CSS_CLASS = {
 _SONARR_TEST_TIMEOUT_S = 10.0
 
 
-async def _check_slug(svt, slug: str) -> dict:
-    """The one computation behind the per-mapping Check control.
+async def _check_slug(svt, slug: str) -> tuple[dict, list | None]:
+    """The SVT half of the per-mapping Check control.
 
     Both of its response paths -- the no-JS form POST that re-renders the
     whole page, and the JS fetch that patches just one row -- call this and
@@ -164,6 +195,14 @@ async def _check_slug(svt, slug: str) -> dict:
     permanently wrong filename in the library once Sonarr imports from it.
     The message says so explicitly; nothing here is worded as "this
     mapping is correct".
+
+    Returns the result *and* the episodes it read, or `None` for the
+    episodes when there are none to compare. The list is what
+    `_check_context` hands to `canary.check_resolvability` for the other
+    half of the answer, and it is deliberately kept out of the result dict:
+    that dict is serialised straight to JSON for the page's fetch, and a
+    list of dataclasses in it would be a 500 on the one control an operator
+    presses when something is already wrong.
     """
     try:
         episodes = await svt.list_episodes(slug)
@@ -180,13 +219,13 @@ async def _check_slug(svt, slug: str) -> dict:
                     "or rule out anything about whether the mapping "
                     "otherwise points at the right show."
                 ),
-            }
+            }, None
         return {
             "outcome": "error",
             "css_class": _CHECK_CSS_CLASS["error"],
             "episode_count": None,
             "message": f"SVT could not be checked: {exc}",
-        }
+        }, None
     except Exception as exc:
         # Not documented to raise anything else, but a check must not be
         # the one route that can 500 -- see the module's "never a 500" rule.
@@ -196,7 +235,7 @@ async def _check_slug(svt, slug: str) -> dict:
             "css_class": _CHECK_CSS_CLASS["error"],
             "episode_count": None,
             "message": f"SVT could not be checked: {exc}",
-        }
+        }, None
 
     if not episodes:
         return {
@@ -221,7 +260,7 @@ async def _check_slug(svt, slug: str) -> dict:
                 "undocumented SVT API, and a change at their end can empty "
                 "this result for slugs that are all perfectly correct."
             ),
-        }
+        }, None
 
     n = len(episodes)
     return {
@@ -236,7 +275,7 @@ async def _check_slug(svt, slug: str) -> dict:
             "title and an episode against Sonarr yourself before trusting "
             "this mapping."
         ),
-    }
+    }, list(episodes)
 
 
 async def _sonarr_test(
@@ -1085,18 +1124,98 @@ def build_config_router(
             },
         )
 
-    async def _check_context(tvdb_id: int) -> dict:
-        """Look up the mapping for `tvdb_id` and run `_check_slug` on it.
+    async def _check_match(mapping, episodes) -> Resolvability:
+        """Can this mapping actually produce a grab? Never raises.
 
-        The one thing standing between the route handlers and `_check_slug`:
-        it turns a path parameter into the slug that function wants, and
+        The verdict is `canary.check_resolvability` -- the *same* function
+        the background check calls -- so this control and the finding
+        rendered beside it on the page cannot answer the same question
+        differently. All that happens here is the one series lookup
+        `Resolver.resolve` also makes, guarded and bounded.
+
+        Read-only: `series_id_for_tvdb` and `episodes` are both GETs.
+        """
+        try:
+            series_id = await asyncio.wait_for(
+                sonarr.series_id_for_tvdb(mapping.tvdb_id),
+                timeout=_CHECK_SONARR_TIMEOUT_S,
+            )
+        except TimeoutError:
+            return Resolvability(
+                None,
+                UNDETERMINED_SONARR_UNAVAILABLE,
+                f"Sonarr did not answer within {_CHECK_SONARR_TIMEOUT_S:g}s.",
+            )
+        except SonarrApiError as exc:
+            # One of sonarr.REASON_MESSAGES: a fixed literal carrying no
+            # URL and no API key. See that module's docstring.
+            return Resolvability(
+                None, UNDETERMINED_SONARR_UNAVAILABLE, str(exc)
+            )
+        except Exception:
+            # This module's own words, not the exception's -- an
+            # unexpected type must not be able to smuggle anything onto
+            # the page it is rendered on.
+            log.warning(
+                "could not look up the Sonarr series for tvdb_id %s while "
+                "checking a mapping", mapping.tvdb_id, exc_info=True,
+            )
+            return Resolvability(
+                None,
+                UNDETERMINED_SONARR_UNAVAILABLE,
+                "Sonarr's series list could not be read. Check "
+                "svtplay-arr's log.",
+            )
+        return await check_resolvability(
+            sonarr,
+            episodes,
+            tvdb_id=mapping.tvdb_id,
+            series_id=series_id,
+            slug=mapping.svt_slug,
+            # The tolerance the service actually booted with, so this
+            # answers at the same air-date window the resolver will later
+            # match at. A router built without `booted` (as tests do)
+            # falls back to `Settings`' own default rather than to a
+            # literal of its own -- the same rule the sweep follows.
+            tolerance_days=_check_tolerance(),
+            today=datetime.now(timezone.utc).date(),
+            timeout_s=_CHECK_SONARR_TIMEOUT_S,
+        )
+
+    def _check_tolerance() -> int:
+        configured = getattr(booted, "air_date_tolerance_days", None)
+        return (
+            Settings.air_date_tolerance_days if configured is None
+            else configured
+        )
+
+    async def _check_context(tvdb_id: int) -> dict:
+        """Look up the mapping for `tvdb_id` and check it, both halves.
+
+        The one thing standing between the route handlers and the check:
+        it turns a path parameter into the mapping the check wants, and
         handles the two ways that lookup itself can fail (an unreadable/
-        invalid mappings.yaml, or a `tvdb_id` with no mapping) -- neither of
-        which is a reason to call SVT, so this is also where "there is
+        invalid mappings.yaml, or a `tvdb_id` with no mapping) -- neither
+        of which is a reason to call SVT, so this is also where "there is
         nothing to check" is decided before any network call happens.
 
-        Never raises, for the same reason as `_check_slug`: a check must
-        never turn into a 500.
+        **Two halves, because the slug half alone reads as an all-clear.**
+        Until 2026-08-28 this control answered only "does the slug still
+        return episodes". A mapping can pass that on every press of its
+        life and never produce a single grab -- `uppdrag-granskning`
+        returns 61 episodes, none carrying an ordinal, so every one is
+        refused. So an operator who saw "this mapping resolves nothing" on
+        the page and pressed Check on that very row to investigate was
+        told *SVT lists 61 episodes for slug 'uppdrag-granskning'*: two
+        surfaces, one mapping, opposite answers, and the reassuring one
+        was the one they asked for directly.
+
+        That is the same defect shape as a Status view reading an
+        unreadable canary as "nothing failing", and it is closed by
+        sharing `canary.check_resolvability` rather than by wording -- two
+        implementations of one verdict can drift, a shared one cannot.
+
+        Never raises: a check must never turn into a 500.
         """
         try:
             mapping = MappingTable.load(mappings_path).for_tvdb(tvdb_id)
@@ -1110,6 +1229,8 @@ def build_config_router(
                 "outcome": "error",
                 "css_class": _CHECK_CSS_CLASS["error"],
                 "episode_count": None,
+                "resolves": None,
+                "unresolvable_reason": None,
                 "message": f"could not check: {mappings_path} is invalid: {exc}",
             }
         if mapping is None:
@@ -1118,10 +1239,75 @@ def build_config_router(
                 "outcome": "unknown_mapping",
                 "css_class": _CHECK_CSS_CLASS["unknown_mapping"],
                 "episode_count": None,
+                "resolves": None,
+                "unresolvable_reason": None,
                 "message": f"No mapping exists for tvdb_id {tvdb_id}.",
             }
-        result = await _check_slug(svt, mapping.svt_slug)
-        return {"tvdb_id": tvdb_id, **result}
+        result, episodes = await _check_slug(svt, mapping.svt_slug)
+        # Tri-state, and present on every result so nothing rendering this
+        # has to tell a missing key from an unanswered question.
+        result = {
+            "tvdb_id": tvdb_id,
+            "resolves": None,
+            "unresolvable_reason": None,
+            **result,
+        }
+        if episodes is None:
+            # The slug half already failed. There is nothing to compare,
+            # and asking Sonarr would cost a request to learn nothing.
+            return result
+        return {**result, **_folded(await _check_match(mapping, episodes), result)}
+
+    def _folded(verdict: Resolvability, result: dict) -> dict:
+        """Fold the matching verdict into the slug half's result.
+
+        One place, so the JSON and the rendered page cannot describe the
+        same verdict differently, and so the colour and the wording are
+        decided together rather than by two branches that can disagree
+        about which is worse.
+        """
+        if verdict.is_finding:
+            return {
+                "outcome": "resolves_nothing",
+                "css_class": _CHECK_CSS_CLASS["resolves_nothing"],
+                "resolves": False,
+                "unresolvable_reason": verdict.reason,
+                # The finding leads. The slug fact follows as the reason
+                # this was invisible, rather than as the headline it used
+                # to be -- an operator who pressed Check on a row already
+                # flagged as resolving nothing must not read the first
+                # sentence and stop.
+                "message": (
+                    f"{verdict.note} The slug itself is fine -- SVT lists "
+                    f"{result['episode_count']} episode"
+                    f"{'s' if result['episode_count'] != 1 else ''} for it "
+                    "-- which is exactly why this is invisible from the "
+                    "slug alone."
+                ),
+            }
+        if verdict.resolves:
+            return {
+                "resolves": True,
+                "message": f"{result['message']} {verdict.note}",
+            }
+        # Undetermined. Sonarr not answering is a real gap and is coloured
+        # as one; "nothing to compare yet" is not -- a control that cried
+        # wolf over a series between seasons would be the same noise this
+        # finding exists to avoid, on the button the operator pressed on
+        # purpose. Either way the sentence says plainly that the second
+        # half was not settled, so neither reads as an all-clear.
+        unchecked = verdict.reason == UNDETERMINED_SONARR_UNAVAILABLE
+        return {
+            "outcome": "match_unchecked" if unchecked else result["outcome"],
+            "css_class": (
+                _CHECK_CSS_CLASS["match_unchecked"] if unchecked
+                else result["css_class"]
+            ),
+            "message": (
+                f"{result['message']} Whether its episodes can actually "
+                f"match anything Sonarr has was not settled: {verdict.note}"
+            ),
+        }
 
     # `/config` keeps serving the entry point it always did; what changed
     # is which view it is. It is documented, deployed and the published SSO
