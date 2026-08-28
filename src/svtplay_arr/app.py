@@ -125,10 +125,21 @@ def create_app(settings: Settings) -> FastAPI:
     # The interval is floored at a minute: config.yaml is hand-editable, and
     # `svt_canary_interval_minutes: 0` would otherwise become a loop firing
     # at SVT's unofficial API as fast as it can answer.
+    #
+    # It is handed the *same* `sonarr_client` the resolver matches against,
+    # and the tolerance the resolver matches at, for its second question:
+    # can each mapping's episodes match anything Sonarr has? A mapping can
+    # be perfectly valid -- right slug, full episode list -- and still
+    # resolve nothing forever, which the SVT half cannot see because from
+    # its side that is a perfect pass. Only `all_series` and `episodes` are
+    # called, both read-only; a Sonarr that is down leaves that half
+    # undetermined and cannot affect the SVT half or this page.
     canary = SvtCanary(
         mapping_table.all,
         svt_client,
+        sonarr_client,
         interval_s=max(1, settings.svt_canary_interval_minutes) * 60.0,
+        tolerance_days=settings.air_date_tolerance_days,
     )
     # ...and the one thing that knows whether Sonarr is still there. Same
     # gap, on the dependency that matters more: without Sonarr's air dates

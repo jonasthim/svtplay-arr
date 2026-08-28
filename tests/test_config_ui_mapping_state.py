@@ -76,6 +76,9 @@ def _state(**over) -> dict:
         "last_error": None,
         "last_error_at": None,
         "last_error_age_s": None,
+        "resolves": None,
+        "unresolvable_reason": None,
+        "resolvability_note": None,
     }
     row.update(over)
     return row
@@ -499,3 +502,172 @@ def test_no_state_provider_is_not_reported_as_a_failed_read(tmp_path: Path):
     body = _text(_client(tmp_path, states=None).get("/config").text)
 
     assert "could not be read" not in body
+
+
+# --- The row that resolves nothing -------------------------------------
+#
+# A mapping whose slug works, whose episode list is full, and none of whose
+# episodes can ever be matched to an episode Sonarr has. `Resolves` would
+# be true of it and deeply misleading, because the thing it is true about
+# is not the thing the operator wants to know.
+
+NOTE = (
+    "This mapping can never match anything. SVT lists 61 available "
+    "episodes and not one of them carries an episode number."
+)
+
+
+def test_a_row_that_can_never_match_says_so_instead_of_resolves(
+    tmp_path: Path,
+):
+    row = _text(_row(
+        _client(tmp_path, states=[_state(
+            ok=True, resolves=False, unresolvable_reason="no_ordinals",
+            resolvability_note=NOTE,
+        )]).get("/config/mappings").text
+    ))
+
+    assert "Resolves nothing" in row
+    assert NOTE in row
+    # ...and it does not also claim the reassuring thing.
+    assert "12 episodes" not in row
+
+
+def test_the_row_that_can_never_match_is_amber_and_not_red(tmp_path: Path):
+    # Same urgency as the ended-show case: the rest of the feed works, and
+    # in the no-ordinal case there is nothing to fix, so a red row would be
+    # permanent by construction -- which is how a marker stops being read.
+    row = _row(
+        _client(tmp_path, states=[_state(
+            ok=True, resolves=False, unresolvable_reason="no_ordinals",
+            resolvability_note=NOTE,
+        )]).get("/config/mappings").text
+    )
+
+    assert 'class="status-chip warn"' in row
+    assert 'class="status-chip error"' not in row
+
+
+def test_a_row_nothing_is_known_about_still_reads_as_resolving(tmp_path: Path):
+    # `resolves: None` is "not determined this round" -- a Sonarr outage, a
+    # brand-new series, a show whose episodes are all upcoming. It is not a
+    # finding and must not be rendered as one.
+    row = _text(_row(
+        _client(tmp_path, states=[_state(ok=True, resolves=None)])
+        .get("/config/mappings").text
+    ))
+
+    assert "Resolves nothing" not in row
+    assert "Resolves" in row
+
+
+def test_a_state_row_from_before_this_check_existed_still_renders(
+    tmp_path: Path,
+):
+    # The provider is a seam. A row with no `resolves` key at all must
+    # render as the SVT check alone rather than raise into a 500 on the one
+    # page an operator opens when something is already wrong.
+    old = _state(ok=True)
+    del old["resolves"]
+    del old["resolvability_note"]
+
+    r = _client(tmp_path, states=[old]).get("/config/mappings")
+
+    assert r.status_code == 200
+    # The row, not the whole page: the explanatory note beneath the table
+    # names both states, so a body-wide assertion would pass on the note.
+    assert "Resolves nothing" not in _row(r.text)
+
+
+# --- ...and the banner above it ----------------------------------------
+
+
+def _unresolvable(**over) -> dict:
+    row = {
+        "tvdb_id": TVDB, "series_title": TITLE,
+        "svt_slug": "gift-vid-forsta-ogonkastet",
+        "reason": "no_ordinals", "note": NOTE,
+    }
+    row.update(over)
+    return row
+
+
+def test_the_banner_names_the_show_and_says_why(tmp_path: Path):
+    cfg, maps = _paths(tmp_path)
+    app = FastAPI()
+    app.include_router(
+        build_config_router(
+            cfg, maps, FakeSvt(), FakeSonarr(),
+            status_provider=lambda: _sample_health(_sample_svt(
+                state="unresolvable", needs_attention=True,
+                unresolvable=1, unresolvable_series=[_unresolvable()],
+            )),
+        )
+    )
+    body = TestClient(app).get("/config").text
+
+    assert "resolves nothing" in _text(body).lower()
+    assert TITLE in body
+    assert NOTE in _text(body)
+
+
+def test_a_failing_row_and_an_unresolvable_row_are_both_reported(
+    tmp_path: Path,
+):
+    # `state` is one word and can only name one shape, so the banner for
+    # this finding is keyed on its own count rather than on the state --
+    # otherwise a row that fails on SVT would hide a *different* row that
+    # returns a perfect episode list nothing can ever match.
+    cfg, maps = _paths(tmp_path)
+    app = FastAPI()
+    app.include_router(
+        build_config_router(
+            cfg, maps, FakeSvt(), FakeSonarr(),
+            status_provider=lambda: _sample_health(_sample_svt(
+                state="series", needs_attention=True, checked=2, failing=1,
+                failing_series=[{
+                    "tvdb_id": 99, "series_title": "Another Show",
+                    "svt_slug": "another-show", "error": "404 not found",
+                }],
+                unresolvable=1, unresolvable_series=[_unresolvable()],
+            )),
+        )
+    )
+    text = _text(TestClient(app).get("/config").text)
+
+    assert "Another Show" in text
+    assert TITLE in text
+    assert NOTE in text
+
+
+def test_the_banner_stays_away_when_every_mapping_can_match(tmp_path: Path):
+    cfg, maps = _paths(tmp_path)
+    app = FastAPI()
+    app.include_router(
+        build_config_router(
+            cfg, maps, FakeSvt(), FakeSonarr(),
+            status_provider=lambda: _sample_health(_sample_svt()),
+        )
+    )
+    text = _text(TestClient(app).get("/config").text)
+
+    assert "resolves nothing" not in text.lower()
+
+
+def test_a_status_dict_from_before_this_check_still_renders(tmp_path: Path):
+    # Same seam as the row above, one level up: a status_provider that
+    # predates these keys renders the rest of the strip rather than
+    # failing.
+    svt = _sample_svt()
+    cfg, maps = _paths(tmp_path)
+    app = FastAPI()
+    app.include_router(
+        build_config_router(
+            cfg, maps, FakeSvt(), FakeSonarr(),
+            status_provider=lambda: _sample_health(svt),
+        )
+    )
+    r = TestClient(app).get("/config")
+
+    assert r.status_code == 200
+    assert "unresolvable" not in svt

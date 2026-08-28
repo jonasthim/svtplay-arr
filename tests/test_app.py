@@ -9,10 +9,11 @@ from xml.etree import ElementTree as ET
 
 import httpx
 import pytest
+from markupsafe import escape
 from fastapi.testclient import TestClient
 from svtplay_arr.app import create_app
 from svtplay_arr.config import ConfigError, Settings
-from svtplay_arr.models import Release, SvtEpisode
+from svtplay_arr.models import Release, SonarrEpisode, SvtEpisode
 from svtplay_arr.sonarr import (
     REASON_MESSAGES,
     REASON_REFUSED,
@@ -1224,6 +1225,207 @@ def test_the_mappings_view_never_calls_svt_to_render_that_state(
         c.get("/config")
 
     assert seen == []
+
+
+# --- The mapping that resolves nothing reaches /health and the page ----
+#
+# A mapping can pass every check above -- right slug, HTTP 200, a full
+# episode list -- and still never match anything Sonarr has, which is the
+# one failure the SVT half is structurally unable to see. These are the
+# wiring: one canary, one computation, and both surfaces rendering it.
+
+
+def _sonarr_library(monkeypatch, per_tvdb: dict, *, error=None) -> list[int]:
+    """Point the app's real SonarrClient at a canned library.
+
+    Patched on the class `create_app` constructs, so the canary is
+    exercised through the same client the resolver matches with. Returns
+    the list every requested series id is appended to, which is what pins
+    the request cost.
+    """
+    series_ids = {tvdb: 1000 + tvdb for tvdb in per_tvdb}
+    asked: list[int] = []
+
+    async def _all_series(self):
+        if error is not None:
+            raise error
+        return [{"tvdbId": t, "id": i} for t, i in series_ids.items()]
+
+    async def _episodes(self, series_id):
+        asked.append(series_id)
+        for tvdb, sid in series_ids.items():
+            if sid == series_id:
+                return list(per_tvdb[tvdb])
+        return []
+
+    monkeypatch.setattr("svtplay_arr.sonarr.SonarrClient.all_series", _all_series)
+    monkeypatch.setattr("svtplay_arr.sonarr.SonarrClient.episodes", _episodes)
+    return asked
+
+
+def _sonarr_episode(i: int, air_date: date) -> SonarrEpisode:
+    return SonarrEpisode(
+        series_id=0, season=1, episode=i, air_date=air_date, title="TBA",
+    )
+
+
+def _unmatchable(n: int) -> list[SonarrEpisode]:
+    """Sonarr episodes that have aired and can agree with nothing.
+
+    Same numbers as `_episode`, a year away from its 2026-08-20, so both
+    sides carry real content and no pair of them can ever match.
+    """
+    return [_sonarr_episode(i, date(2025, 8, 20)) for i in range(1, n + 1)]
+
+
+def test_health_reports_a_mapping_that_can_never_resolve(
+    tmp_path: Path, monkeypatch,
+):
+    _mappings_file(tmp_path, (1, "a-show", "A Show"))
+    _svt_returns(monkeypatch, {"a-show": [_episode(1), _episode(2)]})
+    _sonarr_library(monkeypatch, {1: _unmatchable(2)})
+
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as c:
+        _run_a_canary_round(app)
+        body = c.get("/health").json()
+
+    svt = body["svt"]
+    assert svt["unresolvable"] == 1
+    assert svt["unresolvable_series"][0]["series_title"] == "A Show"
+    assert svt["unresolvable_series"][0]["reason"] == "no_air_date"
+    # The SVT half is untouched: the slug resolves and lists episodes.
+    assert svt["failing"] == 0
+    assert svt["episodes_seen"] == 2
+    # Prominent, and not red. One show being inert does not stop anything
+    # else working, and a light that stays red over it is one nobody reads
+    # by the time SVT itself breaks -- see DEGRADED_STATES in canary.py.
+    assert svt["needs_attention"] is True
+    assert svt["degraded"] is False
+    assert body["status"] == "ok"
+
+
+def test_the_page_says_which_mappings_resolve_nothing_and_why(
+    tmp_path: Path, monkeypatch,
+):
+    _mappings_file(tmp_path, (1, "a-show", "A Show"))
+    _svt_returns(monkeypatch, {"a-show": [_episode(1), _episode(2)]})
+    _sonarr_library(monkeypatch, {1: _unmatchable(2)})
+
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as c:
+        _run_a_canary_round(app)
+        page = c.get("/config").text
+        mappings = c.get("/config/mappings").text
+        health = c.get("/health").json()
+
+    assert "resolve" in page and "nothing" in page
+    assert "A Show" in page
+    assert 'class="status-chip warn"' in page
+    # ...and the row itself, on the page that lists the rows.
+    assert "Resolves nothing" in mappings
+    # One computation behind both: the page renders the same note /health
+    # carries rather than deriving a second opinion of it, verbatim. Escaped
+    # the way the template escapes it, so this compares the rendered text
+    # rather than a paraphrase of it.
+    note = str(escape(health["svt"]["unresolvable_series"][0]["note"]))
+    assert note in mappings
+    assert note in page
+
+
+def test_a_mapping_that_resolves_is_not_reported_as_resolving_nothing(
+    tmp_path: Path, monkeypatch,
+):
+    _mappings_file(tmp_path, (1, "a-show", "A Show"))
+    _svt_returns(monkeypatch, {"a-show": [_episode(1), _episode(2)]})
+    _sonarr_library(
+        monkeypatch, {1: [_sonarr_episode(i, date(2026, 8, 20)) for i in (1, 2)]}
+    )
+
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as c:
+        _run_a_canary_round(app)
+        body = c.get("/health").json()
+        page = c.get("/config").text
+
+    assert body["svt"]["state"] == "ok"
+    assert body["svt"]["unresolvable"] == 0
+    assert body["status"] == "ok"
+    assert "resolves nothing" not in page.lower()
+
+
+def test_a_sonarr_outage_degrades_only_the_resolvability_half(
+    tmp_path: Path, monkeypatch,
+):
+    # The SVT half must keep working and the page must keep rendering. The
+    # unresolvable count must not read as a clean sweep, which is what a
+    # bare 0 would look like.
+    _mappings_file(tmp_path, (1, "a-show", "A Show"))
+    _svt_returns(monkeypatch, {"a-show": [_episode(1)]})
+    _sonarr_library(
+        monkeypatch, {1: _unmatchable(1)},
+        error=SonarrApiError(
+            REASON_MESSAGES[REASON_REFUSED], reason=REASON_REFUSED
+        ),
+    )
+
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as c:
+        _run_a_canary_round(app)
+        body = c.get("/health").json()
+        page = c.get("/config").text
+
+    svt = body["svt"]
+    assert svt["state"] == "ok"
+    assert svt["failing"] == 0
+    assert svt["episodes_seen"] == 1
+    assert svt["unresolvable"] == 0
+    assert svt["resolvability_unknown"] == 1
+    assert svt["resolvability_error"] == REASON_MESSAGES[REASON_REFUSED]
+    assert "resolves nothing" not in page.lower()
+    assert "sekrit-sonarr-api-key" not in page
+
+
+def test_the_resolvability_check_costs_one_episode_call_per_mapping(
+    tmp_path: Path, monkeypatch,
+):
+    _mappings_file(tmp_path, (1, "a-show", "A Show"), (2, "b-show", "B Show"))
+    _svt_returns(monkeypatch, {"a-show": [_episode(1)], "b-show": [_episode(1)]})
+    asked = _sonarr_library(
+        monkeypatch, {1: _unmatchable(1), 2: _unmatchable(1)}
+    )
+
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as c:
+        _run_a_canary_round(app)
+        c.get("/config")
+        c.get("/config/mappings")
+        c.get("/health")
+
+    # One per mapping for the round, and not one more for any render: the
+    # page reads what the canary already collected.
+    assert sorted(asked) == [1001, 1002]
+
+
+def test_health_never_exposes_the_api_key_through_the_resolvability_check(
+    tmp_path: Path, monkeypatch,
+):
+    _mappings_file(tmp_path, (1, "a-show", "A Show"))
+    _svt_returns(monkeypatch, {"a-show": [_episode(1)]})
+    _sonarr_library(
+        monkeypatch, {1: _unmatchable(1)},
+        error=RuntimeError("X-Api-Key: sekrit-sonarr-api-key"),
+    )
+
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as c:
+        _run_a_canary_round(app)
+        body = c.get("/health").text
+        page = c.get("/config").text
+        mappings = c.get("/config/mappings").text
+
+    for rendered in (body, page, mappings):
+        assert "sekrit-sonarr-api-key" not in rendered
 
 
 def _set_created_at(tmp_path: Path, nzo_id: str, when: str) -> None:

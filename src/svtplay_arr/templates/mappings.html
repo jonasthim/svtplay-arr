@@ -85,6 +85,16 @@
       {%- elif state.ok is none %}
       <span class="status-chip">Not checked</span>
       <span class="help">Not reached since svtplay-arr started.</span>
+      {%- elif state.ok and state.get('resolves') is false %}
+      {#- The slug works and the episode list is full -- and not one of
+          those episodes can ever match a Sonarr episode, so this row has
+          never grabbed anything and will not start. `Resolves` would be
+          true and deeply misleading here, which is the whole reason this
+          branch sits ahead of it. Amber, not red: the rest of the feed is
+          unaffected, and in the no-ordinal case there is nothing to fix,
+          so a red row would be permanent. #}
+      <span class="status-chip warn">Resolves nothing</span>
+      <span class="help">{{ state.resolvability_note }}</span>
       {%- elif state.ok %}
       <span class="status-chip notice">Resolves</span>
       <span class="help">{{ state.episode_count if state.episode_count is not none else '?' }}
@@ -217,7 +227,10 @@ check's last word on each row, collected on its own slow loop &mdash;
 opening this page never asks SVT anything, and <strong>Check</strong>
 re-tests one row right now. <em>Resolves</em> means the slug still returns
 episodes; it does not mean the mapping points at the right show, which only
-you can tell.</p>
+you can tell. <em>Resolves nothing</em> is the case in between and the one
+worth reading: the slug returns a full episode list, and none of those
+episodes can ever be matched to an episode Sonarr has, so the row has never
+grabbed anything.</p>
 {% endif %}
 {% if auto_rows %}
 {# Only when at least one badge is actually on the page. An explanation

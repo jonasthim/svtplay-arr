@@ -594,6 +594,13 @@
       {%- elif svt.state == 'series' %}
       SVT: {{ svt.failing }} of {{ checked }} mapping{{ '' if checked == 1 else 's' }}
       failing
+      {#- A row that returns a full episode list and can still never match
+          anything Sonarr has. Deliberately worded as "resolves nothing"
+          rather than "failing": the slug works, which is exactly why the
+          check above cannot see it. #}
+      {%- elif svt.state == 'unresolvable' %}
+      SVT: {{ svt.unresolvable }} of {{ checked }} mapping{{ '' if checked == 1 else 's' }}
+      resolve{{ 's' if svt.unresolvable == 1 else '' }} nothing
       {%- elif svt.state == 'unknown' %}
       SVT: not checked yet since restart
       {%- elif svt.state == 'no_mappings' %}
@@ -726,6 +733,38 @@
     {% for f in svt.failing_series %}{{ f.series_title }} ({{ f.svt_slug }}){{ ', '
     if not loop.last }}{% endfor %}{% if svt.failing_series_truncated %}, and
     {{ svt.failing - svt.failing_series | length }} more{% endif %}.
+    {%- endif %}
+  </p>
+  {%- endif %}
+  {#- Its own banner rather than another branch of the chain above, and
+      that is deliberate: a row can fail on SVT while a *different* row
+      returns a perfect episode list nothing can ever match, and the
+      single-word `state` can only name one of those. Keying this on the
+      count instead means both findings are shown when both exist.
+
+      It is the loudest surface this finding gets, because it is the only
+      one: from the feed, from Sonarr, and from the SVT check above, a
+      mapping that resolves nothing is indistinguishable from a series with
+      nothing new. Each row names its own reason -- one is unfixable and
+      one is a wrong mapping or too tight a tolerance, and guessing which
+      is exactly what the operator should not have to do. #}
+  {%- if health.svt and health.svt.unresolvable %}
+  {%- set svt = health.svt %}
+  <p class="warn">
+    <strong>{{ svt.unresolvable }} of your {{ svt.checked }} mapping{{ '' if
+    svt.checked == 1 else 's' }} resolve{{ 's' if svt.unresolvable == 1 else '' }}
+    nothing.</strong> SVT answers for {{ 'it' if svt.unresolvable == 1 else 'them' }}
+    and lists episodes, and Sonarr has aired episodes to match against, but
+    not one pair of them agrees &mdash; so nothing has ever been grabbed for
+    {{ 'this show' if svt.unresolvable == 1 else 'these shows' }} and nothing
+    will be. That looks exactly like a series with nothing new, which is why
+    it is worth saying out loud.
+    {% for u in svt.unresolvable_series %}
+    <br><strong>{{ u.series_title }} ({{ u.svt_slug }})</strong> &mdash; {{ u.note }}
+    {%- endfor %}
+    {%- if svt.unresolvable_series_truncated %}
+    <br>&hellip;and {{ svt.unresolvable - svt.unresolvable_series | length }}
+    more; the <a href="/config/mappings">Mappings</a> table lists every row.
     {%- endif %}
   </p>
   {%- endif %}
