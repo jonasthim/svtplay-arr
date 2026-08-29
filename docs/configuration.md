@@ -217,6 +217,30 @@ directory yourself.
 This database holds only in-flight and completed job rows. Deleting it loses
 Sonarr's view of queue and history, not any downloaded media.
 
+Its schema is versioned (sqlite's `PRAGMA user_version`) and upgraded in place
+on start. Nothing is required of you: a database from an earlier release is
+recognised and kept, never rebuilt, and each upgrade step runs in a transaction
+so a failure leaves the file exactly as it was. The first start after upgrading
+logs one line per step, for example:
+
+```
+job database /var/lib/svtplay-arr/jobs.db: adopted the jobs table already there, now at schema version 1
+migrating the job database to schema version 2
+```
+
+Later starts log nothing, because there is nothing to do.
+
+Downgrading is the one case that stops the service. A database written by a
+newer release is refused rather than written to in a shape this build does not
+understand:
+
+```
+job database at /var/lib/svtplay-arr/jobs.db is at schema version 3, but this build of svtplay-arr understands version 2. It was written by a newer release; nothing has been changed. Upgrade svtplay-arr again, or point svtplay-arr at a database written by this version.
+```
+
+Nothing has been changed and nothing has been lost — reinstalling the newer
+release brings the installation back exactly as it was.
+
 #### `svt_ua`
 
 **Default: `svtplaywebb-play-render-prod-client`.**

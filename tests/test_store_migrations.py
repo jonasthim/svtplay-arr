@@ -463,3 +463,49 @@ def test_two_stores_opening_the_same_database_at_once_migrate_it_once(
     assert len(opened) == 4
     assert _version(db) == store_module.SCHEMA_VERSION
     assert len(_rows(db)) == len(_HISTORY)
+
+
+# --- What the operator sees -------------------------------------------
+
+
+def test_adopting_an_existing_database_says_so_in_the_log(
+    tmp_path: Path, caplog
+):
+    # This happens exactly once per installation, and it is the only moment
+    # an operator can see that their job history was recognised rather than
+    # replaced. A silent upgrade of a database is noticed only by whoever
+    # loses one.
+    db = tmp_path / "jobs.db"
+    _pre_versioning_database(db)
+
+    with caplog.at_level("INFO", logger="svtplay_arr.store"):
+        _store(db)
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("adopted the jobs table already there" in m for m in messages), messages
+    assert any(str(db) in m for m in messages), messages
+    assert any(
+        f"schema version {store_module.SCHEMA_VERSION}" in m for m in messages
+    ), messages
+
+
+def test_a_new_database_says_it_was_created(tmp_path: Path, caplog):
+    db = tmp_path / "jobs.db"
+
+    with caplog.at_level("INFO", logger="svtplay_arr.store"):
+        _store(db)
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("created a new jobs table" in m for m in messages), messages
+
+
+def test_reopening_an_up_to_date_database_logs_nothing(tmp_path: Path, caplog):
+    # Every restart after the first. A line on every start would train the
+    # operator to ignore the one start where it matters.
+    db = tmp_path / "jobs.db"
+    _store(db).close()
+
+    with caplog.at_level("INFO", logger="svtplay_arr.store"):
+        _store(db)
+
+    assert [r.getMessage() for r in caplog.records] == []

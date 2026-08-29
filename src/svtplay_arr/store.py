@@ -35,6 +35,7 @@ corrupt data nothing in this build knows how to read.
 """
 
 import asyncio
+import logging
 import sqlite3
 import threading
 import time
@@ -43,6 +44,8 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from svtplay_arr.models import Job, JobStatus
+
+log = logging.getLogger(__name__)
 
 # Applied to every connection this module opens. It guards against
 # SQLITE_BUSY from contention at the *engine* level -- another connection
@@ -163,7 +166,7 @@ def _has_jobs_table(conn: sqlite3.Connection) -> bool:
     return row is not None
 
 
-def _adopt_baseline(conn: sqlite3.Connection) -> int:
+def _adopt_baseline(conn: sqlite3.Connection, db_path: Path) -> int:
     """Bring an unstamped database up to version 1 without touching rows.
 
     `user_version` 0 means one of two things and they must not be confused:
@@ -180,9 +183,23 @@ def _adopt_baseline(conn: sqlite3.Connection) -> int:
         current = _user_version(conn)
         if current != 0:
             return current
-        if not _has_jobs_table(conn):
+        existing = _has_jobs_table(conn)
+        if not existing:
             conn.execute(_BASELINE_SCHEMA)
         _set_user_version(conn, _BASELINE_VERSION)
+    # Logged at INFO because it happens exactly once per installation and
+    # it is the only moment an operator can see that their existing job
+    # history was recognised rather than replaced. A silent upgrade of a
+    # database is the kind of thing that is only ever noticed by the person
+    # whose history went missing.
+    log.info(
+        "job database %s: %s, now at schema version %d",
+        db_path,
+        "adopted the jobs table already there"
+        if existing
+        else "created a new jobs table",
+        _BASELINE_VERSION,
+    )
     return _BASELINE_VERSION
 
 
@@ -194,6 +211,7 @@ def _apply(conn: sqlite3.Connection, target: int) -> None:
             # version was read before this transaction took the write lock.
             if _user_version(conn) != target - 1:
                 return
+            log.info("migrating the job database to schema version %d", target)
             _MIGRATIONS[target](conn)
             _set_user_version(conn, target)
     except Exception as exc:
@@ -264,7 +282,7 @@ def _prepare_database(db_path: Path) -> None:
                 " point svtplay-arr at a database written by this version."
             )
         if version == 0:
-            version = _adopt_baseline(conn)
+            version = _adopt_baseline(conn, db_path)
         for target in range(version + 1, SCHEMA_VERSION + 1):
             _apply(conn, target)
     finally:
