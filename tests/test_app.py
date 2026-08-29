@@ -1900,3 +1900,68 @@ def test_the_environment_key_never_leaves_for_a_host_the_request_body_names(
         (settings.sonarr_url, "ENV-ONLY-SECRET-NEVER-RENDERED"),
     ]
     assert "ENV-ONLY-SECRET-NEVER-RENDERED" not in away.text
+
+
+# --- Shutdown stops the downloads before it closes the store ----------
+
+
+def test_shutdown_stops_in_flight_downloads_before_closing_the_store(
+    tmp_path: Path, monkeypatch
+):
+    """The lifespan cancelled the worker's poll loop and then closed the job
+    store -- but the downloads that loop had dispatched are separate tasks,
+    and cancelling their parent does nothing to them. They ran on into a
+    closed store and died with a JobStoreError wherever they had got to.
+
+    The bad window is between publishing a finished file into `completed/`
+    and recording it: the file is there for Sonarr to import, the row still
+    says Downloading, the next start fails that row, Sonarr re-grabs the
+    episode, and the first copy is orphaned in the library.
+
+    Asserted at the moment the store is closed rather than on the wreckage
+    afterwards. That window is microseconds wide, so a test that waited for
+    it to be hit would be a coin toss; "no download was still running when
+    the store went away" is the property that closes it, and it is exactly
+    what `Worker.drain` is for.
+    """
+    from svtplay_arr.downloader import FakeDownloader
+    from svtplay_arr.models import JobStatus
+
+    monkeypatch.setattr(
+        "svtplay_arr.app.SvtplayDlDownloader",
+        lambda *a, **k: FakeDownloader(steps=500, total_bytes=100, delay=0.01),
+    )
+    s = _settings(tmp_path)
+    app = create_app(s)
+    store = app.state.job_store
+    job = store.create("a", "stem", "WEBDL-1080p", 100)
+
+    still_running: list[str] = []
+    # The bound method, so the suite's own leak tracking still runs.
+    tracked_close = store.close
+
+    def recording_close():
+        try:
+            still_running.extend(
+                repr(task)
+                for task in asyncio.all_tasks()
+                if not task.done() and "run_job" in repr(task)
+            )
+        except RuntimeError:  # pragma: no cover - close off the loop
+            pass
+        return tracked_close()
+
+    store.close = recording_close
+
+    with TestClient(app) as c:
+        # Wait until the worker has actually picked the job up, or this
+        # would pass by shutting down before anything was in flight.
+        deadline = time.monotonic() + 5
+        while (
+            store.get(job.nzo_id).status is not JobStatus.DOWNLOADING
+            and time.monotonic() < deadline
+        ):
+            c.get("/health")
+        assert store.get(job.nzo_id).status is JobStatus.DOWNLOADING
+
+    assert still_running == [], still_running

@@ -414,16 +414,28 @@ def create_app(settings: Settings) -> FastAPI:
         finally:
             for task, what in tasks:
                 await _stop(task, what)
+            # Stopping the worker's poll loop above does *not* stop the
+            # downloads it dispatched -- those are separate tasks, and
+            # cancelling their parent does nothing to them. Without this
+            # they run on into store.close() below and die with a
+            # JobStoreError wherever they had got to, which in the window
+            # between publishing a file into completed/ and recording it
+            # leaves an imported file behind a row still saying
+            # Downloading. See Worker.drain.
+            await worker.drain()
             await http.aclose()
-            # Last, and deliberately after the worker task has been both
-            # cancelled and awaited above: the worker writes job progress
-            # through this store from its own task, and closing it while
-            # that task was still running would turn its next write into a
-            # JobStoreError. By here nothing holds it -- the routes stopped
-            # being served before shutdown began -- so this is the one point
-            # at which it is safe. It is the app's own store, opened in
-            # create_app and never handed out, so closing it here cannot
-            # surprise another owner.
+            # Last, and deliberately after both the worker's poll task and
+            # its in-flight downloads have been stopped and awaited above:
+            # the worker writes job progress through this store, and
+            # closing it under a write in flight turns that write into a
+            # JobStoreError -- or, before the store's connections carried a
+            # lock of their own, segfaulted the process. It is the app's own
+            # store, opened in create_app and never handed out, so closing
+            # it here cannot surprise another owner.
+            #
+            # Not a proof that nothing can be mid-write: `drain` gives up
+            # after its timeout, and `JobStore.close` is what makes that
+            # safe rather than fatal.
             try:
                 store.close()
             except JobStoreError:

@@ -61,6 +61,19 @@ class Worker:
         # multiplying bandwidth and -- at concurrency > 1 -- letting two
         # duplicates race on the same staging directory.
         self._in_flight: set[str] = set()
+        # The task objects behind those ids. `run_forever` used to create
+        # them and drop the reference, which meant nothing could wait for
+        # them: shutdown cancelled the poll loop, saw it finish, and closed
+        # the job store while a download was still between `_publish()` and
+        # its `complete()` write. That job then died with a JobStoreError,
+        # leaving the file in `completed/` and the row saying Downloading --
+        # so the next start failed it, Sonarr re-grabbed the episode, and
+        # the first copy was orphaned. See `drain`.
+        #
+        # A strong reference is also what stops the event loop garbage
+        # collecting a running task, which asyncio documents and nothing
+        # here was relying on only by luck.
+        self._jobs: set[asyncio.Task] = set()
 
     def sweep_incomplete(self) -> None:
         """Clean up after a crash: drop stale partials AND reconcile the store.
@@ -247,6 +260,40 @@ class Worker:
             raise
         return final
 
+    async def drain(self, timeout: float = 10.0) -> None:
+        """Stop every download this worker started, and wait for it.
+
+        Shutdown cancels the poll loop, but the jobs it dispatched are
+        separate tasks and cancelling their parent does nothing to them.
+        Without this they run on into `store.close()` and die with a
+        JobStoreError at whatever point they had reached -- including the
+        window between publishing a finished file into `completed/` and
+        recording it, which leaves an imported file behind a row that says
+        Downloading. The next start fails that row (correctly, it cannot
+        know), Sonarr re-grabs the episode, and the first copy is orphaned.
+
+        Cancelled rather than awaited to completion: a download runs for
+        as long as a download runs, and shutdown cannot wait for one. A
+        job cancelled mid-download stays Downloading, which is exactly the
+        state `sweep_incomplete` reconciles on the next start -- the
+        documented recovery path, and the same one a power cut takes.
+
+        The remaining window is the few microseconds between `_publish`
+        returning and `complete_async` being dispatched; it was previously
+        the entire length of every download.
+        """
+        if not self._jobs:
+            return
+        jobs = list(self._jobs)
+        for task in jobs:
+            task.cancel()
+        # Every outcome is swallowed: a cancelled job raises CancelledError,
+        # and one that had already failed re-raises whatever killed it --
+        # logged where it happened. Shutdown proceeds regardless, and the
+        # timeout means a task that will not die cannot hold the service
+        # open (its store writes are safe either way; see JobStore.close).
+        await asyncio.wait(jobs, timeout=timeout)
+
     async def run_forever(self, poll_seconds: float = 2.0) -> None:
         self.sweep_incomplete()
         while True:
@@ -263,7 +310,9 @@ class Worker:
                     if job.nzo_id in self._in_flight:
                         continue
                     self._in_flight.add(job.nzo_id)
-                    asyncio.create_task(self.run_job(job.nzo_id))
+                    task = asyncio.create_task(self.run_job(job.nzo_id))
+                    self._jobs.add(task)
+                    task.add_done_callback(self._jobs.discard)
             except Exception:
                 log.exception("worker poll failed; retrying next tick")
             await asyncio.sleep(poll_seconds)

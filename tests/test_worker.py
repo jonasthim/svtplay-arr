@@ -531,3 +531,101 @@ async def test_the_poll_loop_does_not_read_the_store_on_the_event_loop(
 
     assert where, "the poll loop never read the store"
     assert set(where) == {"off the loop"}, where
+
+
+# --- Stopping the downloads shutdown leaves behind --------------------
+
+
+async def _dispatched(worker: Worker, timeout: float = 2.0) -> set:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while not worker._jobs and loop.time() < deadline:
+        await asyncio.sleep(0.01)
+    return set(worker._jobs)
+
+
+async def test_run_forever_keeps_hold_of_the_tasks_it_starts(tmp_path: Path):
+    # It used to create them and drop the reference. Nothing could then wait
+    # for a download, which is what let the app's shutdown close the job
+    # store out from under one -- and, separately, is what asyncio warns
+    # about: a task nothing holds can be collected mid-run.
+    store, worker = _setup(tmp_path)
+    worker._downloader = FakeDownloader(steps=200, total_bytes=100, delay=0.01)
+    store.create("a", "stem", "WEBDL-1080p", 100)
+
+    runner = asyncio.create_task(worker.run_forever(poll_seconds=0.01))
+    try:
+        jobs = await _dispatched(worker)
+    finally:
+        runner.cancel()
+        try:
+            await runner
+        except asyncio.CancelledError:
+            pass
+
+    assert len(jobs) == 1, "the worker did not keep hold of its download task"
+    await worker.drain()
+
+
+async def test_drain_stops_a_download_that_is_still_running(tmp_path: Path):
+    store, worker = _setup(tmp_path)
+    worker._downloader = FakeDownloader(steps=200, total_bytes=100, delay=0.01)
+    job = store.create("a", "stem", "WEBDL-1080p", 100)
+
+    runner = asyncio.create_task(worker.run_forever(poll_seconds=0.01))
+    jobs = await _dispatched(worker)
+    runner.cancel()
+    try:
+        await runner
+    except asyncio.CancelledError:
+        pass
+
+    await worker.drain()
+
+    assert all(task.done() for task in jobs), "drain returned with a job running"
+    assert worker._jobs == set(), "a finished task was not let go of"
+    # Left Downloading, which is exactly what sweep_incomplete reconciles on
+    # the next start -- the documented recovery path, and the same one a
+    # power cut takes. What must not happen is a file in completed/ behind a
+    # row that never got written.
+    assert store.get(job.nzo_id).status is JobStatus.DOWNLOADING
+    assert list((tmp_path / "completed").iterdir()) == []
+
+
+async def test_drain_gives_up_rather_than_holding_shutdown_open(tmp_path: Path):
+    # A download runs for as long as a download runs. Shutdown cannot wait
+    # for one, and a task that ignores cancellation must not be able to keep
+    # the service alive -- JobStore.close is what makes giving up safe.
+    store, worker = _setup(tmp_path)
+    running = asyncio.Event()
+    stubborn = asyncio.Event()
+
+    async def refuses_to_stop():
+        running.set()
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            stubborn.set()
+            await asyncio.sleep(30)
+
+    task = asyncio.create_task(refuses_to_stop())
+    worker._jobs.add(task)
+    # Started, not merely scheduled: a task cancelled before its first step
+    # never reaches its own `except`, and the assertion below would then be
+    # about the test rather than about `drain`.
+    await running.wait()
+    try:
+        await worker.drain(timeout=0.1)  # must return
+        assert stubborn.is_set(), "drain did not even try to cancel it"
+        assert not task.done()
+    finally:
+        task.cancel()
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
+
+
+async def test_drain_on_a_worker_that_started_nothing_is_a_no_op(tmp_path: Path):
+    store, worker = _setup(tmp_path)
+    await worker.drain()
