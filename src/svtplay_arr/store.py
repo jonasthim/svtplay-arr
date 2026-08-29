@@ -506,7 +506,8 @@ class JobStore:
         try:
             with self._use() as conn:
                 conn.execute(
-                    "INSERT INTO jobs (nzo_id, svt_id, stem, quality, status, size_bytes)"
+                    "INSERT INTO jobs"
+                    " (nzo_id, svt_id, stem, quality, status, size_bytes)"
                     " VALUES (?,?,?,?,?,?)",
                     (nzo_id, svt_id, stem, quality, JobStatus.QUEUED.value, size_bytes),
                 )
