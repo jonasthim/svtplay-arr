@@ -192,12 +192,27 @@ class Worker:
         )
 
     def _report_progress(self, nzo_id: str, downloaded_bytes: int) -> None:
-        # Synchronous, unlike everything else here that touches the store:
-        # this is the `ProgressFn` callback the downloader invokes from
-        # inside its own call stack, which has no way to await. It is one
-        # small UPDATE against this thread's own connection and nothing
-        # else can hold it up -- under the lock this call replaced, it
-        # could wait behind a full table scan taken by a page render.
+        # Synchronous, unlike everything else here that touches the store,
+        # and therefore **a blocking sqlite write on the event loop**. Say
+        # it plainly, because it is the one place in this service where
+        # that is still true and an earlier version of this comment implied
+        # otherwise: `SvtplayDlDownloader` polls the staging directory from
+        # a coroutine and calls this from there, so the write runs on the
+        # loop the routes are served on. Ordinarily it is one small UPDATE
+        # against this thread's own connection and costs microseconds. It
+        # is not bounded, though: if another connection is holding the WAL
+        # write lock, this waits out `busy_timeout` -- five seconds of
+        # stalled event loop, then `database is locked` -- which is worth
+        # knowing before anyone adds a second long write to this store.
+        #
+        # It stays synchronous because it cannot be anything else. This is
+        # the `ProgressFn` callback the downloader invokes from inside its
+        # own call stack; making it awaitable means changing the
+        # `Downloader` protocol and every implementation of it, to move a
+        # write that is measured in microseconds. Note that this is not a
+        # regression: before the store had per-thread connections, this
+        # same call could wait behind a full table scan taken by a page
+        # render, on the same loop, with a Python lock in the way as well.
         #
         # A monitoring/bookkeeping mechanism must never be able to fail the
         # thing it monitors: a transient store error here (busy database,

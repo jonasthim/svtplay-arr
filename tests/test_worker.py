@@ -482,6 +482,68 @@ def _where_it_ran(where: list[str], inner):
     return probe
 
 
+async def test_every_store_call_the_worker_makes_is_where_it_says_it_is(
+    tmp_path: Path,
+):
+    """The rule, swept rather than sampled.
+
+    An earlier version of this named `get` and `complete` explicitly, so a
+    new store call joining `_report_progress` on the event loop would have
+    gone unnoticed -- which is exactly the thing the sweep is for. Every
+    public store operation is watched, and each one must land where this
+    module says it does: off the loop, except the one documented exception.
+
+    `update_progress` is that exception and is asserted *on* the loop
+    deliberately. It is the downloader's synchronous `ProgressFn` callback,
+    invoked from inside its own call stack with nothing to await; see
+    `Worker._report_progress` for why it stays that way and what it costs.
+    Asserting it rather than excusing it means that if it ever does move
+    off the loop, this test says so instead of quietly agreeing.
+    """
+    import inspect
+
+    where: dict[str, set[str]] = {}
+    operations = [
+        name
+        for name, value in vars(JobStore).items()
+        if not name.startswith("_")
+        and not name.endswith("_async")
+        and inspect.isfunction(value)
+        and name != "close"
+    ]
+    originals = {name: getattr(JobStore, name) for name in operations}
+
+    def watched(name, inner):
+        def probe(self, *args, **kwargs):
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                where.setdefault(name, set()).add("off the loop")
+            else:
+                where.setdefault(name, set()).add("on the loop")
+            return inner(self, *args, **kwargs)
+
+        return probe
+
+    store, worker = _setup(tmp_path)
+    job = store.create("a", "stem", "WEBDL-1080p", 100)
+    for name, inner in originals.items():
+        setattr(JobStore, name, watched(name, inner))
+    try:
+        await worker.run_job(job.nzo_id)
+    finally:
+        for name, inner in originals.items():
+            setattr(JobStore, name, inner)
+
+    assert store.get(job.nzo_id).status is JobStatus.COMPLETED
+    assert where, "the worker never touched the store"
+    assert where.pop("update_progress", None) == {"on the loop"}, (
+        "update_progress has moved off the event loop -- good, but say so in"
+        " Worker._report_progress and here"
+    )
+    assert all(v == {"off the loop"} for v in where.values()), where
+
+
 async def test_the_worker_does_not_read_the_store_on_the_event_loop(
     tmp_path: Path,
 ):
