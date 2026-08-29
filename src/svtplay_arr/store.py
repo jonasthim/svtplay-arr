@@ -416,13 +416,20 @@ class JobStore:
         """
         live: list[_Registered] = []
         for entry in self._connections:
-            if entry.thread.is_alive():
+            # The lock is taken without waiting, so the invariant `close()`
+            # rests on holds everywhere: a connection is never closed except
+            # while its own lock is held. A dead thread cannot be holding
+            # it, so this only ever fails in a shape that should be left
+            # alone anyway.
+            if entry.thread.is_alive() or not entry.lock.acquire(blocking=False):
                 live.append(entry)
                 continue
             try:
                 entry.conn.close()
             except sqlite3.Error:  # pragma: no cover - sqlite rarely fails here
                 live.append(entry)
+            finally:
+                entry.lock.release()
         self._connections = live
 
     def close(self) -> None:

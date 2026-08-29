@@ -372,6 +372,10 @@ def test_a_read_in_flight_does_not_block_a_write(tmp_path: Path):
     # download worker's progress write no longer queues behind a page
     # render's full table scan. Under the lock this write would not have
     # completed until the read did, and the assertion below would fail.
+    #
+    # There is still a lock, but it is per connection and a connection has
+    # one user thread, so these two threads hold different ones -- this is
+    # also what pins that distinction.
     store = _store(tmp_path)
     ids = _seed(store, count=1)
     inside_read = threading.Event()
