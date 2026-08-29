@@ -243,35 +243,151 @@ def _apply(conn: sqlite3.Connection, target: int) -> None:
         ) from exc
 
 
+def _is_contention(exc: sqlite3.OperationalError) -> bool:
+    """Is this sqlite saying "someone else has it", or something else?
+
+    Only the first is worth waiting out. Matching on the message is
+    unlovely, but `sqlite3.OperationalError` carries no code, and the
+    alternative -- retrying every failure -- is what put a five second
+    delay in front of a start that was never going to succeed.
+    """
+    text = str(exc).lower()
+    return "locked" in text or "busy" in text
+
+
 def _enable_wal(conn: sqlite3.Connection, db_path: Path) -> None:
-    """Put the database into WAL, waiting out anyone else converting it.
+    """Put the database into WAL if it will go, and say so plainly if not.
 
     WAL is a property of the database file, not of a connection: set once,
     every later connection inherits it. It is what makes per-thread
     connections worth having -- readers do not block behind the writer, so
     removing the store's global lock removed waiting rather than moving it
-    into sqlite -- which is why failing to get it is fatal rather than a
-    silent fall back to a mode where every reader and writer takes turns
-    again.
+    into sqlite.
 
-    Asking for WAL when the database is already in WAL is a no-op that
-    needs no exclusive lock, so the retry below only ever runs on the
-    one-time conversion; see `_WAL_TIMEOUT_S`.
+    Wanted, then, but **not required**, and that distinction is the whole
+    reason this function is shaped the way it is. Every release before this
+    one issued the same pragma and ignored its result, so there are
+    `db_path`s in the world where the pragma does not take and the service
+    has always worked: an NFS or CIFS mount, where sqlite falls back to a
+    VFS with no shared-memory support and answers `delete` (or refuses the
+    write outright) on a database that is otherwise perfectly writable.
+    `docs/configuration.md` invites moving `db_path` there. Refusing to
+    start on one of those would be a regression dressed as a safety check
+    -- without WAL this store is slower, because readers and the worker's
+    writes take turns again, and no less correct.
+
+    So: retry while sqlite says something else is holding the file (the
+    one-time conversion racing another process, which busy_timeout does
+    *not* cover -- switching journal mode takes an exclusive lock and
+    sqlite deliberately does not run the busy handler for it), give up
+    immediately on any other error, and in both cases warn with the reason
+    sqlite actually gave rather than a guess. Asking for WAL when the
+    database is already in WAL is a no-op needing no exclusive lock, so the
+    retry never runs on an ordinary start.
     """
     deadline = time.monotonic() + _WAL_TIMEOUT_S
     while True:
+        failure: sqlite3.OperationalError | None = None
         try:
             mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
-        except sqlite3.OperationalError:
+        except sqlite3.OperationalError as exc:
+            failure = exc
             mode = None
         if str(mode).lower() == "wal":
             return
+        if failure is not None and not _is_contention(failure):
+            break
         if time.monotonic() >= deadline:
-            raise JobStoreError(
-                f"could not switch the job database at {db_path} into WAL mode"
-                f" (it is in {mode!r}); something else is holding it open."
-            )
+            break
         time.sleep(_WAL_RETRY_S)
+    log.warning(
+        "the job database at %s is in %r, not WAL%s. svtplay-arr will use it"
+        " anyway -- this is how every release before this one ran -- but"
+        " reads and the download worker's writes will block each other"
+        " instead of running side by side. A database on an NFS or CIFS"
+        " mount is the usual reason; a local path will not do this.",
+        db_path,
+        mode,
+        f" ({failure})" if failure is not None else "",
+    )
+
+
+def _copy_before_migrating(
+    conn: sqlite3.Connection, db_path: Path, version: int
+) -> None:
+    """Take a copy of the database before the first migration touches it.
+
+    Everything else here is defence against a migration going wrong:
+    each one is transactional, additive by convention, and rolls back
+    whole. This is defence against the convention being broken -- a
+    migration that succeeds and loses data, which no transaction can undo
+    -- on a file that is, for the installations this ships to, the only
+    copy of that download history in existence. The project already keeps
+    a `.bak` beside `config.yaml` on every write; the database that holds
+    the history had nothing.
+
+    `VACUUM INTO` rather than copying the file: it is sqlite's own
+    consistent-snapshot mechanism, so it needs no external lock and cannot
+    catch a half-written page or miss the WAL.
+
+    Named for the version it holds (`jobs.db.v1.bak`), so a copy is never
+    overwritten by a later migration's, and a copy already there for this
+    version is left alone -- a failed migration leaves the database at the
+    version it started at, so the existing file describes the same state
+    this one would.
+
+    Skipped for a database with no rows: a fresh install has nothing to
+    lose, and a `.bak` beside every new install is clutter that teaches
+    the operator to ignore the ones that matter.
+
+    A failure here stops the start. Nothing has been changed at that
+    point, and the one thing this project has said it will not do is lose
+    job history -- migrating without the copy that exists to make that
+    promise good is not a trade to take silently. In practice this can
+    only fail for reasons that would stop the service anyway: the
+    directory has to be writable for the WAL sidecars regardless, and this
+    database is measured in hundreds of kilobytes.
+    """
+    if not _has_jobs_table(conn):
+        return
+    if conn.execute("SELECT 1 FROM jobs LIMIT 1").fetchone() is None:
+        return
+    target = db_path.with_name(f"{db_path.name}.v{version}.bak")
+    # `is_file`, not `exists`: anything else in the way is not a copy this
+    # can keep, and must reach `VACUUM INTO` so the failure below names it.
+    if target.is_file():
+        log.info(
+            "job database: a schema version %d copy is already at %s; keeping it",
+            version,
+            target,
+        )
+        return
+    try:
+        conn.execute("VACUUM INTO ?", (str(target),))
+    except sqlite3.Error as exc:
+        if "already exists" in str(exc).lower():
+            # Another process wrote it between the check above and here.
+            # Matching on the message because `VACUUM INTO` refusing an
+            # existing target is the one failure that is not a failure, and
+            # re-checking `target.exists()` could not tell it apart from a
+            # copy this call started and abandoned half-written.
+            log.info(
+                "job database: a schema version %d copy appeared at %s while"
+                " this one was being written; keeping it",
+                version,
+                target,
+            )
+            return
+        raise JobStoreError(
+            f"could not write a copy of the job database to {target} before"
+            f" migrating it ({exc}); nothing has been changed. Free some space"
+            " or fix the permissions on that directory and start again."
+        ) from exc
+    log.info(
+        "job database: copied to %s before migrating past schema version %d",
+        target,
+        version,
+    )
 
 
 def _prepare_database(db_path: Path) -> None:
@@ -284,7 +400,12 @@ def _prepare_database(db_path: Path) -> None:
     conn = sqlite3.connect(db_path, isolation_level=None)
     try:
         conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
-        _enable_wal(conn, db_path)
+        # The version is read, and a future one refused, before anything at
+        # all is written -- WAL included. Switching journal mode rewrites
+        # the database header, so enabling it first would leave a database
+        # this build has just refused to touch with a different sha256 than
+        # it had, which is not what "nothing has been changed" means to
+        # whoever is about to restore it.
         version = _user_version(conn)
         if version > SCHEMA_VERSION:
             # Refused before anything is written, and deliberately fatal:
@@ -300,9 +421,13 @@ def _prepare_database(db_path: Path) -> None:
                 " nothing has been changed. Upgrade svtplay-arr again, or"
                 " point svtplay-arr at a database written by this version."
             )
+        _enable_wal(conn, db_path)
         if version == 0:
             version = _adopt_baseline(conn, db_path)
-        for target in range(version + 1, SCHEMA_VERSION + 1):
+        pending = range(version + 1, SCHEMA_VERSION + 1)
+        if pending:
+            _copy_before_migrating(conn, db_path, version)
+        for target in pending:
             _apply(conn, target)
     finally:
         conn.close()

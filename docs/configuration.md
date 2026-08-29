@@ -217,6 +217,12 @@ directory yourself.
 This database holds only in-flight and completed job rows. Deleting it loses
 Sonarr's view of queue and history, not any downloaded media.
 
+A `db_path` on an NFS or CIFS mount works, with a caveat worth knowing: sqlite
+cannot use WAL there, so svtplay-arr logs a warning at start and runs in the
+slower mode every release before v0.6 used — reads and the download worker's
+writes block each other rather than running side by side. It is correct either
+way. A local path is the better choice if you have one.
+
 Its schema is versioned (sqlite's `PRAGMA user_version`) and upgraded in place
 on start. Nothing is required of you: a database from an earlier release is
 recognised and kept, never rebuilt, and each upgrade step runs in a transaction
@@ -230,9 +236,20 @@ migrating the job database to schema version 2
 
 Later starts log nothing, because there is nothing to do.
 
+Before the first migration touches a database that has rows in it, a copy is
+written beside it — `jobs.db.v1.bak` for a database at schema version 1 — and
+that copy is never overwritten by a later one. It is a `VACUUM INTO` snapshot,
+so it is a complete, openable database at the schema the previous release
+understood: to undo an upgrade, stop the service, move the copy over `jobs.db`,
+and reinstall the older release. Copies are not pruned; they are small, and
+deleting one is safe once you no longer want to go back to that version. A
+fresh install with an empty database gets no copy, and a start that cannot
+write the copy stops rather than migrating without it.
+
 Downgrading is the one case that stops the service. A database written by a
 newer release is refused rather than written to in a shape this build does not
-understand:
+understand — before anything at all is written to it, so the file is left
+byte-for-byte as it was:
 
 ```
 job database at /var/lib/svtplay-arr/jobs.db is at schema version 3, but this build of svtplay-arr understands version 2. It was written by a newer release; nothing has been changed. Upgrade svtplay-arr again, or point svtplay-arr at a database written by this version.

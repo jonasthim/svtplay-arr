@@ -4,6 +4,7 @@ import subprocess
 import sys
 import textwrap
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -151,12 +152,22 @@ def test_listing_methods_raise_rather_than_silently_drop_corrupted_job(
         s.history()
 
 
-def test_wal_mode_and_busy_timeout_are_configured(tmp_path: Path):
+def test_wal_mode_and_busy_timeout_are_configured(tmp_path: Path, monkeypatch):
     # WAL is a property of the database file, so it is set once at open and
     # every later connection inherits it -- which is exactly what makes
     # per-thread connections safe. busy_timeout is per-connection and has to
     # be applied to each one, so both are asserted on a connection the store
     # opened for a *different* thread than the one that built it.
+    #
+    # busy_timeout is asserted against a patched value, and that is the only
+    # way this half of the test means anything: `sqlite3.connect()`'s own
+    # `timeout` argument defaults to 5.0 seconds -- busy_timeout = 5000,
+    # exactly what this module sets. An earlier version of this test
+    # asserted 5000 and passed with the pragma deleted outright. 7321 is a
+    # number the standard library will never hand back on its own.
+    from svtplay_arr import store as store_module
+
+    monkeypatch.setattr(store_module, "_BUSY_TIMEOUT_MS", 7321)
     s = _store(tmp_path)
     settings = {}
 
@@ -169,31 +180,156 @@ def test_wal_mode_and_busy_timeout_are_configured(tmp_path: Path):
     t.start()
     t.join()
 
-    assert settings == {"journal_mode": "wal", "busy_timeout": 5000}
+    assert settings == {"journal_mode": "wal", "busy_timeout": 7321}
 
 
-def test_a_database_that_cannot_be_put_into_wal_is_refused(
+def test_the_store_works_on_a_database_that_never_reached_wal(
     tmp_path: Path, monkeypatch
 ):
-    # WAL is what makes per-thread connections worth having: without it,
-    # readers and the writer block each other and the store is back to
-    # taking turns, only now with no lock saying so. Failing loudly beats
-    # running on silently in a mode nothing else in this module assumes.
+    # What the WAL warning claims: slower, not wrong. Asserted rather than
+    # asserted-in-a-comment, because it is the whole justification for
+    # degrading instead of refusing to start.
     from svtplay_arr import store as store_module
 
-    # The real timeout is five seconds of retrying, which is right for a
-    # conversion racing another process and wrong for a test.
+    monkeypatch.setattr(store_module, "_enable_wal", lambda conn, db_path: None)
+    s = _store(tmp_path)
+    assert s._connection().execute("PRAGMA journal_mode").fetchone()[0] != "wal"
+
+    job = s.create("a", "stem", "WEBDL-1080p", 100)
+    s.update_progress(job.nzo_id, 50)
+    s.complete(job.nzo_id, "/downloads/completed/stem.mkv")
+    errors: list = []
+
+    def read():
+        try:
+            for _ in range(50):
+                s.all_jobs()
+                s.get(job.nzo_id)
+        except Exception as exc:  # noqa: BLE001 - collected for the assertion
+            errors.append(exc)
+
+    threads = [threading.Thread(target=read) for _ in range(3)]
+    for t in threads:
+        t.start()
+    for _ in range(50):
+        s.create("b", "other", "WEBDL-1080p", 1)
+    for t in threads:
+        t.join(timeout=30)
+
+    assert errors == []
+    assert s.get(job.nzo_id).status is JobStatus.COMPLETED
+    assert len(s.history()) == 1
+
+
+def test_a_closed_store_stays_closed_for_a_thread_that_never_used_it(
+    tmp_path: Path,
+):
+    # `close()` sets the flag before it drains the registry, and without
+    # that a thread checking out afterwards gets a brand new connection
+    # registered into a list nothing will ever drain again -- a store that
+    # silently works after being closed, and leaks. Asked of a thread that
+    # has never touched this store, because a thread that has one cached in
+    # its thread-local would be answered from there either way.
+    s = JobStore(tmp_path / "jobs.db")
+    s.create("a", "stem", "WEBDL-1080p", 1)
+    s.close()
+    outcome: list = []
+
+    def use_it():
+        try:
+            outcome.append(s.all_jobs())
+        except Exception as exc:  # noqa: BLE001 - collected for the assertion
+            outcome.append(exc)
+
+    t = threading.Thread(target=use_it)
+    t.start()
+    t.join(timeout=10)
+
+    assert len(outcome) == 1
+    assert isinstance(outcome[0], JobStoreError), outcome
+    assert s._connections == [], "a closed store registered a new connection"
+
+
+def _rollback_journal_database(tmp_path: Path) -> Path:
+    """A database in sqlite's default journal mode, never opened by the store.
+
+    Opening it through `JobStore` would put it into WAL, and a database
+    already in WAL answers the pragma with "wal" whatever else is true of
+    it -- so a test built on one would take the early return and prove
+    nothing.
+    """
+    db = tmp_path / "jobs.db"
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute("CREATE TABLE jobs (nzo_id TEXT PRIMARY KEY)")
+        conn.commit()
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] != "wal"
+    finally:
+        conn.close()
+    return db
+
+
+def test_a_database_that_will_not_go_into_wal_is_used_anyway(monkeypatch):
+    # WAL is wanted, not required. Every release before this one issued the
+    # same pragma and ignored the result, so there are db_paths in the world
+    # where it does not take and the service has always worked -- an NFS or
+    # CIFS mount, where sqlite falls back to a VFS with no shared memory.
+    # docs/configuration.md invites moving db_path there. Refusing to start
+    # on one of those would be a regression dressed as a safety check:
+    # without WAL this store is slower, not wrong.
+    from svtplay_arr import store as store_module
+
     monkeypatch.setattr(store_module, "_WAL_TIMEOUT_S", 0.0)
-    # An in-memory database cannot be put into WAL at all, which is the
-    # cheapest honest way to reach the failure.
+    # An in-memory database reports "memory" and cannot be moved to WAL --
+    # the cheapest honest stand-in for a mode the pragma will not change.
     conn = sqlite3.connect(":memory:")
     try:
-        with pytest.raises(JobStoreError) as exc:
-            store_module._enable_wal(conn, Path("/nonexistent/jobs.db"))
+        store_module._enable_wal(conn, Path("/srv/nfs/jobs.db"))  # must not raise
     finally:
         conn.close()
 
-    assert "WAL" in str(exc.value)
+
+def test_the_wal_warning_names_what_sqlite_actually_said(tmp_path: Path, caplog):
+    # The first version of this said "something else is holding it open" for
+    # every failure, having discarded the OperationalError. On the shape it
+    # was most likely to meet, the real answer was "attempt to write a
+    # readonly database" -- so the operator was sent to hunt a second
+    # process that did not exist, once every five seconds, on a
+    # Restart=on-failure loop.
+    from svtplay_arr import store as store_module
+
+    db = _rollback_journal_database(tmp_path)
+    # Read-only, which is what an NFS mount answers with when the pragma
+    # tries to take the exclusive lock the conversion needs.
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        with caplog.at_level("WARNING", logger="svtplay_arr.store"):
+            store_module._enable_wal(conn, db)
+    finally:
+        conn.close()
+
+    assert len(caplog.records) == 1, [r.getMessage() for r in caplog.records]
+    message = caplog.records[0].getMessage()
+    assert "readonly database" in message, message
+    assert str(db) in message
+    assert "NFS" in message, "the message must point at the usual cause"
+
+
+def test_a_wal_failure_that_is_not_contention_is_not_waited_out(tmp_path: Path):
+    # Retrying every failure is what put a five second delay in front of a
+    # start that was never going to succeed. Only "someone else has the
+    # file" is worth waiting out.
+    from svtplay_arr import store as store_module
+
+    db = _rollback_journal_database(tmp_path)
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    started = time.monotonic()
+    try:
+        store_module._enable_wal(conn, db)
+    finally:
+        conn.close()
+
+    assert time.monotonic() - started < store_module._WAL_TIMEOUT_S / 2
 
 
 def test_concurrent_writer_and_readers_never_see_corrupted_rows(tmp_path: Path):

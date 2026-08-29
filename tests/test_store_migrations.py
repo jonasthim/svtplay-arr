@@ -14,6 +14,7 @@ newer release is refused rather than written to in a shape it does not
 understand.
 """
 
+import hashlib
 import sqlite3
 import threading
 import time
@@ -433,15 +434,38 @@ def test_readers_during_a_migration_never_see_a_half_migrated_database(
 
 
 def test_two_stores_opening_the_same_database_at_once_migrate_it_once(
-    tmp_path: Path,
+    tmp_path: Path, extra_migrations
 ):
-    # Not the deployed shape -- one service owns the file -- but a restart
-    # can overlap with the process it replaces, and an installer script can
-    # touch the database while the service is up. Whoever gets the write
-    # lock second must notice the version already moved rather than run the
-    # migration a second time.
+    """Not the deployed shape -- one service owns the file -- but a restart
+    can overlap with the process it replaces, and an installer script can
+    touch the database while the service is up. Whoever gets the write lock
+    second must notice the version already moved rather than run the
+    migration a second time.
+
+    The migration installed here is deliberately **not** idempotent, and
+    that is the whole point. The only migration this build ships is
+    `CREATE INDEX IF NOT EXISTS`, which survives being run twice by
+    accident -- so with the real set, deleting the version re-read inside
+    `_apply`'s transaction leaves the entire suite green. With a realistic
+    next migration (`ALTER TABLE ... ADD COLUMN`, which is what any future
+    one will be), removing that guard makes three of six opens fail to
+    start *and* leaves the database half-migrated behind a version stamp
+    that says otherwise -- so every subsequent start re-runs it, hits
+    `duplicate column name`, and refuses. Unrecoverable without hand-editing
+    sqlite, on what may be the only copy of that history.
+    """
     db = tmp_path / "jobs.db"
     _pre_versioning_database(db)
+    ran: list[int] = []
+    ran_lock = threading.Lock()
+
+    def adds_a_column(conn):
+        with ran_lock:
+            ran.append(1)
+        conn.execute("ALTER TABLE jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
+
+    extra_migrations({store_module.SCHEMA_VERSION + 1: adds_a_column})
+
     opened: list[JobStore] = []
     errors: list[Exception] = []
 
@@ -451,18 +475,53 @@ def test_two_stores_opening_the_same_database_at_once_migrate_it_once(
         except Exception as exc:  # noqa: BLE001 - collected for the assertion
             errors.append(exc)
 
-    threads = [threading.Thread(target=open_it) for _ in range(4)]
+    threads = [threading.Thread(target=open_it) for _ in range(6)]
     for t in threads:
         t.start()
     for t in threads:
-        t.join(timeout=10)
+        t.join(timeout=20)
     for store in opened:
         _OPEN_STORES.append(store)
 
     assert errors == [], [repr(e) for e in errors]
-    assert len(opened) == 4
+    assert len(opened) == 6
+    assert ran == [1], f"the migration ran {len(ran)} times, not once"
     assert _version(db) == store_module.SCHEMA_VERSION
     assert len(_rows(db)) == len(_HISTORY)
+    columns = [r[1] for r in _raw(db, "PRAGMA table_info(jobs)")]
+    assert columns.count("attempts") == 1
+
+
+def test_adopting_a_database_another_process_already_moved_leaves_it_alone(
+    tmp_path: Path,
+):
+    # The other re-read, in `_adopt_baseline`. The version is sampled before
+    # the transaction takes the write lock, so by the time the lock is held
+    # another process may have adopted the database *and* migrated it.
+    # Without the re-read this stamps it back to the baseline, and every
+    # migration since runs a second time on the next start -- which the
+    # shipped `CREATE INDEX IF NOT EXISTS` survives and nothing else would.
+    #
+    # Driven directly rather than through a race, because "the other process
+    # got further than we did" is not something two threads can be made to
+    # do on demand.
+    db = tmp_path / "jobs.db"
+    _pre_versioning_database(db)
+    _store(db).close()
+    assert _version(db) == store_module.SCHEMA_VERSION
+    before = _rows(db)
+
+    conn = sqlite3.connect(db, isolation_level=None)
+    try:
+        returned = store_module._adopt_baseline(conn, db)
+    finally:
+        conn.close()
+
+    assert returned == store_module.SCHEMA_VERSION, (
+        "adoption reported the baseline for a database that had moved past it"
+    )
+    assert _version(db) == store_module.SCHEMA_VERSION
+    assert _rows(db) == before
 
 
 # --- What the operator sees -------------------------------------------
@@ -509,3 +568,151 @@ def test_reopening_an_up_to_date_database_logs_nothing(tmp_path: Path, caplog):
         _store(db)
 
     assert [r.getMessage() for r in caplog.records] == []
+
+
+# --- The copy taken before the first migration ------------------------
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _copy_path(db: Path, version: int) -> Path:
+    return db.with_name(f"{db.name}.v{version}.bak")
+
+
+def test_a_copy_is_taken_before_the_first_migration(tmp_path: Path):
+    # Everything else here defends against a migration going *wrong*: each
+    # is transactional and rolls back whole. This defends against one going
+    # right and losing data anyway -- a migration that breaks the
+    # additive-only convention, which no transaction can undo -- on a file
+    # that is, for the installations this ships to, the only copy of that
+    # history in existence. config.yaml has had a .bak on every write for
+    # releases; the database holding the history had nothing.
+    db = tmp_path / "jobs.db"
+    _pre_versioning_database(db)
+
+    _store(db)
+
+    copy = _copy_path(db, store_module._BASELINE_VERSION)
+    assert copy.is_file(), f"no copy at {copy}"
+    assert [tuple(r) for r in _raw(copy, "SELECT * FROM jobs ORDER BY nzo_id")] == [
+        tuple(r) for r in _raw(db, "SELECT * FROM jobs ORDER BY nzo_id")
+    ]
+
+
+def test_the_copy_is_of_the_schema_it_is_named_for(tmp_path: Path):
+    # Taken before the migration, so it is a database the *previous* build
+    # can open -- which is the only thing that makes it useful to restore.
+    db = tmp_path / "jobs.db"
+    _pre_versioning_database(db)
+
+    _store(db)
+
+    copy = _copy_path(db, store_module._BASELINE_VERSION)
+    assert _version(copy) == store_module._BASELINE_VERSION
+    assert _version(db) == store_module.SCHEMA_VERSION
+    assert "idx_jobs_created_at" not in _indexes(copy)
+    assert "idx_jobs_created_at" in _indexes(db)
+
+
+def test_no_copy_is_taken_of_a_database_with_nothing_in_it(tmp_path: Path):
+    # A fresh install has nothing to lose, and a .bak beside every new
+    # install is clutter that teaches the operator to ignore the ones that
+    # matter.
+    db = tmp_path / "jobs.db"
+
+    _store(db)
+
+    assert list(tmp_path.glob("*.bak")) == []
+
+
+def test_an_existing_copy_is_kept_rather_than_overwritten(
+    tmp_path: Path, extra_migrations
+):
+    # A failed migration leaves the database at the version it started at,
+    # so the next start would take a second copy of the same state -- over
+    # the top of the one that describes it. The first copy is the one to
+    # keep.
+    def refuses(conn):
+        raise RuntimeError("not today")
+
+    # The first pending migration fails, so the database stays at the
+    # version it started at and the next start takes the same copy path
+    # again. This is the only shape where that happens, and it is the shape
+    # an operator retrying a failed upgrade is in.
+    db = tmp_path / "jobs.db"
+    _pre_versioning_database(db)
+    extra_migrations({store_module._BASELINE_VERSION + 1: refuses})
+
+    with pytest.raises(JobStoreError):
+        JobStore(db)
+    copy = _copy_path(db, store_module._BASELINE_VERSION)
+    assert copy.is_file()
+    before = _sha256(copy)
+    # Something only the first copy has, so an overwrite is detectable even
+    # if the two copies would otherwise be byte-identical.
+    conn = sqlite3.connect(db)
+    conn.execute("DELETE FROM jobs")
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(JobStoreError):
+        JobStore(db)
+
+    assert _sha256(copy) == before, "the first copy was overwritten"
+    assert [tuple(r) for r in _raw(copy, "SELECT * FROM jobs")], (
+        "the kept copy must still hold the rows the database has since lost"
+    )
+
+
+def test_a_copy_that_cannot_be_written_stops_the_start(tmp_path: Path):
+    # The one promise this project has made about the job database is that
+    # history is not lost. Migrating without the copy that exists to make
+    # that promise good is not a trade to take quietly -- and nothing has
+    # been changed at the point this refuses, so the message can say so.
+    db = tmp_path / "jobs.db"
+    _pre_versioning_database(db)
+    before = _rows(db)
+    # In the way, and not a copy this can keep.
+    _copy_path(db, store_module._BASELINE_VERSION).mkdir()
+
+    with pytest.raises(JobStoreError) as exc:
+        JobStore(db)
+
+    message = str(exc.value)
+    assert "copy of the job database" in message
+    assert "nothing has been changed" in message
+    # Not byte-identical: adoption stamps the version before the copy is
+    # attempted, and adoption touches no row. The rows are what the promise
+    # is about, and they are all still here.
+    assert _rows(db) == before
+    assert _version(db) == store_module._BASELINE_VERSION
+
+
+# --- Refusing a newer database changes nothing ------------------------
+
+
+def test_refusing_a_newer_database_does_not_change_one_byte(tmp_path: Path):
+    # The refusal message and docs/configuration.md both promise "nothing
+    # has been changed", and an operator who reads that is about to restore
+    # or downgrade on the strength of it. Enabling WAL rewrites the database
+    # header, so doing that before the version check made the promise false
+    # for exactly the databases most likely to meet it: one written by a
+    # newer release, on a host that had never opened it in WAL.
+    db = tmp_path / "jobs.db"
+    _pre_versioning_database(db)
+    conn = sqlite3.connect(db)
+    conn.execute("PRAGMA user_version = 99")
+    conn.commit()
+    conn.close()
+    assert _raw(db, "PRAGMA journal_mode")[0][0] != "wal", (
+        "the fixture must not already be in WAL, or this proves nothing"
+    )
+    before = _sha256(db)
+
+    with pytest.raises(JobStoreError):
+        JobStore(db)
+
+    assert _sha256(db) == before
+    assert list(tmp_path.glob("*.bak")) == []
