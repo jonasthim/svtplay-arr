@@ -152,24 +152,67 @@ def test_listing_methods_raise_rather_than_silently_drop_corrupted_job(
 
 
 def test_wal_mode_and_busy_timeout_are_configured(tmp_path: Path):
+    # WAL is a property of the database file, so it is set once at open and
+    # every later connection inherits it -- which is exactly what makes
+    # per-thread connections safe. busy_timeout is per-connection and has to
+    # be applied to each one, so both are asserted on a connection the store
+    # opened for a *different* thread than the one that built it.
     s = _store(tmp_path)
-    assert s._conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
-    assert s._conn.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
+    settings = {}
+
+    def read():
+        conn = s._connection()
+        settings["journal_mode"] = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        settings["busy_timeout"] = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+
+    t = threading.Thread(target=read)
+    t.start()
+    t.join()
+
+    assert settings == {"journal_mode": "wal", "busy_timeout": 5000}
+
+
+def test_a_database_that_cannot_be_put_into_wal_is_refused(
+    tmp_path: Path, monkeypatch
+):
+    # WAL is what makes per-thread connections worth having: without it,
+    # readers and the writer block each other and the store is back to
+    # taking turns, only now with no lock saying so. Failing loudly beats
+    # running on silently in a mode nothing else in this module assumes.
+    from svtplay_arr import store as store_module
+
+    # The real timeout is five seconds of retrying, which is right for a
+    # conversion racing another process and wrong for a test.
+    monkeypatch.setattr(store_module, "_WAL_TIMEOUT_S", 0.0)
+    # An in-memory database cannot be put into WAL at all, which is the
+    # cheapest honest way to reach the failure.
+    conn = sqlite3.connect(":memory:")
+    try:
+        with pytest.raises(JobStoreError) as exc:
+            store_module._enable_wal(conn, Path("/nonexistent/jobs.db"))
+    finally:
+        conn.close()
+
+    assert "WAL" in str(exc.value)
 
 
 def test_concurrent_writer_and_readers_never_see_corrupted_rows(tmp_path: Path):
-    # Regression test for a real, reproduced bug: driving the shared
+    # Regression test for a real, reproduced bug: driving one shared
     # sqlite3.Connection from multiple OS threads at once -- one thread
     # calling update_progress() in a loop while several others call
     # get()/queued()/all_active()/history() -- used to hand readers back
     # rows with a NULL or empty status, which _to_job() (correctly) raises
-    # on as corruption. That is not real corruption: it is a race in the
+    # on as corruption. That is not disk corruption: it is a race in the
     # Python sqlite3 module's per-connection bookkeeping when execute() and
-    # commit() from different threads interleave without external
-    # synchronisation. WAL mode and busy_timeout do not prevent it -- only
-    # serialising access with a lock does. This reliably reproduced 9-40
-    # errors per run before JobStore serialised access internally; it must
-    # produce zero now.
+    # commit() from different threads interleave. WAL mode and busy_timeout
+    # do not prevent it -- not sharing the connection does, which is why
+    # the store now opens one per thread. This reliably reproduced 9-40
+    # errors per run before that; it must produce zero now.
+    #
+    # Kept as it was written, deliberately: this is the shape the original
+    # defect was found in. tests/test_store_concurrency.py is the wider
+    # version, and holds the negative control proving the shape still
+    # catches it.
     s = _store(tmp_path)
     job = s.create("a", "stem", "WEBDL-1080p", 100_000)
     nzo_id = job.nzo_id
