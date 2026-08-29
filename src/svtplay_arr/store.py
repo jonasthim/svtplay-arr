@@ -40,6 +40,7 @@ corrupt data nothing in this build knows how to read.
 
 import asyncio
 import logging
+import os
 import sqlite3
 import threading
 import time
@@ -353,41 +354,119 @@ def _copy_before_migrating(
     if conn.execute("SELECT 1 FROM jobs LIMIT 1").fetchone() is None:
         return
     target = db_path.with_name(f"{db_path.name}.v{version}.bak")
-    # `is_file`, not `exists`: anything else in the way is not a copy this
-    # can keep, and must reach `VACUUM INTO` so the failure below names it.
-    if target.is_file():
-        log.info(
-            "job database: a schema version %d copy is already at %s; keeping it",
-            version,
-            target,
-        )
-        return
-    try:
-        conn.execute("VACUUM INTO ?", (str(target),))
-    except sqlite3.Error as exc:
-        if "already exists" in str(exc).lower():
-            # Another process wrote it between the check above and here.
-            # Matching on the message because `VACUUM INTO` refusing an
-            # existing target is the one failure that is not a failure, and
-            # re-checking `target.exists()` could not tell it apart from a
-            # copy this call started and abandoned half-written.
+    # Existence first, usability second, and in that order deliberately.
+    # Asking "is it usable?" and only then "is it there?" left a window
+    # between the two: another start's `os.replace` lands in it, and this
+    # one refuses to start over a copy that had just been written correctly
+    # -- reproduced at roughly one run in ten of the six-way concurrent
+    # open. `os.replace` is atomic, so a target that exists at all is a
+    # complete file, and both questions are now answered from that one
+    # moment onwards.
+    if target.exists() or target.is_symlink():
+        if _is_usable_copy(target, version):
             log.info(
-                "job database: a schema version %d copy appeared at %s while"
-                " this one was being written; keeping it",
+                "job database: a schema version %d copy is already at %s;"
+                " keeping it",
                 version,
                 target,
             )
             return
+        # Something is at the name that means "a copy exists", and it is not
+        # one. Refused rather than overwritten: this build has no idea what
+        # it is -- a copy an older version of this function truncated when
+        # the disk filled, a file somebody put there, a symlink pointing at
+        # something that matters -- and destroying it to make room for a
+        # backup would be a strange way to protect data.
         raise JobStoreError(
-            f"could not write a copy of the job database to {target} before"
-            f" migrating it ({exc}); nothing has been changed. Free some space"
-            " or fix the permissions on that directory and start again."
-        ) from exc
+            f"there is something at {target} that is not a usable copy of the"
+            f" job database at schema version {version}; nothing has been"
+            " changed. Move it or delete it and start again -- svtplay-arr"
+            " writes a copy there before migrating and will not overwrite"
+            " whatever that is."
+        )
+    _vacuum_into(conn, target)
     log.info(
         "job database: copied to %s before migrating past schema version %d",
         target,
         version,
     )
+
+
+def _is_usable_copy(target: Path, version: int) -> bool:
+    """Is `target` a database this function would have written?
+
+    Opened and read, not merely stat-ed, and this is the whole point.
+    Checking `is_file()` alone accepted anything -- and the case that
+    matters is the one the copy exists for: the disk fills part way through
+    `VACUUM INTO`, the start correctly refuses and changes nothing, and
+    then the *next* start finds a truncated file, reports "keeping it", and
+    migrates with no copy at all. Reproduced end to end on 6003 rows of
+    history: the surviving file answered `no such table: jobs`. A net that
+    fails open in exactly the scenario it was strung for is worse than no
+    net, because of what it says in the log while doing it.
+
+    A symlink is not a copy either, whatever it points at: `is_file()`
+    follows one, so without this check the "copy" could be a file belonging
+    to something else entirely.
+    """
+    if target.is_symlink() or not target.is_file():
+        return False
+    try:
+        conn = sqlite3.connect(f"{target.resolve().as_uri()}?mode=ro", uri=True)
+    except (sqlite3.Error, OSError, ValueError):
+        return False
+    try:
+        return _user_version(conn) == version and _has_jobs_table(conn)
+    except sqlite3.Error:
+        # Not a database at all, or a truncated one. Either way it is not a
+        # copy of anything.
+        return False
+    finally:
+        conn.close()
+
+
+def _vacuum_into(conn: sqlite3.Connection, target: Path) -> None:
+    """Write a consistent copy of the database to `target`, or to nothing.
+
+    Written to a neighbouring `.partial` and moved into place with
+    `os.replace`, so a copy that fails half way through -- the disk filling
+    is the reason this exists -- never lands under the name that means "a
+    copy exists". The move is atomic within the directory, so the target
+    either is not there or is a complete database; there is no third state
+    for the next start to misread.
+
+    The partial's name carries the process and thread that is writing it,
+    so two starts racing each other cannot truncate one another's work.
+    Whoever finishes last wins the `os.replace`, and both were copies of
+    the same state. A partial left behind by a process that was killed
+    outright is harmless -- it is never read, and the next start writes its
+    own -- but it is not cleaned up either.
+
+    `VACUUM INTO` rather than copying the file: it is sqlite's own
+    consistent-snapshot mechanism, so it needs no external lock and cannot
+    catch a half-written page or miss the WAL. Its own refusal to write
+    over an existing file is deliberately not relied on -- it is only one
+    of three answers it gives (a zero-length file is overwritten silently,
+    and non-database bytes come back as "file is not a database"), and the
+    unlink below means it never has to make that decision.
+    """
+    partial = target.with_name(
+        f"{target.name}.{os.getpid()}.{threading.get_ident()}.partial"
+    )
+    try:
+        partial.unlink(missing_ok=True)
+        conn.execute("VACUUM INTO ?", (str(partial),))
+        os.replace(partial, target)
+    except (sqlite3.Error, OSError) as exc:
+        try:
+            partial.unlink(missing_ok=True)
+        except OSError:  # pragma: no cover - nothing useful to do about it
+            pass
+        raise JobStoreError(
+            f"could not write a copy of the job database to {target} before"
+            f" migrating it ({exc}); nothing has been changed. Free some space"
+            " or fix the permissions on that directory and start again."
+        ) from exc
 
 
 def _prepare_database(db_path: Path) -> None:

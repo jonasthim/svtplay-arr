@@ -492,6 +492,67 @@ def test_two_stores_opening_the_same_database_at_once_migrate_it_once(
     assert columns.count("attempts") == 1
 
 
+def test_six_opens_of_an_already_adopted_database_migrate_it_once(
+    tmp_path: Path, extra_migrations
+):
+    """`_apply`'s version re-read, where it is the *only* thing guarding.
+
+    The sibling test above starts from an unstamped database, so
+    `_adopt_baseline`'s own re-read is in the path too and deleting only
+    `_apply`'s guard slips through about one run in twenty-five. This is
+    the shape with no second net: a database that is already adopted, with
+    a migration pending, opened six times at once. Deleting the guard fails
+    five of the six opens here, every time.
+
+    It is also the shape the deployed installation will actually be in for
+    its *second* schema bump -- adopted long ago, one new migration to run.
+    """
+    db = tmp_path / "jobs.db"
+    _pre_versioning_database(db)
+    _store(db).close()
+    base = store_module.SCHEMA_VERSION
+    assert _version(db) == base, "the fixture must already be adopted"
+
+    ran: list[int] = []
+    ran_lock = threading.Lock()
+
+    def adds_a_column(conn):
+        with ran_lock:
+            ran.append(1)
+        conn.execute("ALTER TABLE jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
+
+    extra_migrations({base + 1: adds_a_column})
+
+    opened: list[JobStore] = []
+    errors: list[Exception] = []
+
+    def open_it():
+        try:
+            opened.append(JobStore(db))
+        except Exception as exc:  # noqa: BLE001 - collected for the assertion
+            errors.append(exc)
+
+    threads = [threading.Thread(target=open_it) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=20)
+    for store in opened:
+        _OPEN_STORES.append(store)
+
+    assert errors == [], [repr(e) for e in errors]
+    assert len(opened) == 6
+    assert ran == [1], f"the migration ran {len(ran)} times, not once"
+    assert _version(db) == base + 1
+    columns = [r[1] for r in _raw(db, "PRAGMA table_info(jobs)")]
+    assert columns.count("attempts") == 1
+    assert len(_rows(db)) == len(_HISTORY)
+    # Six starts racing for one copy: exactly one is written, and the rest
+    # recognise it rather than retaking or refusing.
+    assert _copy_path(db, base).is_file()
+    assert list(tmp_path.glob("*.partial")) == []
+
+
 def test_adopting_a_database_another_process_already_moved_leaves_it_alone(
     tmp_path: Path,
 ):
@@ -666,7 +727,9 @@ def test_an_existing_copy_is_kept_rather_than_overwritten(
     )
 
 
-def test_a_copy_that_cannot_be_written_stops_the_start(tmp_path: Path):
+def test_a_copy_that_cannot_be_written_stops_the_start(
+    tmp_path: Path, monkeypatch
+):
     # The one promise this project has made about the job database is that
     # history is not lost. Migrating without the copy that exists to make
     # that promise good is not a trade to take quietly -- and nothing has
@@ -674,8 +737,14 @@ def test_a_copy_that_cannot_be_written_stops_the_start(tmp_path: Path):
     db = tmp_path / "jobs.db"
     _pre_versioning_database(db)
     before = _rows(db)
-    # In the way, and not a copy this can keep.
-    _copy_path(db, store_module._BASELINE_VERSION).mkdir()
+
+    def full_disk(conn, target):
+        raise store_module.JobStoreError(
+            f"could not write a copy of the job database to {target} before"
+            " migrating it (disk full); nothing has been changed."
+        )
+
+    monkeypatch.setattr(store_module, "_vacuum_into", full_disk)
 
     with pytest.raises(JobStoreError) as exc:
         JobStore(db)
@@ -688,6 +757,151 @@ def test_a_copy_that_cannot_be_written_stops_the_start(tmp_path: Path):
     # is about, and they are all still here.
     assert _rows(db) == before
     assert _version(db) == store_module._BASELINE_VERSION
+
+
+def test_a_copy_that_failed_leaves_nothing_that_looks_like_one(tmp_path: Path):
+    """The scenario the copy exists for, all the way through.
+
+    The disk fills part way into `VACUUM INTO`. The first start must refuse
+    and change nothing -- and then the *second* start must not find the
+    wreckage of the first, decide a copy already exists, and migrate
+    unprotected while saying so in the log. Reproduced against an earlier
+    version of this code on 6003 rows of real history: the surviving file
+    answered `no such table: jobs`.
+
+    `RLIMIT_FSIZE` rather than a stubbed-out failure, because the property
+    is about what a genuinely half-written copy leaves on disk.
+    """
+    import resource
+    import subprocess
+    import sys
+    import textwrap
+
+    db = tmp_path / "jobs.db"
+    _pre_versioning_database(db, rows=[
+        (f"SVTPLAY-{i:012d}", f"svt{i}", f"Show {i} - S01E01 - WEBDL-1080p",
+         "WEBDL-1080p", "Completed", 1000 + i, 1000 + i, f"/c/{i}.mkv", None,
+         "2026-01-02 03:04:05")
+        for i in range(4000)
+    ])
+    del resource  # the limit is applied in the child, below
+
+    script = textwrap.dedent(
+        f"""
+        import resource, sys
+        from pathlib import Path
+        # Small enough that the copy of a 4000-row database cannot finish,
+        # large enough that the database itself still opens and migrates.
+        resource.setrlimit(resource.RLIMIT_FSIZE, (64 * 1024, 64 * 1024))
+        from svtplay_arr.store import JobStore, JobStoreError
+        try:
+            JobStore(Path({str(db)!r}))
+        except JobStoreError as exc:
+            print("refused:", exc)
+            sys.exit(0)
+        print("started anyway")
+        sys.exit(1)
+        """
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True
+    )
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    # The copy specifically, not some other failure the file-size limit
+    # happened to cause first.
+    assert "could not write a copy of the job database" in proc.stdout, proc.stdout
+
+    # Nothing that a later start could mistake for a copy.
+    copy = _copy_path(db, store_module._BASELINE_VERSION)
+    assert not copy.exists(), f"a half-written copy was left at {copy}"
+
+    # ...and the retry, with room this time, takes a real one and migrates.
+    _store(db)
+
+    assert copy.is_file()
+    assert _version(copy) == store_module._BASELINE_VERSION
+    assert len(_raw(copy, "SELECT nzo_id FROM jobs")) == 4000
+    assert _version(db) == store_module.SCHEMA_VERSION
+
+
+@pytest.mark.parametrize(
+    "name,make",
+    [
+        ("truncated", lambda p, src: p.write_bytes(src.read_bytes()[:512])),
+        ("empty", lambda p, src: p.write_bytes(b"")),
+        ("not a database", lambda p, src: p.write_bytes(b"nope" * 400)),
+    ],
+)
+def test_a_file_that_is_not_a_database_is_never_taken_for_a_copy(
+    tmp_path: Path, name: str, make
+):
+    # Each of these was accepted by `is_file()` and reported as "keeping
+    # it". sqlite treats all three differently on its own -- a zero-length
+    # file it silently overwrites, non-database bytes it calls "file is not
+    # a database" -- so relying on `VACUUM INTO`'s own guard would not have
+    # covered them either.
+    db = tmp_path / "jobs.db"
+    _pre_versioning_database(db)
+    copy = _copy_path(db, store_module._BASELINE_VERSION)
+    make(copy, db)
+    before = copy.read_bytes()
+
+    with pytest.raises(JobStoreError) as exc:
+        JobStore(db)
+
+    assert "not a usable copy" in str(exc.value), str(exc.value)
+    assert copy.read_bytes() == before, "the file in the way was overwritten"
+    assert _version(db) == store_module._BASELINE_VERSION, "it migrated anyway"
+
+
+def test_a_symlink_at_the_copy_path_is_neither_followed_nor_overwritten(
+    tmp_path: Path,
+):
+    # `is_file()` follows a symlink, so the "copy" could be a file belonging
+    # to something else -- and the keep-it branch would then leave the
+    # migration unprotected while pointing at someone else's database.
+    db = tmp_path / "jobs.db"
+    _pre_versioning_database(db)
+    elsewhere = tmp_path / "somebody-elses.db"
+    _pre_versioning_database(elsewhere)
+    conn = sqlite3.connect(elsewhere)
+    conn.execute(f"PRAGMA user_version = {store_module._BASELINE_VERSION}")
+    conn.close()
+    before = elsewhere.read_bytes()
+    _copy_path(db, store_module._BASELINE_VERSION).symlink_to(elsewhere)
+
+    with pytest.raises(JobStoreError) as exc:
+        JobStore(db)
+
+    assert "not a usable copy" in str(exc.value)
+    assert elsewhere.read_bytes() == before
+
+
+def test_a_copy_of_a_different_schema_version_is_not_kept(tmp_path: Path):
+    # A real database, but not of the version this name claims. Restoring it
+    # would hand the older build a schema it does not understand.
+    db = tmp_path / "jobs.db"
+    _pre_versioning_database(db)
+    copy = _copy_path(db, store_module._BASELINE_VERSION)
+    _pre_versioning_database(copy)
+    conn = sqlite3.connect(copy)
+    conn.execute("PRAGMA user_version = 97")
+    conn.close()
+
+    with pytest.raises(JobStoreError) as exc:
+        JobStore(db)
+
+    assert "not a usable copy" in str(exc.value)
+
+
+def test_no_partial_copy_is_left_behind_by_a_successful_one(tmp_path: Path):
+    db = tmp_path / "jobs.db"
+    _pre_versioning_database(db)
+
+    _store(db)
+
+    assert list(tmp_path.glob("*.partial")) == []
+    assert _copy_path(db, store_module._BASELINE_VERSION).is_file()
 
 
 # --- Refusing a newer database changes nothing ------------------------
