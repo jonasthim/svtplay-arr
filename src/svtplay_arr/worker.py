@@ -171,7 +171,32 @@ class Worker:
                         )
                         return
                     final = self._publish(staging, job.stem)
-                    await self._store.complete_async(nzo_id, str(final))
+                    # Synchronous, and this is the second and last place in
+                    # this module where that is deliberate. There must be
+                    # no await between publishing the file and recording
+                    # it: a cancellation landing in that gap leaves
+                    # `stem.mkv` in `completed/` for Sonarr to import while
+                    # the row still says Downloading, so the next start
+                    # fails that row, Sonarr re-grabs the episode, and the
+                    # first copy is orphaned in the library. `drain` makes
+                    # cancellation here routine rather than exotic, and
+                    # forcing the gap open produced that outcome 40 times
+                    # out of 40.
+                    #
+                    # `asyncio.shield` was the obvious alternative and does
+                    # not close it: `to_thread` cancelled before the
+                    # executor picks the call up drops it entirely, so the
+                    # window becomes "until a worker thread starts the
+                    # write" rather than vanishing -- and every route's
+                    # store access shares that executor, so it is not a
+                    # narrow window under load. Removing the suspension
+                    # point is the only version with no gap at all.
+                    #
+                    # The cost is one small UPDATE on the event loop, at
+                    # most once per completed download -- far less than
+                    # `_report_progress` already spends per tick, and
+                    # bounded the same way. See `_report_progress`.
+                    self._store.complete(nzo_id, str(final))
                 except Exception as exc:
                     log.exception("job %s failed", nzo_id)
                     await self._store.fail_async(nzo_id, str(exc))

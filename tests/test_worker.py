@@ -537,40 +537,17 @@ async def test_every_store_call_the_worker_makes_is_where_it_says_it_is(
 
     assert store.get(job.nzo_id).status is JobStatus.COMPLETED
     assert where, "the worker never touched the store"
+    # The two documented exceptions, asserted rather than excused, so that
+    # moving either off the loop says so here instead of quietly agreeing.
     assert where.pop("update_progress", None) == {"on the loop"}, (
         "update_progress has moved off the event loop -- good, but say so in"
         " Worker._report_progress and here"
     )
+    assert where.pop("complete", None) == {"on the loop"}, (
+        "complete has moved off the event loop -- which reopens the gap"
+        " between publishing a file and recording it; see run_job"
+    )
     assert all(v == {"off the loop"} for v in where.values()), where
-
-
-async def test_the_worker_does_not_read_the_store_on_the_event_loop(
-    tmp_path: Path,
-):
-    # The argument that applies to the routes applies to the worker in the
-    # other direction: it shares the loop with every route in the service,
-    # so a store read taken inline here stalls a Sonarr poll and a page
-    # render. The `*_async` mirrors are what keep it off the loop, and this
-    # is the only thing that observes it -- a plain `self._store.get(...)`
-    # would leave every other worker test green.
-    #
-    # Asked of asyncio rather than of thread identity: inside an
-    # `asyncio.to_thread` worker there is no running loop at all.
-    where: list[str] = []
-    store, worker = _setup(tmp_path)
-    job = store.create("a", "stem", "WEBDL-1080p", 100)
-    originals = {name: getattr(JobStore, name) for name in ("get", "complete")}
-    for name, inner in originals.items():
-        setattr(JobStore, name, _where_it_ran(where, inner))
-    try:
-        await worker.run_job(job.nzo_id)
-    finally:
-        for name, inner in originals.items():
-            setattr(JobStore, name, inner)
-
-    assert store.get(job.nzo_id).status is JobStatus.COMPLETED
-    assert where, "the worker never read the store"
-    assert set(where) == {"off the loop"}, where
 
 
 async def test_the_poll_loop_does_not_read_the_store_on_the_event_loop(
@@ -691,3 +668,41 @@ async def test_drain_gives_up_rather_than_holding_shutdown_open(tmp_path: Path):
 async def test_drain_on_a_worker_that_started_nothing_is_a_no_op(tmp_path: Path):
     store, worker = _setup(tmp_path)
     await worker.drain()
+
+
+async def test_a_cancellation_cannot_land_between_publishing_and_recording(
+    tmp_path: Path,
+):
+    """The orphan window, closed.
+
+    Shutdown cancels in-flight downloads (see `drain`), so a cancellation
+    arriving at an arbitrary point in `run_job` is routine rather than
+    exotic. If there is any suspension point between the file landing in
+    `completed/` and the row being written, that is where an imported file
+    ends up behind a job that says Downloading -- and the next start fails
+    the row, Sonarr re-grabs, and the first copy is orphaned.
+
+    Cancelled from inside `_publish`, which is exact rather than
+    probabilistic: `Task.cancel()` is delivered at the next await, so if
+    one exists after `_publish` returns, this test finds it every time.
+    """
+    store, worker = _setup(tmp_path)
+    job = store.create("a", "stem", "WEBDL-1080p", 100)
+    published = worker._publish
+
+    def publish_then_cancel(staging, stem):
+        final = published(staging, stem)
+        asyncio.current_task().cancel()
+        return final
+
+    worker._publish = publish_then_cancel
+    task = asyncio.create_task(worker.run_job(job.nzo_id))
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert (tmp_path / "completed" / "stem.mkv").exists(), "nothing was published"
+    got = store.get(job.nzo_id)
+    assert got.status is JobStatus.COMPLETED, (
+        "a cancellation landed between publishing the file and recording it"
+    )
+    assert got.storage_path == str(tmp_path / "completed" / "stem.mkv")
