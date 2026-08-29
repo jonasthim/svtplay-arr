@@ -1965,3 +1965,52 @@ def test_shutdown_stops_in_flight_downloads_before_closing_the_store(
         assert store.get(job.nzo_id).status is JobStatus.DOWNLOADING
 
     assert still_running == [], still_running
+
+
+def test_a_failed_startup_stops_the_downloads_too(tmp_path: Path, monkeypatch):
+    # The shutdown path drains before closing the store; the startup-failure
+    # path did not. Unreachable today -- the only thing that can raise up
+    # there runs before the poll loop exists -- but an asymmetry between two
+    # branches that must do the same thing is what survives until the day
+    # something between those lines starts raising.
+    s = _settings(tmp_path)
+    app = create_app(s)
+    worker = app.state.worker
+    store = app.state.job_store
+
+    dispatched: list = []
+
+    async def never_finishes():
+        await asyncio.sleep(30)
+
+    def explode():
+        # Stand in for a download already dispatched when startup dies.
+        task = asyncio.ensure_future(never_finishes())
+        worker._jobs.add(task)
+        dispatched.append(task)
+        raise OSError("incomplete_dir is not readable")
+
+    monkeypatch.setattr(worker, "sweep_incomplete", explode)
+
+    running_at_close: list[bool] = []
+    tracked_close = store.close  # bound, so the suite's leak tracking still runs
+
+    def recording_close():
+        running_at_close.append(any(not t.done() for t in dispatched))
+        return tracked_close()
+
+    store.close = recording_close
+
+    with pytest.raises(OSError):
+        with TestClient(app):
+            pass  # pragma: no cover - startup raises before this runs
+
+    assert dispatched, "the stand-in download was never created"
+    # Asked at the moment the store is closed, not afterwards: the test
+    # client cancels whatever is left when its event loop goes away, so
+    # every task looks cancelled by the time this returns whether or not
+    # anything here did it in the right order.
+    assert running_at_close == [False], running_at_close
+    # And the store was still closed, so the suite's leak guard stays quiet.
+    with pytest.raises(Exception):
+        store.all_jobs()

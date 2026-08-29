@@ -247,9 +247,8 @@ fresh install with an empty database gets no copy, and a start that cannot
 write the copy stops rather than migrating without it.
 
 Downgrading is the one case that stops the service. A database written by a
-newer release is refused rather than written to in a shape this build does not
-understand — before anything at all is written to it, so the file is left
-byte-for-byte as it was:
+newer release is refused before anything at all is written to it, rather than
+used in a shape this build does not understand:
 
 ```
 job database at /var/lib/svtplay-arr/jobs.db is at schema version 3, but this build of svtplay-arr understands version 2. It was written by a newer release; nothing has been changed. Upgrade svtplay-arr again, or point svtplay-arr at a database written by this version.
@@ -257,6 +256,12 @@ job database at /var/lib/svtplay-arr/jobs.db is at schema version 3, but this bu
 
 Nothing has been changed and nothing has been lost — reinstalling the newer
 release brings the installation back exactly as it was.
+
+If the newer release exited cleanly the file is untouched down to the byte. If
+it *crashed*, it left a `-wal` sidecar behind, and opening the database at all
+— by svtplay-arr, by the `sqlite3` shell, by any reader — checkpoints that into
+`jobs.db` and changes it. Every row and the version stamp survive; there is no
+build that could avoid this, because it is what opening a WAL database means.
 
 #### `svt_ua`
 

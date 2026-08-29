@@ -403,9 +403,16 @@ def create_app(settings: Settings) -> FastAPI:
             # was entered, so nothing else will ever release them if startup
             # dies here. Anything already started is stopped first, so a
             # failure part-way through startup cannot leave a task running
-            # against resources this is about to close.
+            # against resources this is about to close -- and that includes
+            # the downloads the worker's poll loop dispatches, which are
+            # separate tasks it does not own. Unreachable today, since the
+            # only thing above that can raise runs before the poll loop
+            # exists; kept in step with the shutdown path below because an
+            # asymmetry here is exactly the kind that survives until the
+            # day something between those lines starts raising.
             for task, what in tasks:
                 await _stop(task, what)
+            await worker.drain()
             await http.aclose()
             store.close()
             raise
@@ -454,6 +461,11 @@ def create_app(settings: Settings) -> FastAPI:
     # shutdown, and that is only observable from outside if the very store
     # the app uses is reachable.
     app.state.job_store = store
+    # Exposed for the same reason as the store: the lifespan drains this
+    # worker's in-flight downloads before closing that store, on both the
+    # startup-failure and the shutdown path, and neither is observable from
+    # outside unless the worker the app actually runs is reachable.
+    app.state.worker = worker
     # Exposed so a test can drive one round of the *app's own* canary --
     # the same object /health reports on, not a second one built for the
     # occasion -- rather than waiting out its startup delay and then an
