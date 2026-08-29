@@ -19,9 +19,13 @@ was correct but made the store a single-file queue: a page render's full
 table scan and the download worker's next progress write took turns. Under
 WAL -- already enabled, and now load-bearing rather than decorative --
 concurrent readers and one writer are safe *given separate connections*, so
-each thread gets its own and nothing waits on anything held in Python. All
-connections are registered so `close()` can release every one of them; see
-`close` for why that registry is what keeps the suite's warning gate green.
+each thread gets its own and no store operation waits on another. There is
+still one lock, per connection rather than global and therefore uncontended
+between callers: it exists so `close()` cannot free a connection out from
+under a query still running on the thread that owns it, which segfaults the
+interpreter rather than raising (see `_use`). All connections are registered
+so `close()` can find them; see `close` for why that registry is what keeps
+the suite's warning gate green.
 
 **The schema is versioned with `PRAGMA user_version`.** `_prepare_database`
 runs once per store, before any per-thread connection is handed out. Version
@@ -42,6 +46,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
+from typing import NamedTuple
 
 from svtplay_arr.models import Job, JobStatus
 
@@ -63,6 +68,12 @@ _BUSY_TIMEOUT_MS = 5000
 # failed start.
 _WAL_TIMEOUT_S = 5.0
 _WAL_RETRY_S = 0.02
+# How long `close()` waits for an operation still running on a connection
+# before giving up on closing it. Every store operation here is one small
+# statement, so reaching this at all means something is badly wrong -- and
+# leaving a connection open costs a warning, while closing it under a live
+# query costs the process.
+_CLOSE_TIMEOUT_S = 5.0
 
 # Version 1 is what every installation before schema versioning existed is
 # running: the `jobs` table exactly as it was created below, with
@@ -89,6 +100,14 @@ CREATE TABLE jobs (
 
 class JobStoreError(RuntimeError):
     """The job database could not be read or written."""
+
+
+class _Registered(NamedTuple):
+    """One thread's connection, and the lock `close()` waits on."""
+
+    thread: threading.Thread
+    conn: sqlite3.Connection
+    lock: "threading.RLock"
 
 
 def _migrate_2_index_created_at(conn: sqlite3.Connection) -> None:
@@ -303,7 +322,7 @@ class JobStore:
         # It is held for the length of a list append, never for the length
         # of a query, so no store operation ever waits on another one.
         self._registry_lock = threading.Lock()
-        self._connections: list[tuple[threading.Thread, sqlite3.Connection]] = []
+        self._connections: list[_Registered] = []
         self._closed = False
         try:
             _prepare_database(db_path)
@@ -314,13 +333,13 @@ class JobStore:
         except sqlite3.Error as exc:
             raise JobStoreError(f"could not open job database at {db_path}") from exc
 
-    def _connection(self) -> sqlite3.Connection:
-        """This thread's connection, opening one the first time it asks."""
+    def _checkout(self) -> tuple[sqlite3.Connection, threading.RLock]:
+        """This thread's connection and its lock, opening one on first use."""
         if self._closed:
             raise JobStoreError("the job database is closed")
         conn = getattr(self._local, "conn", None)
         if conn is not None:
-            return conn
+            return conn, self._local.lock
         # check_same_thread=False is not permission to share this
         # connection -- the thread-local above is what guarantees nothing
         # does. It is needed only so `close()` can release connections
@@ -337,6 +356,10 @@ class JobStore:
             # would ever close it.
             conn.close()
             raise
+        # Reentrant so an operation implemented in terms of another one --
+        # `queued()` on `_all()`, say -- cannot deadlock against itself on
+        # the thread that already holds it.
+        lock = threading.RLock()
         with self._registry_lock:
             if self._closed:
                 # Closed while this connection was being opened. Registering
@@ -344,9 +367,39 @@ class JobStore:
                 conn.close()
                 raise JobStoreError("the job database is closed")
             self._release_finished_threads()
-            self._connections.append((threading.current_thread(), conn))
+            self._connections.append(
+                _Registered(threading.current_thread(), conn, lock)
+            )
         self._local.conn = conn
-        return conn
+        self._local.lock = lock
+        return conn, lock
+
+    def _connection(self) -> sqlite3.Connection:
+        """This thread's connection, opening one the first time it asks."""
+        return self._checkout()[0]
+
+    @contextmanager
+    def _use(self):
+        """This thread's connection, for the length of one operation.
+
+        The lock is per *connection*, and a connection has exactly one user
+        thread, so in the ordinary path it is uncontended -- it is not the
+        global lock this store used to serialise everything through, and no
+        store operation ever waits on another one because of it.
+
+        It exists for `close()`, which is the one thing that touches a
+        connection from a thread other than its owner. Without it, closing
+        the store while an operation was in flight on another thread frees
+        a `sqlite3.Connection` out from under a running query, which
+        segfaults the interpreter rather than raising. That is not
+        hypothetical: `asyncio.to_thread` does not stop the worker thread
+        when the awaiting task is cancelled, so the app's shutdown --
+        cancel the worker task, then close the store -- reliably produced
+        exactly that race, roughly one run of the test suite in five.
+        """
+        conn, lock = self._checkout()
+        with lock:
+            yield conn
 
     def _release_finished_threads(self) -> None:
         """Close connections whose thread has ended.
@@ -361,15 +414,15 @@ class JobStore:
         threadpool) reuse long-lived threads and reach this rarely; it
         exists so a caller that spawns threads does not accumulate them.
         """
-        live: list[tuple[threading.Thread, sqlite3.Connection]] = []
-        for thread, conn in self._connections:
-            if thread.is_alive():
-                live.append((thread, conn))
+        live: list[_Registered] = []
+        for entry in self._connections:
+            if entry.thread.is_alive():
+                live.append(entry)
                 continue
             try:
-                conn.close()
+                entry.conn.close()
             except sqlite3.Error:  # pragma: no cover - sqlite rarely fails here
-                live.append((thread, conn))
+                live.append(entry)
         self._connections = live
 
     def close(self) -> None:
@@ -398,17 +451,38 @@ class JobStore:
         """
         failures: list[sqlite3.Error] = []
         with self._registry_lock:
-            # Set first: a caller that reaches `_connection` while this is
+            # Set first: a caller that reaches `_checkout` while this is
             # running must be told the store is closed rather than handed a
             # connection about to be closed underneath it.
             self._closed = True
             connections = self._connections
             self._connections = []
-        for _thread, conn in connections:
+        for entry in connections:
+            # Waits out an operation still in flight on that connection's
+            # own thread -- see `_use` for why closing under one segfaults
+            # rather than raising. In the ordinary shutdown this is
+            # uncontended; the case it covers is a store call left running
+            # on a threadpool thread by a cancelled `asyncio.to_thread`.
+            held = entry.lock.acquire(timeout=_CLOSE_TIMEOUT_S)
             try:
-                conn.close()
+                if not held:
+                    # Deliberately not closed. An unclosed connection costs
+                    # a `ResourceWarning` at some later collection; closing
+                    # one mid-query costs the process.
+                    log.warning(
+                        "job database connection for %s is still busy after"
+                        " %.0fs; leaving it open rather than closing it under"
+                        " a query in flight",
+                        entry.thread.name,
+                        _CLOSE_TIMEOUT_S,
+                    )
+                    continue
+                entry.conn.close()
             except sqlite3.Error as exc:  # pragma: no cover - rarely fails
                 failures.append(exc)
+            finally:
+                if held:
+                    entry.lock.release()
         if failures:  # pragma: no cover - sqlite rarely fails here
             raise JobStoreError("could not close the job database") from failures[0]
 
@@ -423,13 +497,13 @@ class JobStore:
     ) -> Job:
         nzo_id = f"SVTPLAY-{uuid.uuid4().hex[:12]}"
         try:
-            conn = self._connection()
-            conn.execute(
-                "INSERT INTO jobs (nzo_id, svt_id, stem, quality, status, size_bytes)"
-                " VALUES (?,?,?,?,?,?)",
-                (nzo_id, svt_id, stem, quality, JobStatus.QUEUED.value, size_bytes),
-            )
-            conn.commit()
+            with self._use() as conn:
+                conn.execute(
+                    "INSERT INTO jobs (nzo_id, svt_id, stem, quality, status, size_bytes)"
+                    " VALUES (?,?,?,?,?,?)",
+                    (nzo_id, svt_id, stem, quality, JobStatus.QUEUED.value, size_bytes),
+                )
+                conn.commit()
         except sqlite3.Error as exc:
             raise JobStoreError(f"could not create job for {svt_id!r}") from exc
         job = self.get(nzo_id)
@@ -439,16 +513,16 @@ class JobStore:
 
     def get(self, nzo_id: str) -> Job | None:
         try:
-            row = self._connection().execute(
-                "SELECT * FROM jobs WHERE nzo_id = ?", (nzo_id,)
-            ).fetchone()
+            with self._use() as conn:
+                row = conn.execute(
+                    "SELECT * FROM jobs WHERE nzo_id = ?", (nzo_id,)
+                ).fetchone()
         except sqlite3.Error as exc:
             raise JobStoreError(f"could not read job {nzo_id!r}") from exc
         return _to_job(row) if row is not None else None
 
     def update_progress(self, nzo_id: str, downloaded_bytes: int) -> None:
         try:
-            conn = self._connection()
             # The status filter is load-bearing, not defensive fluff: a
             # real downloader keeps reporting progress -- including one
             # mandatory final on_progress(size, size) call right before
@@ -463,40 +537,41 @@ class JobStore:
             # ever moves a row that is currently Queued or Downloading;
             # a terminal row is left untouched (silently -- this is a
             # legitimate no-op, not an error).
-            conn.execute(
-                "UPDATE jobs SET downloaded_bytes = ?, status = ?"
-                " WHERE nzo_id = ? AND status IN (?, ?)",
-                (
-                    downloaded_bytes,
-                    JobStatus.DOWNLOADING.value,
-                    nzo_id,
-                    JobStatus.QUEUED.value,
-                    JobStatus.DOWNLOADING.value,
-                ),
-            )
-            conn.commit()
+            with self._use() as conn:
+                conn.execute(
+                    "UPDATE jobs SET downloaded_bytes = ?, status = ?"
+                    " WHERE nzo_id = ? AND status IN (?, ?)",
+                    (
+                        downloaded_bytes,
+                        JobStatus.DOWNLOADING.value,
+                        nzo_id,
+                        JobStatus.QUEUED.value,
+                        JobStatus.DOWNLOADING.value,
+                    ),
+                )
+                conn.commit()
         except sqlite3.Error as exc:
             raise JobStoreError(f"could not update progress for {nzo_id!r}") from exc
 
     def complete(self, nzo_id: str, storage_path: str) -> None:
         try:
-            conn = self._connection()
-            conn.execute(
-                "UPDATE jobs SET status = ?, storage_path = ? WHERE nzo_id = ?",
-                (JobStatus.COMPLETED.value, storage_path, nzo_id),
-            )
-            conn.commit()
+            with self._use() as conn:
+                conn.execute(
+                    "UPDATE jobs SET status = ?, storage_path = ? WHERE nzo_id = ?",
+                    (JobStatus.COMPLETED.value, storage_path, nzo_id),
+                )
+                conn.commit()
         except sqlite3.Error as exc:
             raise JobStoreError(f"could not complete job {nzo_id!r}") from exc
 
     def fail(self, nzo_id: str, message: str) -> None:
         try:
-            conn = self._connection()
-            conn.execute(
-                "UPDATE jobs SET status = ?, fail_message = ? WHERE nzo_id = ?",
-                (JobStatus.FAILED.value, message, nzo_id),
-            )
-            conn.commit()
+            with self._use() as conn:
+                conn.execute(
+                    "UPDATE jobs SET status = ?, fail_message = ? WHERE nzo_id = ?",
+                    (JobStatus.FAILED.value, message, nzo_id),
+                )
+                conn.commit()
         except sqlite3.Error as exc:
             raise JobStoreError(f"could not fail job {nzo_id!r}") from exc
 
@@ -510,9 +585,9 @@ class JobStore:
         history would grow without bound.
         """
         try:
-            conn = self._connection()
-            cursor = conn.execute("DELETE FROM jobs WHERE nzo_id = ?", (nzo_id,))
-            conn.commit()
+            with self._use() as conn:
+                cursor = conn.execute("DELETE FROM jobs WHERE nzo_id = ?", (nzo_id,))
+                conn.commit()
         except sqlite3.Error as exc:
             raise JobStoreError(f"could not delete job {nzo_id!r}") from exc
         return cursor.rowcount > 0
@@ -557,9 +632,10 @@ class JobStore:
         # Sonarr polls. Decoding every row here means a corrupted status
         # raises loudly (see _to_job) instead of a job disappearing unseen.
         try:
-            rows = self._connection().execute(
-                "SELECT * FROM jobs ORDER BY created_at"
-            ).fetchall()
+            with self._use() as conn:
+                rows = conn.execute(
+                    "SELECT * FROM jobs ORDER BY created_at"
+                ).fetchall()
         except sqlite3.Error as exc:
             raise JobStoreError("could not query jobs") from exc
         return [_to_job(r) for r in rows]

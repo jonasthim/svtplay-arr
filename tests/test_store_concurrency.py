@@ -32,6 +32,7 @@ from pathlib import Path
 
 import pytest
 
+from svtplay_arr import store as store_module
 from svtplay_arr.models import Job, JobStatus
 from svtplay_arr.store import JobStore
 
@@ -273,7 +274,7 @@ class _SharedConnectionStore(JobStore):
     say about this bug, which is the point.
     """
 
-    def _connection(self) -> sqlite3.Connection:
+    def _checkout(self):
         conn = getattr(self, "_shared", None)
         if conn is None:
             conn = sqlite3.connect(self._db_path, check_same_thread=False)
@@ -282,8 +283,20 @@ class _SharedConnectionStore(JobStore):
             self._shared = conn
             # Registered so `close()` still releases it and the suite's
             # unclosed-database gate stays meaningful for this test too.
-            self._connections.append((threading.current_thread(), conn))
-        return conn
+            self._connections.append(
+                store_module._Registered(
+                    threading.current_thread(), conn, threading.RLock()
+                )
+            )
+        # A lock of this thread's own, deliberately: the store's real one is
+        # per connection, and giving every thread the same one here would
+        # serialise access to the shared connection and hide the very defect
+        # this class exists to reproduce.
+        lock = getattr(self._local, "lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._local.lock = lock
+        return conn, lock
 
 
 def test_the_hammer_catches_the_original_defect(tmp_path: Path):
@@ -403,6 +416,116 @@ def test_a_read_in_flight_does_not_block_a_write(tmp_path: Path):
 
     assert order == ["write", "read"]
     assert store.get(ids[0]).downloaded_bytes == 7
+
+
+def test_close_waits_for_an_operation_in_flight_on_another_thread(
+    tmp_path: Path,
+):
+    """The segfault this store's per-connection lock exists to prevent.
+
+    `asyncio.to_thread` does not stop the worker thread when the awaiting
+    task is cancelled -- it only abandons the future. The app's shutdown
+    cancels the download worker's task and then closes the store, so a
+    `store.queued()` dispatched by the worker's last poll can still be
+    running on a threadpool thread at the moment `close()` reaches its
+    connection. Freeing a `sqlite3.Connection` out from under a live query
+    does not raise: it segfaults the interpreter. It took roughly one run
+    of the full suite in five before `close()` waited.
+
+    Deterministic here rather than left to that race: the reader is parked
+    *inside* its query, and `close()` must not return until it is let go.
+    """
+    store = JobStore(tmp_path / "jobs.db")
+    _seed(store, count=1)
+    inside_read = threading.Event()
+    let_the_read_finish = threading.Event()
+    closed = threading.Event()
+
+    class _SlowConnection:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def execute(self, *args):
+            inside_read.set()
+            let_the_read_finish.wait(timeout=10)
+            return self._inner.execute(*args)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    def slow_reader():
+        store._local.conn = _SlowConnection(store._connection())
+        store.all_jobs()
+
+    reader = threading.Thread(target=slow_reader)
+    reader.start()
+    assert inside_read.wait(timeout=10), "the reader never started its query"
+
+    closer = threading.Thread(target=lambda: (store.close(), closed.set()))
+    closer.start()
+    # `close()` must still be waiting: the connection it wants is busy.
+    assert not closed.wait(timeout=0.5), "close() freed a connection mid-query"
+
+    let_the_read_finish.set()
+    reader.join(timeout=10)
+    closer.join(timeout=10)
+
+    assert closed.is_set(), "close() never finished"
+    assert not reader.is_alive()
+
+
+def test_close_gives_up_rather_than_closing_under_a_stuck_query(
+    tmp_path: Path, monkeypatch
+):
+    # The other side of the same decision. An unclosed connection costs a
+    # ResourceWarning at some later collection; closing one under a live
+    # query costs the process. So a connection that is still busy when the
+    # wait runs out is left open, loudly.
+    from svtplay_arr import store as store_module
+
+    monkeypatch.setattr(store_module, "_CLOSE_TIMEOUT_S", 0.05)
+    store = JobStore(tmp_path / "jobs.db")
+    _OPEN_STORES.append(store)
+    _seed(store, count=1)
+    inside_read = threading.Event()
+    let_the_read_finish = threading.Event()
+    # The connection `close()` is about to give up on. Held here because
+    # nothing else will close it -- which is the point of the test, and
+    # also why the test has to close it itself rather than leave a
+    # ResourceWarning for a later collection to raise.
+    left_open: list[sqlite3.Connection] = []
+
+    class _SlowConnection:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def execute(self, *args):
+            inside_read.set()
+            let_the_read_finish.wait(timeout=10)
+            return self._inner.execute(*args)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    def slow_reader():
+        real = store._connection()
+        left_open.append(real)
+        store._local.conn = _SlowConnection(real)
+        store.all_jobs()
+
+    reader = threading.Thread(target=slow_reader, name="stuck-reader")
+    reader.start()
+    try:
+        assert inside_read.wait(timeout=10), "the reader never started"
+        store.close()  # must return rather than block or crash
+    finally:
+        let_the_read_finish.set()
+        reader.join(timeout=10)
+
+    assert not reader.is_alive()
+    assert left_open, "the reader never opened a connection"
+    left_open[0].execute("SELECT 1")  # still open, as the warning said
+    left_open[0].close()
 
 
 def test_connections_belonging_to_finished_threads_are_released(tmp_path: Path):
