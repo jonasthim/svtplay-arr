@@ -1,3 +1,4 @@
+import asyncio
 import sqlite3
 from pathlib import Path
 
@@ -435,3 +436,87 @@ def test_addfile_catches_unexpected_read_error(tmp_path: Path, monkeypatch):
     assert r.status_code == 200
     assert r.json()["status"] is False
     assert store.all_active() == []
+
+
+# --- Where the store reads happen -------------------------------------
+
+
+def _records_the_thread(where: list[str], answer):
+    """A stand-in for a sync JobStore method that notes where it ran."""
+
+    def probe(self, *args, **kwargs):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            where.append("off the loop")
+        else:
+            where.append("on the loop")
+        return answer
+
+    return probe
+
+
+@pytest.mark.parametrize(
+    "mode,method,answer",
+    [
+        ("queue", "all_active", []),
+        ("history", "history", []),
+    ],
+)
+def test_sonarrs_polls_do_not_read_the_store_on_the_event_loop(
+    tmp_path: Path, mode: str, method: str, answer
+):
+    # Sonarr polls these on a schedule, and this service shares one event
+    # loop between its routes and the download worker. A route that read
+    # the store inline would run a blocking sqlite read on that loop and
+    # stall the download it is reporting on. The store's `*_async` mirrors
+    # are what keep the route a coroutine and the read off the loop; this
+    # is the only thing that observes the difference.
+    #
+    # Asked of asyncio rather than of thread identity: the test client
+    # already runs the app off the main thread, so "not the main thread"
+    # is true either way -- but inside an `asyncio.to_thread` worker there
+    # is no running loop at all, and there is nowhere else this could be
+    # called from where that is true.
+    where: list[str] = []
+    client, _store_ = _client(tmp_path)
+    original = getattr(JobStore, method)
+    setattr(JobStore, method, _records_the_thread(where, answer))
+    try:
+        resp = client.get(f"/sabnzbd/api?mode={mode}&apikey=x")
+    finally:
+        setattr(JobStore, method, original)
+
+    assert resp.status_code == 200
+    assert where, f"mode={mode} never read the store"
+    assert set(where) == {"off the loop"}, where
+
+
+def test_addfile_does_not_write_to_the_store_on_the_event_loop(tmp_path: Path):
+    # The write half of the same rule. `mode=addfile` is the one route
+    # Sonarr uses that changes the table, and an INSERT taken on the loop
+    # stalls it just as a read does.
+    where: list[str] = []
+    client, store = _client(tmp_path)
+    original = JobStore.create
+
+    def probe(self, *args, **kwargs):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            where.append("off the loop")
+        else:
+            where.append("on the loop")
+        return original(self, *args, **kwargs)
+
+    JobStore.create = probe
+    try:
+        resp = client.post(
+            "/sabnzbd/api?mode=addfile",
+            files={"name": ("x.nzb", NZB, "application/x-nzb")},
+        )
+    finally:
+        JobStore.create = original
+
+    assert resp.json()["status"] is True
+    assert where == ["off the loop"], where

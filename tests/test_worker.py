@@ -464,3 +464,70 @@ async def test_run_forever_survives_a_store_error(tmp_path: Path):
 
     assert store.remaining == 0, "the loop must have kept polling after the errors"
     assert real_store.get(job.nzo_id).status is JobStatus.COMPLETED
+
+
+# --- Where the worker's own store reads happen ------------------------
+
+
+def _where_it_ran(where: list[str], inner):
+    def probe(self, *args, **kwargs):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            where.append("off the loop")
+        else:
+            where.append("on the loop")
+        return inner(self, *args, **kwargs)
+
+    return probe
+
+
+async def test_the_worker_does_not_read_the_store_on_the_event_loop(
+    tmp_path: Path,
+):
+    # The argument that applies to the routes applies to the worker in the
+    # other direction: it shares the loop with every route in the service,
+    # so a store read taken inline here stalls a Sonarr poll and a page
+    # render. The `*_async` mirrors are what keep it off the loop, and this
+    # is the only thing that observes it -- a plain `self._store.get(...)`
+    # would leave every other worker test green.
+    #
+    # Asked of asyncio rather than of thread identity: inside an
+    # `asyncio.to_thread` worker there is no running loop at all.
+    where: list[str] = []
+    store, worker = _setup(tmp_path)
+    job = store.create("a", "stem", "WEBDL-1080p", 100)
+    originals = {name: getattr(JobStore, name) for name in ("get", "complete")}
+    for name, inner in originals.items():
+        setattr(JobStore, name, _where_it_ran(where, inner))
+    try:
+        await worker.run_job(job.nzo_id)
+    finally:
+        for name, inner in originals.items():
+            setattr(JobStore, name, inner)
+
+    assert store.get(job.nzo_id).status is JobStatus.COMPLETED
+    assert where, "the worker never read the store"
+    assert set(where) == {"off the loop"}, where
+
+
+async def test_the_poll_loop_does_not_read_the_store_on_the_event_loop(
+    tmp_path: Path,
+):
+    where: list[str] = []
+    store, worker = _setup(tmp_path)
+    original = JobStore.queued
+    JobStore.queued = _where_it_ran(where, original)
+    try:
+        runner = asyncio.create_task(worker.run_forever(poll_seconds=0.01))
+        await asyncio.sleep(0.05)
+        runner.cancel()
+        try:
+            await runner
+        except asyncio.CancelledError:
+            pass
+    finally:
+        JobStore.queued = original
+
+    assert where, "the poll loop never read the store"
+    assert set(where) == {"off the loop"}, where
