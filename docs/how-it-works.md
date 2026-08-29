@@ -489,10 +489,23 @@ purpose — an empty relative dir means the category's full path *is*
 either; Sonarr reads a trailing `*` as "job folders disabled" and fails
 validation for that too.
 
-**Every route is `async def`.** `JobStore` serialises access to one shared
-`sqlite3.Connection` behind a blocking `threading.Lock`; FastAPI runs non-async
-routes in a threadpool, and a threadpool thread holding that lock would stall
-the event loop — and with it the download worker — for as long as it held it.
+**Every route is `async def`, and reaches the job store through its `*_async`
+mirrors.** The routes are coroutines because this service does network I/O — to
+Sonarr, to SVT — on paths that share an event loop with the download worker.
+The mirrors exist because a coroutine that called the store directly would run
+a blocking sqlite read or write *on* that loop: Sonarr polls `mode=queue` on a
+schedule, and a poll that stalls the loop stalls the download it is reporting
+on. Each mirror hops onto a worker thread, where it gets that thread's own
+sqlite connection.
+
+The store used to drive one shared `sqlite3.Connection` from every thread
+behind a blocking `threading.Lock`, and that lock was the original reason for
+the async-route rule. It is gone: the lock made every read and write take
+turns, so a page render's full table scan and the worker's next progress write
+queued behind each other. Each thread now opens its own connection, which under
+WAL is what makes concurrent readers and one writer safe — and makes the
+corruption the lock was added to fix structurally impossible, since no
+connection is reachable from two threads. The rule outlived its first reason.
 
 ---
 
@@ -639,10 +652,12 @@ a grab failed, the only record of why was `journalctl`. It shows what is in
 flight and what recently finished, with a failed job's recorded reason on
 the page. A store that cannot be read renders as a store that cannot be
 read — never as an empty list, which would tell an operator whose database
-is broken that nothing has ever gone wrong. Both the health read and the
-activity read go through `asyncio.to_thread`: every config route is `async
-def` (see below), so a plain call would run a blocking sqlite read on the
-event loop the download worker also runs on.
+is broken that nothing has ever gone wrong. Both the health computation and
+the activity read go through `asyncio.to_thread`: every config route is
+`async def` (see below), so a plain call would run blocking work on the event
+loop the download worker also runs on. The whole provider is hopped rather
+than the store call inside it, because the store is not the only thing that
+blocks there — the health computation also stats both download directories.
 
 A fresh install with no mappings gets an explanation rather than an empty
 table: what a mapping is, why svtplay-arr cannot work one out on its own,

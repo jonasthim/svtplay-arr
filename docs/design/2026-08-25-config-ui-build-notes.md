@@ -29,6 +29,14 @@ restart-required banner.
   behind a blocking `threading.Lock`; FastAPI runs non-async routes in a
   threadpool, which was empirically shown to corrupt reads before the lock
   existed and would stall the event loop after it.
+
+  > Superseded, and left as written because this is a record of what was
+  > decided at the time. The lock is gone — the store now gives each thread
+  > its own connection, which under WAL makes the corruption structurally
+  > impossible rather than merely serialised away. The rule itself stands
+  > for a different reason: these routes do network I/O to Sonarr and SVT on
+  > the loop the download worker shares. See "The SABnzbd surface" in
+  > `../how-it-works.md`.
 - **`series_title` is copied verbatim from Sonarr's record, never typed.** It
   becomes the permanent filename — Sonarr runs with `renameEpisodes=False`,
   so a typo is not a retry.
