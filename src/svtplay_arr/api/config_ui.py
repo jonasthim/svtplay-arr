@@ -811,20 +811,25 @@ def build_config_router(
 
         `await asyncio.to_thread(...)`, not a plain call, and that is the
         one interesting decision on this page. Every route here is
-        `async def` (enforced by a test) because `JobStore` drives one
-        `sqlite3.Connection` behind a blocking `threading.Lock` and a
-        threadpool thread holding that lock stalls things it should not.
-        But `async def` only moves the problem: `compute_health` reads
-        `store.all_active()`, so calling it inline runs a blocking sqlite
-        read *on the event loop* -- the same loop the download worker runs
-        on. If the worker is mid-write and holding the lock, rendering this
-        page stops the downloads it is reporting on.
+        `async def` (enforced by a test) because this service does network
+        I/O -- to Sonarr and to SVT -- on the same event loop the download
+        worker runs on, and a route that blocked that loop would stall a
+        download. But `async def` only moves the problem: the provider
+        blocks. It reads the job store, and it stats both download
+        directories to answer `same_filesystem`. Called inline, all of that
+        runs *on* the loop, and rendering this page stops the downloads it
+        is reporting on.
 
         `to_thread` is what makes both rules true at once: the route stays
-        a coroutine, and the blocking read happens on a worker thread,
-        which is exactly what `check_same_thread=False` plus that lock
-        exist to make safe. The cost is one thread hop per render, on a
-        page a human loads by hand.
+        a coroutine, and the blocking work happens on a worker thread,
+        where the store hands out a connection of that thread's own (see
+        store.py). The cost is one thread hop per render, on a page a human
+        loads by hand.
+
+        The whole provider is hopped rather than the store call inside it,
+        because the store is not the only thing here that blocks. Callers
+        whose only blocking work *is* the store -- sab.py's routes, the
+        worker -- use the store's own `*_async` mirrors instead.
 
         (`compute_health` also reads `Task.done()` on the worker and canary
         tasks from that thread. That is a plain attribute read on an
@@ -865,8 +870,8 @@ def build_config_router(
           without one, as most tests do). Also not "nothing happened".
 
         `to_thread` for the same reason as `_status_strip_context`, and
-        more so: this is the larger of the two reads, and it is a second
-        one on every render of the pages that show it.
+        more so: this is the larger of the two reads -- the whole table --
+        and it is a second one on every render of the pages that show it.
         """
         if activity_provider is None:
             return {"activity": None, "activity_unavailable": False}

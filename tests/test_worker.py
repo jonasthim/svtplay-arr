@@ -421,7 +421,13 @@ async def test_run_forever_survives_a_store_error(tmp_path: Path):
     real_store = _store(tmp_path)
 
     class FlakyStore:
-        """Raises from queued() for the first few polls, then recovers."""
+        """Raises from queued() for the first few polls, then recovers.
+
+        `queued_async` is spelled out rather than left to `__getattr__`:
+        the worker polls through the store's async mirror, and delegating
+        it to the inner store would run the *real* `queued()` and this
+        double would never fail at all.
+        """
 
         def __init__(self, inner: JobStore, failures: int):
             self._inner = inner
@@ -435,6 +441,9 @@ async def test_run_forever_survives_a_store_error(tmp_path: Path):
                 self.remaining -= 1
                 raise JobStoreError("row has an unrecognised status")
             return self._inner.queued()
+
+        async def queued_async(self):
+            return self.queued()
 
     store = FlakyStore(real_store, failures=3)
     worker = Worker(store, FakeDownloader(steps=2, total_bytes=100), inc, comp)

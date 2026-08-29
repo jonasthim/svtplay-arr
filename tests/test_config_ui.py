@@ -1744,11 +1744,15 @@ def test_search_survives_an_unreadable_mappings_file(tmp_path: Path):
 
 
 def test_every_config_route_is_async(tmp_path: Path):
-    # JobStore holds one sqlite3.Connection behind a blocking lock, and
-    # FastAPI runs a non-async route in a threadpool -- empirically shown to
-    # corrupt reads. Mutating `index` to a plain `def` left all 281 tests
-    # green, so the rule held only by convention. Sweeping the router makes
-    # it enforce itself for the next route someone adds.
+    # These routes do network I/O -- to Sonarr, to SVT -- and share their
+    # event loop with the download worker, so they must not be run in
+    # FastAPI's threadpool where a blocking call has nothing to yield to.
+    # (The rule predates that reasoning: it was originally about JobStore's
+    # single shared connection, which is gone -- the store now hands each
+    # thread its own. The rule outlived its first reason, which is why it
+    # is written down here.) Mutating `index` to a plain `def` left all 281
+    # tests green, so the rule held only by convention. Sweeping the router
+    # makes it enforce itself for the next route someone adds.
     import inspect
 
     cfg, maps = _paths(tmp_path)

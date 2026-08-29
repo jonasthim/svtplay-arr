@@ -1515,11 +1515,10 @@ def test_the_activity_view_is_bounded_however_long_the_history_is(
 def test_health_does_not_read_the_store_on_the_event_loop(tmp_path: Path):
     # The same argument the config page's status strip makes, and it
     # applies here at least as strongly: /health is polled on a schedule
-    # by a monitor rather than loaded by hand, and it reads the same
-    # JobStore -- one sqlite3.Connection behind a blocking lock -- that
-    # the download worker writes job progress through. Reading it inline
-    # from an async route stalls the loop the worker runs on for as long
-    # as the worker holds that lock.
+    # by a monitor rather than loaded by hand, and compute_health blocks --
+    # it reads the same JobStore the download worker writes job progress
+    # through, and stats both download directories. Reading it inline from
+    # an async route runs all of that on the loop the worker runs on.
     #
     # Asked of asyncio rather than of thread identity: inside an
     # asyncio.to_thread worker there is no running loop, and there is

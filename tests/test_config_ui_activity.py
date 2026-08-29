@@ -254,11 +254,11 @@ def test_the_degraded_activity_page_still_has_its_nav(tmp_path: Path):
 def test_the_store_read_does_not_happen_on_the_event_loop(
     tmp_path: Path, path: str
 ):
-    # Every route here is `async def`, because JobStore drives one
-    # sqlite3.Connection behind a blocking threading.Lock. That makes the
-    # route a coroutine -- so a plain call would run a blocking sqlite
-    # read *on the event loop*, the same loop the download worker runs on,
-    # and a page render would stall the downloads it is reporting on.
+    # Every route here is `async def`, because this service does network
+    # I/O to Sonarr and SVT on the same event loop the download worker
+    # runs on. That makes the route a coroutine -- so a plain call would
+    # run the provider's blocking sqlite read *on the event loop*, and a
+    # page render would stall the downloads it is reporting on.
     # asyncio.to_thread is what keeps both true; nothing else observes it.
     #
     # Asked of asyncio rather than of `threading.current_thread()`: the

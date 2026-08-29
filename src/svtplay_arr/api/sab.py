@@ -28,12 +28,16 @@ This module speaks only SABnzbd's wire format -- no download logic, no
 matching logic, no SVT knowledge. `JobStore` is the source of truth; this
 just shapes its rows into what Sonarr expects.
 
-Every route below is `async def`. `JobStore` serialises access to one shared
-`sqlite3.Connection` behind a blocking `threading.Lock`; FastAPI would run a
-non-async route in a threadpool thread, and that thread holding the lock
-would stall the event loop -- and with it the download worker -- for as long
-as the lock is held. See `store.py` for the corruption this lock was added
-to fix.
+Every route below is `async def`, and reaches the job store through its
+`*_async` mirrors rather than calling it directly. Both halves matter and
+they are separate rules. The routes are coroutines because this service does
+network I/O -- to Sonarr, to SVT -- on paths that share the event loop with
+the download worker. The mirrors exist because a coroutine calling the store
+directly would run a blocking sqlite read or write *on* that loop: Sonarr
+polls `mode=queue` on a schedule, and a poll that stalls the loop stalls the
+download it is reporting on. Each mirror hops onto a worker thread, where it
+gets that thread's own sqlite connection; see `store.py` for why there is one
+per thread and what the shared connection it replaced did to reads.
 """
 
 import logging
@@ -97,12 +101,14 @@ def build_sab_router(store, completed_dir: Path) -> APIRouter:
         # `mode=queue&name=delete&value=X` fell through to the listing branch
         # below and answered with the queue while deleting nothing.
         if mode in ("queue", "history") and name == "delete":
-            return _delete(store, mode, value)
+            return await _delete(store, mode, value)
         if mode == "queue":
-            slots = _slots(store.all_active, _queue_slot)
+            slots = await _slots(store.all_active_async, _queue_slot)
             return {"queue": {"paused": False, "slots": slots}}
         if mode == "history":
-            return {"history": {"slots": _slots(store.history, _history_slot)}}
+            return {
+                "history": {"slots": await _slots(store.history_async, _history_slot)}
+            }
         return {"status": False, "error": f"unsupported mode {mode!r}"}
 
     @router.post("/api")
@@ -114,7 +120,7 @@ def build_sab_router(store, completed_dir: Path) -> APIRouter:
             if len(raw) > _MAX_NZB_BYTES:
                 raise _NzbRejected("nzb exceeds max upload size")
             meta = _parse_nzb(raw)
-            job = store.create(
+            job = await store.create_async(
                 svt_id=_require(meta, "svt_id"),
                 stem=_require(meta, "stem"),
                 quality=meta.get("quality") or _DEFAULT_QUALITY,
@@ -153,9 +159,9 @@ def _get_config(completed_dir: Path) -> dict:
     }
 
 
-def _slots(source, to_slot) -> list[dict]:
+async def _slots(source, to_slot) -> list[dict]:
     try:
-        jobs = source()
+        jobs = await source()
     except JobStoreError:
         # A store read failure must degrade to an empty list, not a 500 --
         # Sonarr treats a 500 from its download client far worse than a
@@ -165,7 +171,7 @@ def _slots(source, to_slot) -> list[dict]:
     return [to_slot(j) for j in jobs]
 
 
-def _delete(store, mode: str, value: str | None) -> dict:
+async def _delete(store, mode: str, value: str | None) -> dict:
     """Handle `mode=queue|history&name=delete&value=...`.
 
     `value` is one nzo_id, a comma-separated list of them, or the literal
@@ -185,12 +191,12 @@ def _delete(store, mode: str, value: str | None) -> dict:
     if not value:
         return {"status": False, "error": "missing value"}
     try:
-        targets = _delete_targets(store, mode, value)
+        targets = await _delete_targets(store, mode, value)
         for nzo_id in targets:
             if mode == "queue":
-                store.fail(nzo_id, "removed from queue")
+                await store.fail_async(nzo_id, "removed from queue")
             else:
-                store.delete(nzo_id)
+                await store.delete_async(nzo_id)
     except JobStoreError:
         log.exception("%s delete failed for value %r", mode, value)
         return {"status": False, "error": "could not delete job"}
@@ -200,17 +206,17 @@ def _delete(store, mode: str, value: str | None) -> dict:
     return {"status": True, "nzo_ids": targets}
 
 
-def _delete_targets(store, mode: str, value: str) -> list[str]:
+async def _delete_targets(store, mode: str, value: str) -> list[str]:
     want_terminal = mode == "history"
     if value.strip() == "all":
-        source = store.history if want_terminal else store.all_active
-        return [job.nzo_id for job in source()]
+        source = store.history_async if want_terminal else store.all_active_async
+        return [job.nzo_id for job in await source()]
 
     targets: list[str] = []
     for nzo_id in (part.strip() for part in value.split(",")):
         if not nzo_id:
             continue
-        job = store.get(nzo_id)
+        job = await store.get_async(nzo_id)
         if job is None:
             log.info("%s delete: no such job %r, ignoring", mode, nzo_id)
             continue

@@ -316,10 +316,9 @@ def create_app(settings: Settings) -> FastAPI:
         the store as unreadable; an empty list would have rendered as a
         quiet, wrong "nothing happened".
 
-        One read of the table, not two: `all_active()` and `history()` each
-        take the connection's lock for a full scan, and that is the lock
-        the download worker writes progress through. `all_jobs()` is read
-        once and partitioned here.
+        One read of the table, not two: `all_active()` and `history()` are
+        each a full scan, so asking for both would read the whole table
+        twice for one page. `all_jobs()` is read once and partitioned here.
 
         History is newest first -- the store returns oldest first, which is
         what Sonarr's queue wants and the opposite of what a human reading
@@ -510,12 +509,17 @@ def create_app(settings: Settings) -> FastAPI:
     @app.get("/health")
     async def health():
         # `to_thread`, for the reason the config page's status strip gives
-        # at length: `compute_health` reads `store.all_active()`, and this
-        # route is a coroutine, so calling it inline runs a blocking sqlite
-        # read on the event loop -- the loop the download worker runs on,
-        # behind the very lock the worker takes to write job progress. The
-        # argument is stronger here than on the page: this endpoint is
+        # at length: this route is a coroutine, and `compute_health`
+        # blocks -- it reads the job store, and it stats both download
+        # directories through `dirs_share_filesystem()`. Called inline, all
+        # of that runs on the event loop the download worker also runs on.
+        # The argument is stronger here than on the page: this endpoint is
         # polled on a schedule by a monitor rather than loaded by hand.
+        #
+        # The whole computation is hopped, not just the store read. The
+        # store now has `*_async` mirrors of its own for callers whose only
+        # blocking work is the store (see store.py, and sab.py's routes);
+        # this one has more than that, so the hop belongs here.
         #
         # The response is unchanged, which is the contract that matters:
         # `compute_health` still produces it, and nothing about its shape

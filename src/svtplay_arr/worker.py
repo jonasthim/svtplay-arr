@@ -9,6 +9,15 @@ only via `Path.rename`, which is atomic within one filesystem. If
 `incomplete/` and `completed/` are ever on different filesystems, `rename`
 silently degrades to copy-then-delete and this guarantee is lost --
 `Settings.dirs_share_filesystem()` exists to catch that case elsewhere.
+
+Everything here that runs on the event loop reaches the job store through
+its `*_async` mirrors rather than calling it directly: this worker shares a
+loop with every route in the service, so a store read taken inline here
+would stall a Sonarr poll and a page render, exactly as a page render's
+store read used to stall this worker. The two exceptions are deliberate and
+named where they are: `sweep_incomplete` (startup only, already blocking on
+`rmtree`) and `_report_progress` (a synchronous callback in the downloader's
+own call stack, and one small UPDATE on this thread's own connection).
 """
 
 import asyncio
@@ -110,7 +119,7 @@ class Worker:
 
     async def run_job(self, nzo_id: str) -> None:
         try:
-            job = self._store.get(nzo_id)
+            job = await self._store.get_async(nzo_id)
             if job is None or job.status is not JobStatus.QUEUED:
                 # Nothing to do: unknown job, or a stale/duplicate dispatch
                 # for a job another invocation has already started, finished,
@@ -123,7 +132,7 @@ class Worker:
                 # that outlived run_forever's own in-flight tracking, or a
                 # direct duplicate call) and already finished while we
                 # waited. A stale snapshot must not cause a redo.
-                job = self._store.get(nzo_id)
+                job = await self._store.get_async(nzo_id)
                 if job is None or job.status is not JobStatus.QUEUED:
                     return
                 try:
@@ -133,7 +142,7 @@ class Worker:
                         job.stem,
                         lambda done, total: self._report_progress(nzo_id, done),
                     )
-                    if not self._still_running(nzo_id):
+                    if not await self._still_running(nzo_id):
                         # Something external (e.g. Sonarr's mode=delete)
                         # terminated this job while the download was in
                         # flight. The download itself has no cancellation
@@ -149,27 +158,34 @@ class Worker:
                         )
                         return
                     final = self._publish(staging, job.stem)
-                    self._store.complete(nzo_id, str(final))
+                    await self._store.complete_async(nzo_id, str(final))
                 except Exception as exc:
                     log.exception("job %s failed", nzo_id)
-                    self._store.fail(nzo_id, str(exc))
+                    await self._store.fail_async(nzo_id, str(exc))
                 finally:
                     shutil.rmtree(staging, ignore_errors=True)
         finally:
             self._in_flight.discard(nzo_id)
 
-    def _still_running(self, nzo_id: str) -> bool:
+    async def _still_running(self, nzo_id: str) -> bool:
         """True if the job is still QUEUED/DOWNLOADING right now. Re-reads
         the store rather than trusting the snapshot taken before the
         download started, since that snapshot can't see an out-of-band
         change (e.g. mode=delete) made while the download was in flight."""
-        current = self._store.get(nzo_id)
+        current = await self._store.get_async(nzo_id)
         return current is not None and current.status in (
             JobStatus.QUEUED,
             JobStatus.DOWNLOADING,
         )
 
     def _report_progress(self, nzo_id: str, downloaded_bytes: int) -> None:
+        # Synchronous, unlike everything else here that touches the store:
+        # this is the `ProgressFn` callback the downloader invokes from
+        # inside its own call stack, which has no way to await. It is one
+        # small UPDATE against this thread's own connection and nothing
+        # else can hold it up -- under the lock this call replaced, it
+        # could wait behind a full table scan taken by a page render.
+        #
         # A monitoring/bookkeeping mechanism must never be able to fail the
         # thing it monitors: a transient store error here (busy database,
         # disk full, connection closing during shutdown) must not cost a
@@ -243,7 +259,7 @@ class Worker:
             # outside the guard so a persistent failure still paces itself
             # (and so cancellation at shutdown is never swallowed).
             try:
-                for job in self._store.queued():
+                for job in await self._store.queued_async():
                     if job.nzo_id in self._in_flight:
                         continue
                     self._in_flight.add(job.nzo_id)
